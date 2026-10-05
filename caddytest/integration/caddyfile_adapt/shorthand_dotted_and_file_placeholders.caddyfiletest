@@ -1,0 +1,44 @@
+localhost:80
+
+respond * "{header.X-Custom.Header} {query.page.num} {vars.user.id} {file.token} {file.base} {file.ext}"
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":80"
+					],
+					"routes": [
+						{
+							"match": [
+								{
+									"host": [
+										"localhost"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"handle": [
+												{
+													"body": "{http.request.header.X-Custom.Header} {http.request.uri.query.page.num} {http.vars.user.id} {file.token} {http.request.uri.path.file.base} {http.request.uri.path.file.ext}",
+													"handler": "static_response"
+												}
+											]
+										}
+									]
+								}
+							],
+							"terminal": true
+						}
+					]
+				}
+			}
+		}
+	}
+}
