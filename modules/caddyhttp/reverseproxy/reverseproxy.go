@@ -1007,6 +1007,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 	shouldLogCredentials := server.Logs != nil && server.Logs.ShouldLogCredentials
 
 	// Forward 1xx status codes, backported from https://github.com/golang/go/pull/53164
+	downstreamHeaders := rw.Header().Clone()
 	var (
 		roundTripMutex sync.Mutex
 		roundTripDone  bool
@@ -1027,6 +1028,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 			// Clear headers coming from the backend
 			// (it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses)
 			clear(h)
+			copyHeader(h, downstreamHeaders)
 
 			return nil
 		},
