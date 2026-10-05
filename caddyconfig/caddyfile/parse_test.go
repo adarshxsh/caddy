@@ -78,15 +78,15 @@ func TestParseVariadic(t *testing.T) {
 		},
 		{
 			input:  "{args[-1:]}",
-			result: false,
+			result: true,
 		},
 		{
 			input:  "{args[:11]}",
-			result: false,
+			result: true,
 		},
 		{
 			input:  "{args[10:0]}",
-			result: false,
+			result: true,
 		},
 		{
 			input:  "{args[0:10]}",
@@ -1034,3 +1034,57 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 func testParser(input string) parser {
 	return parser{Dispenser: NewTestDispenser(input)}
 }
+
+func TestVariadicOutOfBoundsAndZeroArgs(t *testing.T) {
+	t.Run("out of bounds variadic drops token without raw text retention", func(t *testing.T) {
+		p := testParser(`
+			(snippet) {
+				respond {args[0:2]}
+			}
+			http://example.com {
+				import snippet arg0
+			}
+		`)
+		blocks, err := p.parseAll()
+		if err != nil {
+			t.Fatalf("parseAll: %v", err)
+		}
+		if len(blocks) != 1 {
+			t.Fatalf("expected 1 block, got %d", len(blocks))
+		}
+		seg := blocks[0].Segments[0]
+		// Directive is "respond", out of bounds {args[0:2]} should be dropped so length of segment is 1 (only "respond")
+		if len(seg) != 1 {
+			t.Fatalf("expected segment length 1, got %d: %v", len(seg), seg)
+		}
+		if seg[0].Text != "respond" {
+			t.Fatalf("expected directive 'respond', got %q", seg[0].Text)
+		}
+	})
+
+	t.Run("zero argument variadic evaluates to empty token list", func(t *testing.T) {
+		p := testParser(`
+			(snippet) {
+				respond {args[0:]}
+			}
+			http://example.com {
+				import snippet
+			}
+		`)
+		blocks, err := p.parseAll()
+		if err != nil {
+			t.Fatalf("parseAll: %v", err)
+		}
+		if len(blocks) != 1 {
+			t.Fatalf("expected 1 block, got %d", len(blocks))
+		}
+		seg := blocks[0].Segments[0]
+		if len(seg) != 1 {
+			t.Fatalf("expected segment length 1, got %d: %v", len(seg), seg)
+		}
+		if seg[0].Text != "respond" {
+			t.Fatalf("expected directive 'respond', got %q", seg[0].Text)
+		}
+	})
+}
+
