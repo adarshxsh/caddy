@@ -2,12 +2,19 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +284,191 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestHTTPTransport_StreamReadTimeout_KeepAlive(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(300 * time.Millisecond)
+			w.Write([]byte("slow response"))
+			return
+		}
+		w.Write([]byte("fast response"))
+	}))
+	defer server.Close()
+
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(100 * time.Millisecond),
+	}
+	err := ht.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	// 1. Send request to /slow
+	reqSlow, err := http.NewRequest("GET", server.URL+"/slow", nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	respSlow, err := ht.RoundTrip(reqSlow)
+	if err != nil {
+		t.Fatalf("RoundTrip for /slow error: %v", err)
+	}
+	buf := make([]byte, 1024)
+	_, readErr := respSlow.Body.Read(buf)
+	respSlow.Body.Close()
+
+	if readErr == nil {
+		t.Fatalf("expected timeout error on /slow response body read, got nil")
+	}
+	if !errors.Is(readErr, os.ErrDeadlineExceeded) {
+		if netErr, ok := readErr.(net.Error); !ok || !netErr.Timeout() {
+			t.Fatalf("expected timeout error, got: %v", readErr)
+		}
+	}
+
+	// 2. Send request to /fast using same transport; should reuse pooled connection
+	reqFast, err := http.NewRequest("GET", server.URL+"/fast", nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	respFast, err := ht.RoundTrip(reqFast)
+	if err != nil {
+		t.Fatalf("RoundTrip for /fast error: %v", err)
+	}
+	bodyFast, err := io.ReadAll(respFast.Body)
+	respFast.Body.Close()
+	if err != nil {
+		t.Fatalf("ReadAll for /fast error: %v", err)
+	}
+	if string(bodyFast) != "fast response" {
+		t.Fatalf("unexpected body for /fast: %s", string(bodyFast))
+	}
+}
+
+func TestHTTPTransport_StreamWriteTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ht := &HTTPTransport{
+		WriteTimeout: caddy.Duration(100 * time.Millisecond),
+	}
+	err := ht.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	pipeR, pipeW := io.Pipe()
+	defer pipeR.Close()
+
+	req, err := http.NewRequest("POST", server.URL, pipeR)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := ht.RoundTrip(req)
+		errChan <- err
+	}()
+
+	select {
+	case err := <-errChan:
+		pipeW.Close()
+		if err == nil {
+			t.Fatalf("expected write timeout error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		pipeW.Close()
+		t.Fatalf("test timed out waiting for WriteTimeout")
+	}
+}
+
+func TestHTTPTransport_HTTP2_StreamTimeoutIsolation(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(300 * time.Millisecond)
+			w.Write([]byte("slow response"))
+			return
+		}
+		w.Write([]byte("fast response"))
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	cert := server.Certificate()
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(100 * time.Millisecond),
+		TLS: &TLSConfig{
+			InsecureSkipVerify: true,
+		},
+	}
+
+	err := ht.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	// Issue request to /slow
+	reqSlow, err := http.NewRequest("GET", server.URL+"/slow", nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	respSlow, err := ht.RoundTrip(reqSlow)
+	if err != nil {
+		t.Fatalf("RoundTrip for /slow error: %v", err)
+	}
+
+	// Issue concurrent request to /fast
+	reqFast, err := http.NewRequest("GET", server.URL+"/fast", nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	respFast, err := ht.RoundTrip(reqFast)
+	if err != nil {
+		t.Fatalf("RoundTrip for /fast error: %v", err)
+	}
+
+	// /fast should succeed
+	bodyFast, err := io.ReadAll(respFast.Body)
+	respFast.Body.Close()
+	if err != nil {
+		t.Fatalf("ReadAll for /fast error: %v", err)
+	}
+	if string(bodyFast) != "fast response" {
+		t.Fatalf("unexpected body for /fast: %s", string(bodyFast))
+	}
+
+	// /slow response read should time out
+	buf := make([]byte, 1024)
+	_, readErr := respSlow.Body.Read(buf)
+	respSlow.Body.Close()
+	if readErr == nil {
+		t.Fatalf("expected timeout error on /slow, got nil")
 	}
 }
