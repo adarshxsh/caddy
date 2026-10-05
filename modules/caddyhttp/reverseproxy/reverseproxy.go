@@ -716,7 +716,8 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	// remember this failure (if enabled); response-based retries
 	// are not counted as failures since the upstream did respond
 	// successfully - only the response content triggered a retry
-	if _, isRetryableResponse := proxyErr.(retryableResponseError); !isRetryableResponse {
+	var rre retryableResponseError
+	if !errors.As(proxyErr, &rre) {
 		h.countFailure(upstream)
 	}
 
@@ -1343,9 +1344,14 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 	// HTTP request can be transmitted; but if the error is not
 	// specifically a dialer error, we need to be careful
 	if proxyErr != nil {
-		_, isDialError := proxyErr.(DialError)
-		_, isRetryableResponse := proxyErr.(retryableResponseError)
-		herr, isHandlerError := proxyErr.(caddyhttp.HandlerError)
+		var dialErr DialError
+		isDialError := errors.As(proxyErr, &dialErr)
+
+		var retryableErr retryableResponseError
+		isRetryableResponse := errors.As(proxyErr, &retryableErr)
+
+		var herr caddyhttp.HandlerError
+		isHandlerError := errors.As(proxyErr, &herr)
 
 		// if the error occurred after a connection was established,
 		// we have to assume the upstream received the request, and
@@ -1598,7 +1604,8 @@ func removeConnectionHeaders(h http.Header) {
 func statusError(err error) error {
 	// if a response-based retry was exhausted, use the actual upstream
 	// status code instead of a generic 502
-	if rre, ok := err.(retryableResponseError); ok {
+	var rre retryableResponseError
+	if errors.As(err, &rre) {
 		return caddyhttp.Error(rre.statusCode, err)
 	}
 
@@ -1606,7 +1613,8 @@ func statusError(err error) error {
 	statusCode := http.StatusBadGateway
 
 	// timeout errors have a standard status code (see issue #4823)
-	if err, ok := err.(net.Error); ok && err.Timeout() {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		statusCode = http.StatusGatewayTimeout
 	}
 
@@ -1726,6 +1734,15 @@ var hopHeaders = []string{
 // DialError is an error that specifically occurs
 // in a call to Dial or DialContext.
 type DialError struct{ error }
+
+// NewDialError wraps err in a DialError.
+func NewDialError(err error) DialError {
+	return DialError{err}
+}
+
+func (e DialError) Unwrap() error {
+	return e.error
+}
 
 // TLSTransport is implemented by transports
 // that are capable of using TLS.

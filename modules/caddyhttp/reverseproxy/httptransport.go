@@ -456,7 +456,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				err = tlsConn.HandshakeContext(ctx)
 				if err != nil {
 					_ = tlsConn.Close()
-					return nil, err
+					return nil, DialError{err}
 				}
 				return tlsConn, nil
 			}
@@ -502,23 +502,27 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				return nil, fmt.Errorf("making TLS client config for HTTP/3 transport: %v", err)
 			}
 
-			if strings.Contains(h.TLS.ServerName, "{") {
-				// copied from quic-go
-				udpConn, err := net.ListenUDP("udp", nil)
-				if err != nil {
-					return nil, fmt.Errorf("making udp socket for HTTP/3 transport: %v", err)
-				}
-				h.quicTransport = &quic.Transport{Conn: udpConn}
-				h.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-					// tlsCfg is already cloned from h3Transport.TLSClientConfig
+			udpConn, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, fmt.Errorf("making udp socket for HTTP/3 transport: %v", err)
+			}
+			h.quicTransport = &quic.Transport{Conn: udpConn}
+			serverNameHasPlaceholder := strings.Contains(h.TLS.ServerName, "{")
+			h.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				// tlsCfg is already cloned from h3Transport.TLSClientConfig
+				if serverNameHasPlaceholder {
 					repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 					tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
-					udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
-					if err != nil {
-						return nil, err
-					}
-					return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
 				}
+				udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
+				if err != nil {
+					return nil, DialError{err}
+				}
+				qconn, err := h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+				if err != nil {
+					return nil, DialError{err}
+				}
+				return qconn, nil
 			}
 		}
 	} else if len(h.Versions) > 1 && slices.Contains(h.Versions, "3") {
