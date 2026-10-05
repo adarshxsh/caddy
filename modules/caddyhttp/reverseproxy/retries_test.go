@@ -3,6 +3,7 @@ package reverseproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -783,5 +785,128 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	expectedBody := "hello world"
 	if rec.Body.String() != expectedBody {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
+	}
+}
+
+func TestDialErrorUnwrap(t *testing.T) {
+	inner := errors.New("underlying network error")
+	dialErr := DialError{inner}
+
+	if unwrapped := dialErr.Unwrap(); unwrapped != inner {
+		t.Errorf("Unwrap() = %v; want %v", unwrapped, inner)
+	}
+
+	wrapped := fmt.Errorf("outer wrapper: %w", dialErr)
+	var target DialError
+	if !errors.As(wrapped, &target) {
+		t.Errorf("errors.As failed to find DialError in wrapped chain")
+	}
+
+	if !errors.Is(wrapped, inner) {
+		t.Errorf("errors.Is failed to find inner error through DialError")
+	}
+}
+
+type fakeTimeoutError struct{}
+
+func (f fakeTimeoutError) Error() string   { return "i/o timeout" }
+func (f fakeTimeoutError) Timeout() bool   { return true }
+func (f fakeTimeoutError) Temporary() bool { return true }
+
+func TestStatusErrorDialTimeout(t *testing.T) {
+	timeoutErr := fakeTimeoutError{}
+	dialErr := DialError{timeoutErr}
+	wrappedErr := fmt.Errorf("dialing failed: %w", dialErr)
+
+	err := statusError(wrappedErr)
+	hErr, ok := err.(caddyhttp.HandlerError)
+	if !ok {
+		t.Fatalf("expected statusError to return caddyhttp.HandlerError, got %T", err)
+	}
+	if hErr.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("status code = %d; want %d (StatusGatewayTimeout)", hErr.StatusCode, http.StatusGatewayTimeout)
+	}
+}
+
+func TestTryAgainWrappedDialError(t *testing.T) {
+	lb := &LoadBalancing{Retries: 2}
+	req := httptest.NewRequest("POST", "http://example.com/", nil)
+	cctx := caddy.Context{Context: context.Background()}
+
+	wrappedDialErr := fmt.Errorf("outer error: %w", DialError{errors.New("connection refused")})
+	if !lb.tryAgain(cctx, time.Now(), 0, wrappedDialErr, req, zap.NewNop()) {
+		t.Errorf("tryAgain() = false for wrapped DialError on POST request; want true")
+	}
+
+	wrappedOtherErr := fmt.Errorf("outer error: %w", errors.New("other error"))
+	if lb.tryAgain(cctx, time.Now(), 0, wrappedOtherErr, req, zap.NewNop()) {
+		t.Errorf("tryAgain() = true for wrapped non-DialError on POST request; want false")
+	}
+}
+
+func TestTLSHandshakeTimeoutRetry(t *testing.T) {
+	goodServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(goodServer.Close)
+
+	hangingLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	t.Cleanup(func() { hangingLn.Close() })
+
+	go func() {
+		for {
+			conn, err := hangingLn.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	goodAddr := goodServer.Listener.Addr().String()
+	hangingAddr := hangingLn.Addr().String()
+
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			ServerName:         "{http.request.host}",
+			InsecureSkipVerify: true,
+		},
+		DialTimeout: caddy.Duration(500 * time.Millisecond),
+	}
+	cctx := caddy.Context{Context: context.Background()}
+	err = ht.Provision(cctx)
+	if err != nil {
+		t.Fatalf("failed to provision transport: %v", err)
+	}
+	ht.Transport.TLSHandshakeTimeout = 100 * time.Millisecond
+
+	handler := &Handler{
+		logger:    zap.NewNop(),
+		Transport: ht,
+		Upstreams: []*Upstream{
+			{Host: new(Host), Dial: hangingAddr},
+			{Host: new(Host), Dial: goodAddr},
+		},
+		LoadBalancing: &LoadBalancing{
+			Retries:         1,
+			SelectionPolicy: &RoundRobinSelection{},
+		},
+	}
+
+	req := httptest.NewRequest("POST", "https://localhost/", strings.NewReader("test body"))
+	req = prepareTestRequest(req)
+	rec := httptest.NewRecorder()
+
+	err = handler.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("expected request to succeed after retry on TLS handshake timeout, got err: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d; want %d", rec.Code, http.StatusOK)
 	}
 }
