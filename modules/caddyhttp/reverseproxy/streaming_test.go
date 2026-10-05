@@ -2,13 +2,18 @@ package reverseproxy
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func TestHandlerCopyResponse(t *testing.T) {
@@ -80,3 +85,59 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestReverseProxyPreannouncedTrailers(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Trailer", "X-Test-Trailer")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("hello trailer"))
+		w.Header().Set(http.TrailerPrefix+"X-Test-Trailer", "trailer-value")
+	}))
+	defer backend.Close()
+
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	transport := new(HTTPTransport)
+	if err := transport.Provision(caddyCtx); err != nil {
+		t.Fatalf("Provision transport failed: %v", err)
+	}
+
+	h := &Handler{
+		logger:    zap.NewNop(),
+		Transport: transport,
+		Upstreams: UpstreamPool{
+			{
+				Dial: backend.Listener.Addr().String(),
+				Host: new(Host),
+			},
+		},
+		LoadBalancing: &LoadBalancing{
+			SelectionPolicy: &RandomSelection{},
+		},
+	}
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := caddyhttp.PrepareRequest(r, caddy.NewReplacer(), nil, &caddyhttp.Server{})
+		_ = h.ServeHTTP(w, req, nil)
+	}))
+	defer proxyServer.Close()
+
+	res, err := http.Get(proxyServer.URL)
+	if err != nil {
+		t.Fatalf("HTTP GET failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if string(body) != "hello trailer" {
+		t.Errorf("got body %q, want %q", string(body), "hello trailer")
+	}
+
+	if got := res.Trailer.Get("X-Test-Trailer"); got != "trailer-value" {
+		t.Errorf("Trailer X-Test-Trailer = %q, want %q; res.Trailer = %#v", got, "trailer-value", res.Trailer)
+	}
+}
