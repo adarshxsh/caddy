@@ -229,6 +229,36 @@ func TestKeyNormalization(t *testing.T) {
 				Host: "::ffff:cff4:e77d",
 			},
 		},
+		{
+			input: "sub.{env.MY_VAR_{http.request.host}_HEADER}.com",
+			expect: Address{
+				Host: "sub.{env.MY_VAR_{http.request.host}_HEADER}.com",
+			},
+		},
+		{
+			input: "{env.FOO_{http.request.host}_{env.BAR}_BAZ}",
+			expect: Address{
+				Host: "{env.FOO_{http.request.host}_{env.BAR}_BAZ}",
+			},
+		},
+		{
+			input: "FOO}BAR",
+			expect: Address{
+				Host: "foo}bar",
+			},
+		},
+		{
+			input: "{env.MY_DOMAIN}}FOO",
+			expect: Address{
+				Host: "{env.MY_DOMAIN}}foo",
+			},
+		},
+		{
+			input: "FOO{BAR",
+			expect: Address{
+				Host: "foo{BAR",
+			},
+		},
 	}
 	for i, tc := range testCases {
 		addr, err := ParseAddress(tc.input)
@@ -251,3 +281,35 @@ func TestKeyNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLowerExceptPlaceholders(t *testing.T) {
+	testCases := []struct {
+		input  string
+		expect string
+	}{
+		{"EXAMPLE.COM", "example.com"},
+		{"{env.MY_VAR}", "{env.MY_VAR}"},
+		{"{env.MY_VAR_{http.request.host}_HEADER}", "{env.MY_VAR_{http.request.host}_HEADER}"},
+		{"sub.{env.MY_VAR_{http.request.host}_HEADER}.COM", "sub.{env.MY_VAR_{http.request.host}_HEADER}.com"},
+		{"{env.FOO_{http.request.host}_{env.BAR}_BAZ}", "{env.FOO_{http.request.host}_{env.BAR}_BAZ}"},
+		{"FOO}BAR", "foo}bar"},
+		{"{env.MY_DOMAIN}}FOO", "{env.MY_DOMAIN}}foo"},
+		{"FOO{BAR", "foo{BAR"},
+		{"sub.\\{env.MY_DOMAIN\\}", "sub.\\{env.my_domain\\}"},
+	}
+	for i, tc := range testCases {
+		actual := lowerExceptPlaceholders(tc.input)
+		if actual != tc.expect {
+			t.Errorf("Test %d: Input '%s': Expected '%s' but got '%s'", i, tc.input, tc.expect, actual)
+		}
+	}
+}
+
+func BenchmarkLowerExceptPlaceholders(b *testing.B) {
+	b.ReportAllocs()
+	s := "sub.{env.MY_VAR_{http.request.host}_HEADER}.com"
+	for i := 0; i < b.N; i++ {
+		_ = lowerExceptPlaceholders(s)
+	}
+}
+
