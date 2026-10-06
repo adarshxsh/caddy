@@ -97,6 +97,9 @@ linters:
       - linters:
           - errcheck
         path: _test\.go
+      - linters:
+          - modernize
+        text: "errorsastype"
     paths:
       - third_party$
       - builtin$
