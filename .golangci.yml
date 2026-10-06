@@ -8,10 +8,7 @@ run:
     - nopgx
 output:
   formats:
-    text:
-      path: stdout
-      print-linter-name: true
-      print-issued-lines: true
+    - format: colored-line-number
 linters:
   default: none
   enable:
@@ -32,7 +29,6 @@ linters:
     - importas
     - ineffassign
     - misspell
-    - modernize
     - prealloc
     - promlinter
     - sloglint
