@@ -8,7 +8,7 @@ run:
     - nopgx
 output:
   formats:
-    text:
+    colored-line-number:
       path: stdout
       print-linter-name: true
       print-issued-lines: true
@@ -97,6 +97,12 @@ linters:
       - linters:
           - errcheck
         path: _test\.go
+      - linters:
+          - modernize
+        text: errorsastype
+      - linters:
+          - staticcheck
+        text: SA1019.*golang.org/x/net/http2
     paths:
       - third_party$
       - builtin$
