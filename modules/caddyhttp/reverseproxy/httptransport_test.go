@@ -3,15 +3,24 @@ package reverseproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestHTTPTransportUnmarshalCaddyFileWithCaPools(t *testing.T) {
@@ -279,3 +288,232 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPTransport_ConditionalReadDeadline_IdleConnKeepAlive(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	readTimeout := 150 * time.Millisecond
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(readTimeout),
+		KeepAlive: &KeepAlive{
+			IdleConnTimeout: caddy.Duration(2 * time.Second),
+		},
+	}
+
+	err := ht.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	reqURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("Parse URL error: %v", err)
+	}
+
+	// First request
+	req1 := &http.Request{
+		Method: "GET",
+		URL:    reqURL,
+		Header: make(http.Header),
+	}
+	resp1, err := ht.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("First RoundTrip error: %v", err)
+	}
+	body1, err := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if err != nil || string(body1) != "ok" {
+		t.Fatalf("First request body error: %v, got %s", err, string(body1))
+	}
+
+	// Sleep longer than ReadTimeout (300ms > 150ms) while connection is idle in pool
+	time.Sleep(300 * time.Millisecond)
+
+	// Second request on the same idle connection
+	req2 := &http.Request{
+		Method: "GET",
+		URL:    reqURL,
+		Header: make(http.Header),
+	}
+	resp2, err := ht.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("Second RoundTrip error after idle interval: %v", err)
+	}
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if err != nil || string(body2) != "ok" {
+		t.Fatalf("Second request body error: %v, got %s", err, string(body2))
+	}
+}
+
+func TestHTTPTransport_ConditionalReadDeadline_ActiveReadTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "10")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		// Delay longer than ReadTimeout before writing remaining bytes
+		time.Sleep(300 * time.Millisecond)
+		w.Write([]byte("1234567890"))
+	}))
+	defer server.Close()
+
+	readTimeout := 100 * time.Millisecond
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(readTimeout),
+	}
+
+	err := ht.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	reqURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("Parse URL error: %v", err)
+	}
+
+	req := &http.Request{
+		Method: "GET",
+		URL:    reqURL,
+		Header: make(http.Header),
+	}
+
+	resp, err := ht.RoundTrip(req)
+	if err != nil {
+		// Response header read timed out
+		return
+	}
+	defer resp.Body.Close()
+
+	_, err = io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatal("Expected active read timeout error, got nil")
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		// PASS
+	} else if strings.Contains(err.Error(), "i/o timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+		// PASS
+	} else {
+		t.Fatalf("Expected timeout error, got: %v", err)
+	}
+}
+
+func TestHTTPTransport_ConditionalReadDeadline_HTTP2Multiplexed(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("h2-ok"))
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	readTimeout := 150 * time.Millisecond
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(readTimeout),
+		Versions:    []string{"2"},
+		TLS: &TLSConfig{
+			InsecureSkipVerify: true,
+		},
+	}
+
+	err := ht.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	reqURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("Parse URL error: %v", err)
+	}
+
+	// Request 1
+	req1 := &http.Request{
+		Method: "GET",
+		URL:    reqURL,
+		Header: make(http.Header),
+	}
+	resp1, err := ht.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("H2 First RoundTrip error: %v", err)
+	}
+	body1, err := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if err != nil || string(body1) != "h2-ok" {
+		t.Fatalf("H2 First request body error: %v, got %s", err, string(body1))
+	}
+
+	// Idle gap longer than ReadTimeout
+	time.Sleep(300 * time.Millisecond)
+
+	// Request 2 on same multiplexed H2 connection
+	req2 := &http.Request{
+		Method: "GET",
+		URL:    reqURL,
+		Header: make(http.Header),
+	}
+	resp2, err := ht.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("H2 Second RoundTrip error after idle window: %v", err)
+	}
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if err != nil || string(body2) != "h2-ok" {
+		t.Fatalf("H2 Second request body error: %v, got %s", err, string(body2))
+	}
+}
+
+func TestHTTPTransport_SetReadDeadline_ErrorLogging(t *testing.T) {
+	core, logs := observer.New(zapcore.ErrorLevel)
+	logger := zap.New(core)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer ln.Close()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("net.Dial: %v", err)
+	}
+
+	tcpConn := conn.(*net.TCPConn)
+	// Close connection so SetReadDeadline fails
+	tcpConn.Close()
+
+	wrapper := &tcpRWTimeoutConn{
+		TCPConn:     tcpConn,
+		readTimeout: 100 * time.Millisecond,
+		logger:      logger,
+	}
+
+	wrapper.clearReadDeadline()
+
+	entries := logs.All()
+	if len(entries) == 0 {
+		t.Fatal("Expected log entry on failed SetReadDeadline, got none")
+	}
+	if entries[0].Level != zapcore.ErrorLevel {
+		t.Errorf("Expected ErrorLevel log, got %v", entries[0].Level)
+	}
+	if entries[0].Message != "failed to set read deadline" {
+		t.Errorf("Expected message 'failed to set read deadline', got %q", entries[0].Message)
+	}
+}
+

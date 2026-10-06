@@ -21,14 +21,18 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	weakrand "math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -642,6 +646,39 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return h.h3Transport.RoundTrip(req)
 	}
 
+	if h.ReadTimeout > 0 {
+		var conn *tcpRWTimeoutConn
+		trace := &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				if c := getTCPRWTimeoutConn(info.Conn); c != nil {
+					conn = c
+					c.incActive()
+				}
+			},
+		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
+		resp, err := h.Transport.RoundTrip(req)
+		if err != nil {
+			if conn != nil {
+				conn.decActive()
+			}
+			return nil, err
+		}
+
+		if conn != nil {
+			if resp.Body == nil || resp.Body == http.NoBody {
+				conn.decActive()
+			} else {
+				resp.Body = &trackingResponseBody{
+					ReadCloser: resp.Body,
+					conn:       conn,
+				}
+			}
+		}
+		return resp, nil
+	}
+
 	return h.Transport.RoundTrip(req)
 }
 
@@ -929,10 +966,31 @@ type tcpRWTimeoutConn struct {
 	*net.TCPConn
 	readTimeout, writeTimeout time.Duration
 	logger                    *zap.Logger
+	activeCount               atomic.Int32
+}
+
+func (c *tcpRWTimeoutConn) incActive() {
+	c.activeCount.Add(1)
+}
+
+func (c *tcpRWTimeoutConn) decActive() {
+	if c.activeCount.Add(-1) <= 0 {
+		c.activeCount.Store(0)
+		c.clearReadDeadline()
+	}
+}
+
+func (c *tcpRWTimeoutConn) clearReadDeadline() {
+	err := c.TCPConn.SetReadDeadline(time.Time{})
+	if err != nil {
+		if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
+			ce.Write(zap.Error(err))
+		}
+	}
 }
 
 func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
-	if c.readTimeout > 0 {
+	if c.readTimeout > 0 && c.activeCount.Load() > 0 {
 		err := c.TCPConn.SetReadDeadline(time.Now().Add(c.readTimeout))
 		if err != nil {
 			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
@@ -953,6 +1011,52 @@ func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
 		}
 	}
 	return c.TCPConn.Write(b)
+}
+
+func getTCPRWTimeoutConn(conn net.Conn) *tcpRWTimeoutConn {
+	for conn != nil {
+		if c, ok := conn.(*tcpRWTimeoutConn); ok {
+			return c
+		}
+		type netConner interface {
+			NetConn() net.Conn
+		}
+		type unwrapper interface {
+			Unwrap() net.Conn
+		}
+		if nc, ok := conn.(netConner); ok {
+			conn = nc.NetConn()
+		} else if uw, ok := conn.(unwrapper); ok {
+			conn = uw.Unwrap()
+		} else {
+			break
+		}
+	}
+	return nil
+}
+
+type trackingResponseBody struct {
+	io.ReadCloser
+	conn *tcpRWTimeoutConn
+	once sync.Once
+}
+
+func (r *trackingResponseBody) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err != nil {
+		r.once.Do(func() {
+			r.conn.decActive()
+		})
+	}
+	return n, err
+}
+
+func (r *trackingResponseBody) Close() error {
+	err := r.ReadCloser.Close()
+	r.once.Do(func() {
+		r.conn.decActive()
+	})
+	return err
 }
 
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
