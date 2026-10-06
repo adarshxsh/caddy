@@ -25,7 +25,6 @@ func TestAddForwardedHeadersNonIP(t *testing.T) {
 
 	// Execute the unexported function
 	err := h.addForwardedHeaders(req)
-
 	// Expectation: No error should be returned for non-IP addresses.
 	// The function should simply skip the trusted proxy check.
 	if err != nil {
@@ -123,5 +122,53 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestAddForwardedHeaders_EmptyClientIPUntrusted(t *testing.T) {
+	h := Handler{}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = ":8080"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+
+	vars := map[string]any{
+		caddyhttp.TrustedProxyVarKey: false,
+		caddyhttp.ClientIPVarKey:     "",
+	}
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	err := h.addForwardedHeaders(req)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "" {
+		t.Errorf("X-Forwarded-For should be deleted for untrusted request with empty client IP, got %q", got)
+	}
+}
+
+func TestAddForwardedHeaders_EmptyClientIPTrusted(t *testing.T) {
+	h := Handler{}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = ":8080"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+
+	vars := map[string]any{
+		caddyhttp.TrustedProxyVarKey: true,
+		caddyhttp.ClientIPVarKey:     "",
+	}
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	err := h.addForwardedHeaders(req)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "1.2.3.4" {
+		t.Errorf("X-Forwarded-For = %q, want %q", got, "1.2.3.4")
 	}
 }
