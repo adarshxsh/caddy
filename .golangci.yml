@@ -65,6 +65,12 @@ linters:
       - std-error-handling
     rules:
       - linters:
+          - modernize
+        text: "errorsastype"
+      - linters:
+          - staticcheck
+        text: "SA1019"
+      - linters:
           - gosec
         text: G115 # TODO: Either we should fix the issues or nuke the linter if it's bad
       - linters:

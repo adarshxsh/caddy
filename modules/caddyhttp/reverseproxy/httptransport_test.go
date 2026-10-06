@@ -3,8 +3,10 @@ package reverseproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"reflect"
 	"testing"
@@ -277,5 +279,55 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestHTTPTransportTLSHandshakeErrorWrapping(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// Start a non-TLS server that will fail TLS handshake
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Close immediately on connection to trigger TLS handshake error
+			c.Close()
+		}
+	}()
+
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			ServerName: "{http.request.host}", // Triggers custom DialTLSContext
+		},
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://%s", ln.Addr().String()), nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, caddy.NewReplacer()))
+
+	resp, err := ht.RoundTrip(req)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatalf("expected TLS handshake error, got nil")
+	}
+
+	var dialErr DialError
+	if !errors.As(err, &dialErr) {
+		t.Fatalf("expected TLS handshake error to be wrapped in DialError, got %T (%v)", err, err)
 	}
 }
