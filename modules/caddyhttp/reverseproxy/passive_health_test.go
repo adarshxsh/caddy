@@ -26,6 +26,18 @@ import (
 	"github.com/caddyserver/caddy/v2"
 )
 
+// waitForCondition polls cond every 5ms up to timeout.
+func waitForCondition(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
+
 // newPassiveHandler builds a minimal Handler with passive health checks
 // configured and a live caddy.Context so the fail-forgetter goroutine can
 // be cancelled cleanly. The caller must call cancel() when done.
@@ -133,9 +145,7 @@ func TestCountFailureDecrementsAfterDuration(t *testing.T) {
 	}
 
 	// Wait long enough for the forgetter goroutine to fire.
-	time.Sleep(3 * failDuration)
-
-	if u.Host.Fails() != 0 {
+	if !waitForCondition(2*time.Second, func() bool { return u.Host.Fails() == 0 }) {
 		t.Errorf("expected fail count to return to 0 after FailDuration, got %d", u.Host.Fails())
 	}
 }
@@ -156,9 +166,8 @@ func TestCountFailureCancelledContextForgets(t *testing.T) {
 	// Cancelling the context should cause the forgetter goroutine to exit and
 	// decrement the count.
 	cancel()
-	time.Sleep(50 * time.Millisecond)
 
-	if u.Host.Fails() != 0 {
+	if !waitForCondition(2*time.Second, func() bool { return u.Host.Fails() == 0 }) {
 		t.Errorf("expected fail count to be decremented after context cancel, got %d", u.Host.Fails())
 	}
 }
@@ -217,9 +226,7 @@ func TestStaticUpstreamRecoversAfterFailDuration(t *testing.T) {
 		t.Fatal("upstream should be unhealthy immediately after MaxFails failure")
 	}
 
-	time.Sleep(3 * failDuration)
-
-	if !u.Healthy() {
+	if !waitForCondition(2*time.Second, func() bool { return u.Healthy() }) {
 		t.Errorf("upstream should recover to healthy after FailDuration, Fails=%d", u.Host.Fails())
 	}
 }
@@ -349,14 +356,12 @@ func TestDynamicUpstreamRecoveryAfterFailDuration(t *testing.T) {
 		t.Fatal("upstream should be unhealthy immediately after MaxFails failure")
 	}
 
-	time.Sleep(3 * failDuration)
-
-	// Re-provision (as a new request would) to get fresh *Upstream with policy set.
-	u2 := &Upstream{Dial: "10.3.0.4:80"}
-	h.provisionUpstream(u2, true)
-
-	if !u2.Healthy() {
-		t.Errorf("dynamic upstream should recover to healthy after FailDuration, Fails=%d", u2.Host.Fails())
+	if !waitForCondition(2*time.Second, func() bool {
+		u2 := &Upstream{Dial: "10.3.0.4:80"}
+		h.provisionUpstream(u2, true)
+		return u2.Healthy()
+	}) {
+		t.Errorf("dynamic upstream should recover to healthy after FailDuration, Fails=%d", u.Host.Fails())
 	}
 }
 
@@ -423,9 +428,7 @@ func TestCountFailureNilActiveHealthChecks(t *testing.T) {
 	}
 
 	// Wait long enough for the forgetter goroutine to fire and log without panic
-	time.Sleep(3 * failDuration)
-
-	if u.Host.Fails() != 0 {
+	if !waitForCondition(2*time.Second, func() bool { return u.Host.Fails() == 0 }) {
 		t.Errorf("expected fail count to return to 0 after FailDuration, got %d", u.Host.Fails())
 	}
 }
@@ -435,7 +438,7 @@ func TestCountFailureNilActiveHealthChecks(t *testing.T) {
 // logger without panicking when HealthChecks.Active is nil.
 func TestCountFailureLoggingAndErrorsWithNilActive(t *testing.T) {
 	resetDynamicHosts()
-	const failDuration = 10 * time.Millisecond
+	const failDuration = 50 * time.Millisecond
 	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	defer cancel()
 
@@ -458,22 +461,19 @@ func TestCountFailureLoggingAndErrorsWithNilActive(t *testing.T) {
 	h.countFailure(u)
 
 	// Manually decrement host fails so when forgetter runs host.countFail(-1), it gets "count below 0"
-	time.Sleep(2 * time.Millisecond)
 	_ = u.Host.countFail(-1)
 
-	time.Sleep(3 * failDuration)
-
-	logs := obs.All()
-	var found bool
-	for _, entry := range logs {
-		if entry.Message == "could not forget failure" {
-			found = true
-			if entry.LoggerName != "health_checker.passive" {
-				t.Errorf("expected logger name 'health_checker.passive', got '%s'", entry.LoggerName)
+	if !waitForCondition(2*time.Second, func() bool {
+		for _, entry := range obs.All() {
+			if entry.Message == "could not forget failure" {
+				if entry.LoggerName != "health_checker.passive" {
+					t.Errorf("expected logger name 'health_checker.passive', got '%s'", entry.LoggerName)
+				}
+				return true
 			}
 		}
-	}
-	if !found {
+		return false
+	}) {
 		t.Error("expected 'could not forget failure' log entry in observer")
 	}
 }
@@ -482,7 +482,7 @@ func TestCountFailureLoggingAndErrorsWithNilActive(t *testing.T) {
 // countFailure falls back to h.logger.Named("health_checker.passive") safely.
 func TestCountFailureFallbackLoggerWithNilActive(t *testing.T) {
 	resetDynamicHosts()
-	const failDuration = 10 * time.Millisecond
+	const failDuration = 50 * time.Millisecond
 	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	defer cancel()
 
@@ -505,22 +505,19 @@ func TestCountFailureFallbackLoggerWithNilActive(t *testing.T) {
 
 	h.countFailure(u)
 
-	time.Sleep(2 * time.Millisecond)
 	_ = u.Host.countFail(-1)
 
-	time.Sleep(3 * failDuration)
-
-	logs := obs.All()
-	var found bool
-	for _, entry := range logs {
-		if entry.Message == "could not forget failure" {
-			found = true
-			if entry.LoggerName != "health_checker.passive" {
-				t.Errorf("expected logger name 'health_checker.passive', got '%s'", entry.LoggerName)
+	if !waitForCondition(2*time.Second, func() bool {
+		for _, entry := range obs.All() {
+			if entry.Message == "could not forget failure" {
+				if entry.LoggerName != "health_checker.passive" {
+					t.Errorf("expected logger name 'health_checker.passive', got '%s'", entry.LoggerName)
+				}
+				return true
 			}
 		}
-	}
-	if !found {
+		return false
+	}) {
 		t.Error("expected fallback logger to record 'could not forget failure'")
 	}
 }
