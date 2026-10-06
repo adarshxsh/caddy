@@ -497,9 +497,10 @@ func (app *App) Start() error {
 			// when h2c is enabled but h2 disabled, we already removed h2 from NextProtos
 			// the handshake will never succeed with h2
 			// http2.ConfigureServer will enable the server to handle both h2 and h2c
+			//nolint:staticcheck
 			h2server := new(http2.Server)
-			//nolint:errcheck
-			http2.ConfigureServer(srv.server, h2server)
+			//nolint:staticcheck
+			_ = http2.ConfigureServer(srv.server, h2server)
 		}
 
 		// this TLS config is used by the std lib to choose the actual TLS config for connections
