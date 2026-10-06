@@ -516,4 +516,3 @@ func TestHTTPTransport_SetReadDeadline_ErrorLogging(t *testing.T) {
 		t.Errorf("Expected message 'failed to set read deadline', got %q", entries[0].Message)
 	}
 }
-
