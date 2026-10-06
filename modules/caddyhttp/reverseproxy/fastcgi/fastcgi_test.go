@@ -1,6 +1,10 @@
 package fastcgi
 
 import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -8,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -354,4 +360,30 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 	for _, p := range payloads {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
 	}
+}
+
+func TestFastCGIDialErrorWrapping(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	tr := Transport{}
+	require.NoError(t, tr.Provision(caddyCtx))
+	req, err := http.NewRequest("GET", "http://127.0.0.1:1/test.php", nil)
+	require.NoError(t, err)
+	ctx := context.WithValue(req.Context(), caddyhttp.ServerCtxKey, &caddyhttp.Server{})
+	ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, caddy.NewReplacer())
+	ctx = context.WithValue(ctx, caddyhttp.OriginalRequestCtxKey, *req)
+	req = req.WithContext(ctx)
+
+	resp, err := tr.RoundTrip(req)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	require.Error(t, err)
+
+	var dialErr reverseproxy.DialError
+	require.True(t, errors.As(err, &dialErr), "expected FastCGI connection failure to return reverseproxy.DialError")
+
+	var netErr net.Error
+	require.True(t, errors.As(err, &netErr), "expected FastCGI connection failure to wrap underlying net.Error using %w")
 }

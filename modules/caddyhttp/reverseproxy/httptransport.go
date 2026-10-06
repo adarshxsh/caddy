@@ -456,7 +456,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				err = tlsConn.HandshakeContext(ctx)
 				if err != nil {
 					_ = tlsConn.Close()
-					return nil, err
+					return nil, DialError{err}
 				}
 				return tlsConn, nil
 			}
