@@ -1021,12 +1021,53 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 				return nil
 			}
 			h := rw.Header()
+
+			// Snapshot pre-existing values for keys present in the 1xx header map
+			// so we can restore outer middleware headers and remove 1xx-only headers
+			// after writing the 1xx response.
+			type preExistingHeader struct {
+				rawKey string
+				values []string
+				exists bool
+			}
+			saved := make(map[string]preExistingHeader, len(header))
+			for k := range header {
+				ck := http.CanonicalHeaderKey(k)
+				if _, processed := saved[ck]; processed {
+					continue
+				}
+				val, exists := h[ck]
+				rawKey := ck
+				if !exists && ck != k {
+					val, exists = h[k]
+					if exists {
+						rawKey = k
+					}
+				}
+				if exists {
+					valCopy := append([]string(nil), val...)
+					saved[ck] = preExistingHeader{rawKey: rawKey, values: valCopy, exists: true}
+				} else {
+					saved[ck] = preExistingHeader{rawKey: rawKey, values: nil, exists: false}
+				}
+			}
+
 			copyHeader(h, http.Header(header))
 			rw.WriteHeader(code)
 
-			// Clear headers coming from the backend
-			// (it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses)
-			clear(h)
+			// Selectively restore pre-existing outer middleware header values
+			// or remove headers that were added solely for the 1xx response.
+			for ck, item := range saved {
+				if item.exists {
+					h[ck] = item.values
+					if item.rawKey != ck {
+						delete(h, item.rawKey)
+					}
+				} else {
+					delete(h, ck)
+					delete(h, item.rawKey)
+				}
+			}
 
 			return nil
 		},
