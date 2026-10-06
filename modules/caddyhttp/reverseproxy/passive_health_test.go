@@ -19,6 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
 	"github.com/caddyserver/caddy/v2"
 )
 
@@ -389,3 +393,135 @@ func TestDynamicUpstreamMaxRequestsFromUnhealthyRequestCount(t *testing.T) {
 		t.Error("upstream should be full at UnhealthyRequestCount concurrent requests")
 	}
 }
+
+// TestCountFailureNilActiveHealthChecks verifies that countFailure operates without
+// panicking when HealthChecks.Active is nil and HealthChecks.Passive is enabled.
+func TestCountFailureNilActiveHealthChecks(t *testing.T) {
+	resetDynamicHosts()
+	const failDuration = 50 * time.Millisecond
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	h := &Handler{
+		ctx: caddyCtx,
+		HealthChecks: &HealthChecks{
+			Active: nil, // explicitly nil active health checks
+			Passive: &PassiveHealthChecks{
+				MaxFails:     1,
+				FailDuration: caddy.Duration(failDuration),
+			},
+		},
+	}
+
+	u := &Upstream{Dial: "10.4.0.1:80", Host: new(Host)}
+
+	// Should count failure without panic even though Active is nil
+	h.countFailure(u)
+
+	if u.Host.Fails() != 1 {
+		t.Fatalf("expected 1 fail immediately after countFailure, got %d", u.Host.Fails())
+	}
+
+	// Wait long enough for the forgetter goroutine to fire and log without panic
+	time.Sleep(3 * failDuration)
+
+	if u.Host.Fails() != 0 {
+		t.Errorf("expected fail count to return to 0 after FailDuration, got %d", u.Host.Fails())
+	}
+}
+
+// TestCountFailureLoggingAndErrorsWithNilActive verifies that when countFail returns an error
+// (e.g. during forget failure if host count drops below 0), countFailure logs through the passive
+// logger without panicking when HealthChecks.Active is nil.
+func TestCountFailureLoggingAndErrorsWithNilActive(t *testing.T) {
+	resetDynamicHosts()
+	const failDuration = 10 * time.Millisecond
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	core, obs := observer.New(zapcore.ErrorLevel)
+	logger := zap.New(core)
+
+	h := &Handler{
+		ctx: caddyCtx,
+		HealthChecks: &HealthChecks{
+			Active: nil,
+			Passive: &PassiveHealthChecks{
+				FailDuration: caddy.Duration(failDuration),
+				logger:       logger.Named("health_checker.passive"),
+			},
+		},
+	}
+
+	u := &Upstream{Dial: "10.4.0.2:80", Host: new(Host)}
+
+	h.countFailure(u)
+
+	// Manually decrement host fails so when forgetter runs host.countFail(-1), it gets "count below 0"
+	time.Sleep(2 * time.Millisecond)
+	_ = u.Host.countFail(-1)
+
+	time.Sleep(3 * failDuration)
+
+	logs := obs.All()
+	var found bool
+	for _, entry := range logs {
+		if entry.Message == "could not forget failure" {
+			found = true
+			if entry.LoggerName != "health_checker.passive" {
+				t.Errorf("expected logger name 'health_checker.passive', got '%s'", entry.LoggerName)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected 'could not forget failure' log entry in observer")
+	}
+}
+
+// TestCountFailureFallbackLoggerWithNilActive verifies that when Passive.logger is nil,
+// countFailure falls back to h.logger.Named("health_checker.passive") safely.
+func TestCountFailureFallbackLoggerWithNilActive(t *testing.T) {
+	resetDynamicHosts()
+	const failDuration = 10 * time.Millisecond
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	core, obs := observer.New(zapcore.ErrorLevel)
+	baseLogger := zap.New(core)
+
+	h := &Handler{
+		ctx:    caddyCtx,
+		logger: baseLogger,
+		HealthChecks: &HealthChecks{
+			Active: nil,
+			Passive: &PassiveHealthChecks{
+				FailDuration: caddy.Duration(failDuration),
+				// Passive.logger is nil to test fallback
+			},
+		},
+	}
+
+	u := &Upstream{Dial: "10.4.0.3:80", Host: new(Host)}
+
+	h.countFailure(u)
+
+	time.Sleep(2 * time.Millisecond)
+	_ = u.Host.countFail(-1)
+
+	time.Sleep(3 * failDuration)
+
+	logs := obs.All()
+	var found bool
+	for _, entry := range logs {
+		if entry.Message == "could not forget failure" {
+			found = true
+			if entry.LoggerName != "health_checker.passive" {
+				t.Errorf("expected logger name 'health_checker.passive', got '%s'", entry.LoggerName)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected fallback logger to record 'could not forget failure'")
+	}
+}
+
