@@ -31,7 +31,6 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -1037,25 +1036,27 @@ func getTCPRWTimeoutConn(conn net.Conn) *tcpRWTimeoutConn {
 
 type trackingResponseBody struct {
 	io.ReadCloser
-	conn *tcpRWTimeoutConn
-	once sync.Once
+	conn   *tcpRWTimeoutConn
+	closed atomic.Bool
+}
+
+func (r *trackingResponseBody) decOnce() {
+	if r.closed.CompareAndSwap(false, true) {
+		r.conn.decActive()
+	}
 }
 
 func (r *trackingResponseBody) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	if err != nil {
-		r.once.Do(func() {
-			r.conn.decActive()
-		})
+		r.decOnce()
 	}
 	return n, err
 }
 
 func (r *trackingResponseBody) Close() error {
 	err := r.ReadCloser.Close()
-	r.once.Do(func() {
-		r.conn.decActive()
-	})
+	r.decOnce()
 	return err
 }
 
