@@ -635,7 +635,7 @@ func (s *Server) findLastRouteWithHostMatcher() int {
 	for i, route := range s.Routes {
 		// since we want to break out of an inner loop, use a closure
 		// to allow us to use 'return' when we found a host matcher
-		found := (func() bool {
+		found := func() bool {
 			for _, sets := range route.MatcherSets {
 				for _, matcher := range sets {
 					switch matcher.(type) {
@@ -646,7 +646,7 @@ func (s *Server) findLastRouteWithHostMatcher() int {
 				}
 			}
 			return false
-		})()
+		}()
 
 		// if we found the host matcher, change the lastIndex to
 		// just after the current route
