@@ -123,7 +123,7 @@ func TestInternalIssuer_Issue(t *testing.T) {
 		intermediateChainContents = append(intermediateChainContents, pem.EncodeToMemory(b)...)
 	}
 	intermediateChainFile := filepath.Join(dir, "intermediates.pem")
-	if err := os.WriteFile(intermediateChainFile, intermediateChainContents, 0644); err != nil {
+	if err := os.WriteFile(intermediateChainFile, intermediateChainContents, 0o644); err != nil {
 		t.Fatalf("Failed writing intermediate chain: %v", err)
 	}
 	intermediateChainKeyFile := filepath.Join(dir, "intermediates.key")
