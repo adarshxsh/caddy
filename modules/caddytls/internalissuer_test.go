@@ -25,12 +25,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddypki"
-	"go.uber.org/zap"
-
 	"go.step.sm/crypto/keyutil"
 	"go.step.sm/crypto/pemutil"
+	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddypki"
 )
 
 func TestInternalIssuer_Issue(t *testing.T) {
