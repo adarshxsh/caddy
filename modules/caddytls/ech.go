@@ -448,8 +448,8 @@ func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
 			pubTime := time.Now()
 			err := publisher.PublishECHConfigList(t.ctx, dnsNamesToPublish, echCfgListBin)
 
-			var publishErrs PublishECHConfigListErrors
-			if errors.As(err, &publishErrs) {
+			publishErrs, _ := errors.AsType[PublishECHConfigListErrors](err)
+			if publishErrs != nil {
 				// at least a partial failure, maybe a complete failure, but we can
 				// log each error by domain
 				for innerName, domainErr := range publishErrs {

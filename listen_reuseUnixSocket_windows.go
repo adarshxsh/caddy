@@ -66,8 +66,8 @@ func reuseUnixSocket(network, addr string) (any, error) {
 	// See: https://learn.microsoft.com/en-us/windows/win32/winsock/windows-sockets-error-codes-2#wsaeconnrefused
 	const WSAECONNREFUSED syscall.Errno = 10061
 
-	var errno syscall.Errno
-	hasNoListeningServerProcess := errors.As(err, &errno) && errno == WSAECONNREFUSED
+	errno, ok := errors.AsType[syscall.Errno](err)
+	hasNoListeningServerProcess := ok && errno == WSAECONNREFUSED
 
 	if !hasNoListeningServerProcess {
 		return nil, fmt.Errorf("cannot reuse socket %v: %w", addr, errUnixSocketAlreadyInUse)

@@ -2,6 +2,7 @@ package httpcaddyfile
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -296,5 +297,74 @@ func TestDefaultSNIWithoutHTTPS(t *testing.T) {
 
 	if !found {
 		t.Errorf("Expected default_sni 'my-sni.com' in TLS connection policies, but it was missing. Generated JSON: %s", string(result))
+	}
+}
+
+func TestPlaceholderHostSorting(t *testing.T) {
+	caddyfileStr := `http://:80 {
+		respond "catchall"
+	}
+	http://*.example.com {
+		respond "wildcard"
+	}
+	http://{env.DOMAIN} {
+		respond "placeholder"
+	}
+	http://app.example.com {
+		respond "literal"
+	}`
+
+	adapter := caddyfile.Adapter{
+		ServerType: ServerType{},
+	}
+
+	result, _, err := adapter.Adapt([]byte(caddyfileStr), nil)
+	if err != nil {
+		t.Fatalf("Failed to adapt Caddyfile: %v", err)
+	}
+
+	var config struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					Routes []struct {
+						Match []struct {
+							Host []string `json:"host"`
+						} `json:"match"`
+					} `json:"routes"`
+				} `json:"servers"`
+			} `json:"http"`
+		} `json:"apps"`
+	}
+
+	if err := json.Unmarshal(result, &config); err != nil {
+		t.Fatalf("Failed to unmarshal JSON config: %v", err)
+	}
+
+	server, ok := config.Apps.HTTP.Servers["srv0"]
+	if !ok {
+		t.Fatalf("Expected server 'srv0' to be created")
+	}
+
+	if len(server.Routes) != 4 {
+		t.Fatalf("Expected 4 routes, got %d", len(server.Routes))
+	}
+
+	expectedHosts := [][]string{
+		{"app.example.com"},
+		{"{env.DOMAIN}"},
+		{"*.example.com"},
+		nil,
+	}
+
+	for i, expected := range expectedHosts {
+		route := server.Routes[i]
+		var actualHost []string
+		if len(route.Match) > 0 {
+			actualHost = route.Match[0].Host
+		}
+		if !reflect.DeepEqual(actualHost, expected) {
+			t.Errorf("Route %d: expected host matcher %v, got %v", i, expected, actualHost)
+		}
 	}
 }
