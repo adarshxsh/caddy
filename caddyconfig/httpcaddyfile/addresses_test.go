@@ -251,3 +251,47 @@ func TestKeyNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestListenersForServerBlockAddressMultiBind(t *testing.T) {
+	st := new(ServerType)
+	addr := Address{Host: "example.com", Scheme: "https"}
+	sblock := serverBlock{
+		pile: map[string][]ConfigValue{
+			"bind": {
+				{
+					Value: addressesWithProtocols{
+						addresses: []string{"127.0.0.1"},
+						protocols: []string{"h1", "h2"},
+					},
+				},
+				{
+					Value: addressesWithProtocols{
+						addresses: []string{"127.0.0.1"},
+						protocols: []string{"h3"},
+					},
+				},
+			},
+		},
+	}
+
+	listeners, err := st.listenersForServerBlockAddress(sblock, addr, map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(listeners) == 0 {
+		t.Fatalf("expected listeners, got empty map")
+	}
+
+	for netAddr, protos := range listeners {
+		if _, ok := protos["h1"]; !ok {
+			t.Errorf("listener %s missing protocol 'h1'", netAddr)
+		}
+		if _, ok := protos["h2"]; !ok {
+			t.Errorf("listener %s missing protocol 'h2'", netAddr)
+		}
+		if _, ok := protos["h3"]; !ok {
+			t.Errorf("listener %s missing protocol 'h3'", netAddr)
+		}
+	}
+}
