@@ -176,6 +176,18 @@ func (r *Replacer) replace(input, empty string,
 	treatUnknownAsEmpty, errOnEmpty, errOnUnknown bool,
 	f ReplacementFunc,
 ) (string, error) {
+	return r.replaceRec(input, empty, treatUnknownAsEmpty, errOnEmpty, errOnUnknown, f, 0)
+}
+
+func (r *Replacer) replaceRec(input, empty string,
+	treatUnknownAsEmpty, errOnEmpty, errOnUnknown bool,
+	f ReplacementFunc,
+	depth int,
+) (string, error) {
+	if depth > 100 {
+		return "", fmt.Errorf("placeholder recursion limit exceeded")
+	}
+
 	if !strings.Contains(input, string(phOpen)) && !strings.Contains(input, string(phClose)) {
 		return input, nil
 	}
@@ -192,7 +204,6 @@ func (r *Replacer) replace(input, empty string,
 	// fail fast if too many placeholders are unclosed
 	var unclosedCount int
 
-scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
@@ -212,28 +223,50 @@ scan:
 			return "", fmt.Errorf("too many unclosed placeholders")
 		}
 
-		// find the end of the placeholder
-		end := strings.Index(input[i:], string(phClose)) + i
-		if end < i {
-			unclosedCount++
-			continue
+		// find the end of the placeholder using balanced bracket matching
+		end := -1
+		firstClose := -1
+		nesting := 1
+		for j := i + 1; j < len(input); j++ {
+			isEsc := j > 0 && j < len(input)-1 && input[j-1] == phEscape && (input[j] == phClose || input[j] == phOpen)
+			if input[j] == phClose {
+				if firstClose < 0 && !isEsc {
+					firstClose = j
+				}
+				if !isEsc {
+					nesting--
+					if nesting == 0 {
+						end = j
+						break
+					}
+				}
+			} else if input[j] == phOpen {
+				if !isEsc {
+					nesting++
+				}
+			}
 		}
 
-		// if necessary look for the first closing brace that is not escaped
-		for end > 0 && end < len(input)-1 && input[end-1] == phEscape {
-			nextEnd := strings.Index(input[end+1:], string(phClose))
-			if nextEnd < 0 {
-				unclosedCount++
-				continue scan
-			}
-			end += nextEnd + 1
+		if end < 0 && firstClose >= 0 {
+			end = firstClose
+		}
+
+		if end < 0 {
+			unclosedCount++
+			continue
 		}
 
 		// write the substring from the last cursor to this point
 		sb.WriteString(input[lastWriteCursor:i])
 
-		// trim opening bracket
-		key := input[i+1 : end]
+		// trim opening and closing bracket
+		rawKey := input[i+1 : end]
+
+		// recursively expand inner placeholders in rawKey before provider lookup
+		key, err := r.replaceRec(rawKey, empty, treatUnknownAsEmpty, errOnEmpty, errOnUnknown, f, depth+1)
+		if err != nil {
+			return "", err
+		}
 
 		// try to get a value for this key, handle empty values accordingly
 		val, found := r.Get(key)

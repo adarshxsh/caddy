@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -176,6 +177,82 @@ func TestReplacer(t *testing.T) {
 				i, tc.input, tc.expect, actual)
 		}
 	}
+}
+
+func TestNestedReplacer(t *testing.T) {
+	os.Setenv("VAR_example.com", "matched_env_value")
+	os.Setenv("VAR_{prefix}_example.com", "escaped_brace_success")
+	defer func() {
+		os.Unsetenv("VAR_example.com")
+		os.Unsetenv("VAR_{prefix}_example.com")
+	}()
+
+	rep := NewReplacer()
+	rep.Set("http.request.host", "example.com")
+	rep.Set("c", "3")
+	rep.Set("b_3", "2")
+	rep.Set("a_2", "1")
+	rep.Set("prefix_1", "deep_success")
+
+	t.Run("basic nested placeholder", func(t *testing.T) {
+		input := "{env.VAR_{http.request.host}}"
+		expected := "matched_env_value"
+		actual := rep.ReplaceAll(input, "")
+		if actual != expected {
+			t.Errorf("expected '%s', got '%s'", expected, actual)
+		}
+	})
+
+	t.Run("nested placeholder in string context", func(t *testing.T) {
+		input := "Header: {env.VAR_{http.request.host}} / path"
+		expected := "Header: matched_env_value / path"
+		actual := rep.ReplaceAll(input, "")
+		if actual != expected {
+			t.Errorf("expected '%s', got '%s'", expected, actual)
+		}
+	})
+
+	t.Run("deeply nested placeholders", func(t *testing.T) {
+		input := "{prefix_{a_{b_{c}}}}"
+		expected := "deep_success"
+		actual := rep.ReplaceAll(input, "")
+		if actual != expected {
+			t.Errorf("expected '%s', got '%s'", expected, actual)
+		}
+	})
+
+	t.Run("escaped braces inside nested placeholders", func(t *testing.T) {
+		input := "{env.VAR_\\{prefix\\}_{http.request.host}}"
+		expected := "escaped_brace_success"
+		actual := rep.ReplaceAll(input, "")
+		if actual != expected {
+			t.Errorf("expected '%s', got '%s'", expected, actual)
+		}
+	})
+
+	t.Run("error on unknown inner placeholder in ReplaceOrErr", func(t *testing.T) {
+		input := "{env.VAR_{unknown_inner_key}}"
+		_, err := rep.ReplaceOrErr(input, false, true)
+		if err == nil {
+			t.Errorf("expected error for unknown inner placeholder, got nil")
+		}
+	})
+
+	t.Run("recursion depth limit exceeded", func(t *testing.T) {
+		// Construct 102 levels of nested opening braces
+		var buf strings.Builder
+		for i := 0; i < 102; i++ {
+			buf.WriteString("{a.")
+		}
+		buf.WriteString("v")
+		for i := 0; i < 102; i++ {
+			buf.WriteString("}")
+		}
+		_, err := rep.ReplaceOrErr(buf.String(), false, true)
+		if err == nil {
+			t.Errorf("expected error for exceeding recursion depth limit, got nil")
+		}
+	})
 }
 
 func TestReplacerSet(t *testing.T) {
