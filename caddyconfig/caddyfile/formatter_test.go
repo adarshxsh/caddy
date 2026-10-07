@@ -490,6 +490,32 @@ import ./conf.d/matcher_not_my_subnet.caddy
 	order appsec after crowdsec
 }`,
 		},
+		{
+			description: "unspaced double quotes with braces and spaces",
+			input:       `respond"hello { world }"`,
+			expect:      `respond"hello { world }"`,
+		},
+		{
+			description: "unspaced double quotes in directive arguments",
+			input:       `header_up Host"example.com"`,
+			expect:      `header_up Host"example.com"`,
+		},
+		{
+			description: "unspaced double quotes in key-value assignment",
+			input:       `key="value"`,
+			expect:      `key="value"`,
+		},
+		{
+			description: "unspaced double quotes multi-line with braces",
+			input: `directive"line1
+{
+	line2
+}"`,
+			expect: `directive"line1
+{
+	line2
+}"`,
+		},
 	} {
 		// the formatter should output a trailing newline,
 		// even if the tests aren't written to expect that
@@ -505,3 +531,24 @@ import ./conf.d/matcher_not_my_subnet.caddy
 		}
 	}
 }
+
+func TestFormattingDifference_UnspacedQuotes(t *testing.T) {
+	testCases := []string{
+		`respond"hello { world }"`,
+		`header_up Host"example.com"`,
+		`key="value"`,
+		"directive\"line1\n{\n\tline2\n}\"",
+	}
+
+	for i, input := range testCases {
+		inputWithNewline := input
+		if !strings.HasSuffix(inputWithNewline, "\n") {
+			inputWithNewline += "\n"
+		}
+		warning, different := FormattingDifference("Caddyfile", []byte(inputWithNewline))
+		if different {
+			t.Errorf("Test %d: expected no formatting difference for input %q, got warning: %v", i, input, warning)
+		}
+	}
+}
+
