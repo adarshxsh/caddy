@@ -368,4 +368,3 @@ func TestPlaceholderHostSorting(t *testing.T) {
 		}
 	}
 }
-
