@@ -668,10 +668,10 @@ func (st *ServerType) serversFromPairings(
 				if strings.Contains(addr.Host, "*") || addr.Host == "" {
 					iWildcardHost = true
 				}
-				if specificity(addr.Host) > specificity(iLongestHost) {
+				if specificity(addr.Host) > specificity(iLongestHost) || (iLongestHost == "" && addr.Host != "") {
 					iLongestHost = addr.Host
 				}
-				if specificity(addr.Path) > specificity(iLongestPath) {
+				if specificity(addr.Path) > specificity(iLongestPath) || (iLongestPath == "" && addr.Path != "") {
 					iLongestPath = addr.Path
 				}
 			}
@@ -679,19 +679,19 @@ func (st *ServerType) serversFromPairings(
 				if strings.Contains(addr.Host, "*") || addr.Host == "" {
 					jWildcardHost = true
 				}
-				if specificity(addr.Host) > specificity(jLongestHost) {
+				if specificity(addr.Host) > specificity(jLongestHost) || (jLongestHost == "" && addr.Host != "") {
 					jLongestHost = addr.Host
 				}
-				if specificity(addr.Path) > specificity(jLongestPath) {
+				if specificity(addr.Path) > specificity(jLongestPath) || (jLongestPath == "" && addr.Path != "") {
 					jLongestPath = addr.Path
 				}
 			}
 			// catch-all blocks (blocks with no hostname) should always go
 			// last, even after blocks with wildcard hosts
-			if specificity(iLongestHost) == 0 {
+			if iLongestHost == "" {
 				return false
 			}
-			if specificity(jLongestHost) == 0 {
+			if jLongestHost == "" {
 				return true
 			}
 			if iWildcardHost != jWildcardHost {
