@@ -74,11 +74,10 @@ func replaceEnvVars(input []byte) []byte {
 			break
 		}
 		begin += offset // make beginning relative to input, not offset
-		end := bytes.Index(input[begin+len(spanOpen):], spanClose)
+		end := findSpanEnd(input, begin+len(spanOpen))
 		if end < 0 {
 			break
 		}
-		end += begin + len(spanOpen) // make end relative to input, not begin
 
 		// get the name; if there is no name, skip it
 		envString := input[begin+len(spanOpen) : end]
@@ -86,6 +85,9 @@ func replaceEnvVars(input []byte) []byte {
 			offset = end + len(spanClose)
 			continue
 		}
+
+		// evaluate any nested placeholders recursively (inside-out)
+		envString = replaceEnvVars(envString)
 
 		// split the string into a key and an optional default
 		envParts := strings.SplitN(string(envString), envVarDefaultDelimiter, 2)
@@ -108,6 +110,26 @@ func replaceEnvVars(input []byte) []byte {
 		offset = begin + len(envVarBytes)
 	}
 	return input
+}
+
+// findSpanEnd returns the index in input of the matching spanClose ('}')
+// for a spanOpen ("{$") starting at begin. It tracks brace nesting depth.
+// start is the index in input immediately after spanOpen (i.e. begin + len(spanOpen)).
+// If no matching closing brace is found, it returns -1.
+func findSpanEnd(input []byte, start int) int {
+	depth := 1
+	for i := start; i < len(input); i++ {
+		switch input[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 type parser struct {
