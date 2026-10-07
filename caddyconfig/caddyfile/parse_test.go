@@ -1031,6 +1031,47 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 	}
 }
 
+func TestImportWithBlockArgumentsNoPhantomTokens(t *testing.T) {
+	input := `
+		(site) {
+			http://{args[0]} {
+				{block}
+			}
+		}
+
+		import site example.com {
+			respond "hello"
+		}
+	`
+	p := testParser(input)
+	_, err := p.parseAll()
+	if err != nil {
+		t.Fatalf("parseAll failed: %v", err)
+	}
+
+	for _, tok := range p.tokens {
+		if tok.Text == "import" {
+			t.Errorf("found phantom 'import' token in p.tokens: %#v", tok)
+		}
+		if tok.Text == "site" {
+			t.Errorf("found phantom 'site' token in p.tokens: %#v", tok)
+		}
+	}
+
+	expectedTokens := []string{
+		"(site)", "{", "http://{args[0]}", "{", "{block}", "}", "}",
+		"http://example.com", "{", "respond", "hello", "}",
+	}
+	if len(p.tokens) != len(expectedTokens) {
+		t.Fatalf("expected %d tokens in p.tokens, got %d: %v", len(expectedTokens), len(p.tokens), p.tokens)
+	}
+	for i, expected := range expectedTokens {
+		if p.tokens[i].Text != expected {
+			t.Errorf("token %d: expected %q, got %q", i, expected, p.tokens[i].Text)
+		}
+	}
+}
+
 func testParser(input string) parser {
 	return parser{Dispenser: NewTestDispenser(input)}
 }
