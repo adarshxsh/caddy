@@ -2,6 +2,8 @@ package httpcaddyfile
 
 import (
 	"encoding/json"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -289,5 +291,92 @@ func TestMergeACMEIssuers(t *testing.T) {
 	}
 	if len(base.TrustedRootsPEMFiles) != 1 || base.TrustedRootsPEMFiles[0] != "global.pem" {
 		t.Fatalf("expected base roots to remain unchanged, got %v", base.TrustedRootsPEMFiles)
+	}
+}
+
+func TestConcurrentAdaptWithOrder(t *testing.T) {
+	caddyfiles := []string{
+		`{
+			order respond first
+		}
+		localhost {
+			respond "hello"
+		}`,
+		`{
+			order redir first
+			order respond after redir
+		}
+		localhost {
+			redir /foo /bar
+			respond "world"
+		}`,
+		`{
+			order root first
+		}
+		localhost {
+			root * /var/www
+			respond "root"
+		}`,
+	}
+
+	var wg sync.WaitGroup
+	adapter := caddyfile.Adapter{
+		ServerType: ServerType{},
+	}
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			input := caddyfiles[idx%len(caddyfiles)]
+			_, _, err := adapter.Adapt([]byte(input), nil)
+			if err != nil {
+				t.Errorf("Adapt error in goroutine %d: %v", idx, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestOrderIsolation(t *testing.T) {
+	baselineOrder := GetDirectiveOrder()
+
+	caddyfileA := `{
+		order respond first
+	}
+	localhost {
+		respond "A"
+	}`
+
+	caddyfileB := `localhost {
+		respond "B"
+	}`
+
+	adapter := caddyfile.Adapter{
+		ServerType: ServerType{},
+	}
+
+	// Adapt A
+	_, _, err := adapter.Adapt([]byte(caddyfileA), nil)
+	if err != nil {
+		t.Fatalf("Adapting Caddyfile A failed: %v", err)
+	}
+
+	// Check that GetDirectiveOrder() is unchanged
+	afterOrder := GetDirectiveOrder()
+	if !slices.Equal(baselineOrder, afterOrder) {
+		t.Fatalf("Global directive order was modified by Caddyfile A!\nExpected: %v\nGot: %v", baselineOrder, afterOrder)
+	}
+
+	// Adapt B
+	_, _, err = adapter.Adapt([]byte(caddyfileB), nil)
+	if err != nil {
+		t.Fatalf("Adapting Caddyfile B failed: %v", err)
+	}
+
+	// Double check GetDirectiveOrder() again
+	finalOrder := GetDirectiveOrder()
+	if !slices.Equal(baselineOrder, finalOrder) {
+		t.Fatalf("Global directive order was modified after adapting Caddyfile B!\nExpected: %v\nGot: %v", baselineOrder, finalOrder)
 	}
 }

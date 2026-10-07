@@ -818,7 +818,12 @@ func parseRoute(h Helper) (caddyhttp.MiddlewareHandler, error) {
 		}
 	}
 
-	return buildSubroute(allResults, h.groupCounter, false)
+	var order []string
+	if ord, ok := h.Option("order").([]string); ok {
+		order = ord
+	}
+
+	return buildSubroute(allResults, h.groupCounter, false, order)
 }
 
 func parseHandle(h Helper) (caddyhttp.MiddlewareHandler, error) {
