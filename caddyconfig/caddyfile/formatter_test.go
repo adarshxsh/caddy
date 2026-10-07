@@ -551,4 +551,3 @@ func TestFormattingDifference_UnspacedQuotes(t *testing.T) {
 		}
 	}
 }
-
