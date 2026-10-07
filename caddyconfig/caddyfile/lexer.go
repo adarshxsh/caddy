@@ -187,16 +187,58 @@ func (l *lexer) next() (bool, error) {
 
 			// check if we're done, i.e. that the last few characters are the marker
 			if len(val) >= len(heredocMarker) && heredocMarker == string(val[len(val)-len(heredocMarker):]) {
-				// set the final value
-				val, err = l.finalizeHeredoc(val, heredocMarker)
-				if err != nil {
-					return false, err
+				markerStart := len(val) - len(heredocMarker)
+
+				// Verify line-start prefix: any characters preceding the candidate marker
+				// on the current line must consist exclusively of horizontal whitespace (' ' or '\t').
+				lineStart := 0
+				for i := markerStart - 1; i >= 0; i-- {
+					if val[i] == '\n' {
+						lineStart = i + 1
+						break
+					}
 				}
 
-				// set the line counter, and make the token
-				l.line += l.skippedLines
-				l.skippedLines = 0
-				return makeToken('<'), nil
+				validPrefix := true
+				for _, r := range val[lineStart:markerStart] {
+					if r != ' ' && r != '\t' {
+						validPrefix = false
+						break
+					}
+				}
+
+				if validPrefix {
+					// Delimiter lookahead: character immediately following candidate marker must be
+					// horizontal whitespace (' ' or '\t'), a line break ('\r' or '\n'), or EOF.
+					nextCh, _, peekErr := l.reader.ReadRune()
+					validSuffix := false
+					switch peekErr {
+					case io.EOF:
+						validSuffix = true
+					case nil:
+						if nextCh == ' ' || nextCh == '\t' || nextCh == '\r' || nextCh == '\n' {
+							validSuffix = true
+						}
+						if err := l.reader.UnreadRune(); err != nil {
+							return false, err
+						}
+					default:
+						return false, peekErr
+					}
+
+					if validSuffix {
+						// set the final value
+						val, err = l.finalizeHeredoc(val, heredocMarker)
+						if err != nil {
+							return false, err
+						}
+
+						// set the line counter, and make the token
+						l.line += l.skippedLines
+						l.skippedLines = 0
+						return makeToken('<'), nil
+					}
+				}
 			}
 
 			// stay in the heredoc until we find the ending marker
