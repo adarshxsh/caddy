@@ -636,6 +636,10 @@ func TestParseAll(t *testing.T) {
 func TestEnvironmentReplacement(t *testing.T) {
 	os.Setenv("FOOBAR", "foobar")
 	os.Setenv("CHAINED", "$FOOBAR")
+	os.Setenv("ENV_NAME", "PROD")
+	os.Setenv("PREFIX_PROD", "https://prod.example.com")
+	os.Setenv("PREFIX_DEV", "http://dev.local")
+	os.Setenv("INNER", "val")
 
 	for i, test := range []struct {
 		input  string
@@ -721,10 +725,77 @@ func TestEnvironmentReplacement(t *testing.T) {
 			input:  "}{$",
 			expect: "}{$",
 		},
+		{
+			input:  "{$PREFIX_{$ENV_NAME}:default_val}",
+			expect: "https://prod.example.com",
+		},
+		{
+			input:  "{$PREFIX_{$UNSET_ENV:DEV}:default_val}",
+			expect: "http://dev.local",
+		},
+		{
+			input:  "{$PREFIX_{$UNSET_ENV}:default_val}",
+			expect: "default_val",
+		},
+		{
+			input:  `{$CONFIG:{"status":"active"}}`,
+			expect: `{"status":"active"}`,
+		},
+		{
+			input:  `{$CONFIG:{"key":"{$INNER}"}}`,
+			expect: `{"key":"val"}`,
+		},
+		{
+			input:  `{$CONFIG:{"key":"{$UNSET:default_inner}"}}`,
+			expect: `{"key":"default_inner"}`,
+		},
+		{
+			input:  "{$UNCLOSED_{$ENV_NAME}",
+			expect: "{$UNCLOSED_{$ENV_NAME}",
+		},
 	} {
 		actual := replaceEnvVars([]byte(test.input))
 		if !bytes.Equal(actual, []byte(test.expect)) {
 			t.Errorf("Test %d: Expected: '%s' but got '%s'", i, test.expect, actual)
+		}
+	}
+}
+
+func TestFindSpanEnd(t *testing.T) {
+	for i, test := range []struct {
+		input  string
+		start  int
+		expect int
+	}{
+		{
+			input:  "{$FOOBAR}",
+			start:  2,
+			expect: 8,
+		},
+		{
+			input:  `{$CONFIG:{"status":"active"}}`,
+			start:  2,
+			expect: 28,
+		},
+		{
+			input:  "{$PREFIX_{$NAME}:default}",
+			start:  2,
+			expect: 24,
+		},
+		{
+			input:  "{$UNCLOSED",
+			start:  2,
+			expect: -1,
+		},
+		{
+			input:  "{$NESTED_{$UNCLOSED}",
+			start:  2,
+			expect: -1,
+		},
+	} {
+		actual := findSpanEnd([]byte(test.input), test.start)
+		if actual != test.expect {
+			t.Errorf("Test %d (%s): Expected end %d but got %d", i, test.input, test.expect, actual)
 		}
 	}
 }
