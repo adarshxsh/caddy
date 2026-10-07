@@ -212,16 +212,17 @@ func (l *lexer) next() (bool, error) {
 					// horizontal whitespace (' ' or '\t'), a line break ('\r' or '\n'), or EOF.
 					nextCh, _, peekErr := l.reader.ReadRune()
 					validSuffix := false
-					if peekErr == io.EOF {
+					switch peekErr {
+					case io.EOF:
 						validSuffix = true
-					} else if peekErr == nil {
+					case nil:
 						if nextCh == ' ' || nextCh == '\t' || nextCh == '\r' || nextCh == '\n' {
 							validSuffix = true
 						}
 						if err := l.reader.UnreadRune(); err != nil {
 							return false, err
 						}
-					} else {
+					default:
 						return false, peekErr
 					}
 
