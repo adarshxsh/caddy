@@ -25,12 +25,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddypki"
-	"go.uber.org/zap"
-
 	"go.step.sm/crypto/keyutil"
 	"go.step.sm/crypto/pemutil"
+	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddypki"
 )
 
 func TestInternalIssuer_Issue(t *testing.T) {
@@ -123,7 +123,7 @@ func TestInternalIssuer_Issue(t *testing.T) {
 		intermediateChainContents = append(intermediateChainContents, pem.EncodeToMemory(b)...)
 	}
 	intermediateChainFile := filepath.Join(dir, "intermediates.pem")
-	if err := os.WriteFile(intermediateChainFile, intermediateChainContents, 0644); err != nil {
+	if err := os.WriteFile(intermediateChainFile, intermediateChainContents, 0o644); err != nil {
 		t.Fatalf("Failed writing intermediate chain: %v", err)
 	}
 	intermediateChainKeyFile := filepath.Join(dir, "intermediates.key")

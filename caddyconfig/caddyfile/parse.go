@@ -354,6 +354,8 @@ func (p *parser) directives() error {
 // other words, call Next() to access the first token that was
 // imported.
 func (p *parser) doImport(nesting int) error {
+	importIndex := p.cursor
+
 	// syntax checks
 	if !p.NextArg() {
 		return p.ArgErr()
@@ -401,8 +403,7 @@ func (p *parser) doImport(nesting int) error {
 	}
 
 	// splice out the import directive and its arguments
-	// (2 tokens, plus the length of args)
-	tokensBefore := p.tokens[:p.cursor-1-len(args)-len(blockTokens)]
+	tokensBefore := p.tokens[:importIndex]
 	tokensAfter := p.tokens[p.cursor+1:]
 	var importedTokens []Token
 	var nodes []string
@@ -578,7 +579,7 @@ func (p *parser) doImport(nesting int) error {
 	// splice the imported tokens in the place of the import statement
 	// and rewind cursor so Next() will land on first imported token
 	p.tokens = append(tokensBefore, append(tokensCopy, tokensAfter...)...)
-	p.cursor -= len(args) + len(blockTokens) + 1
+	p.cursor = importIndex
 
 	return nil
 }

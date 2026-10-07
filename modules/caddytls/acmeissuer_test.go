@@ -1,9 +1,11 @@
 package caddytls
 
 import (
-	"github.com/caddyserver/caddy/v2"
-	"github.com/mholt/acmez/v3/acme"
 	"testing"
+
+	"github.com/mholt/acmez/v3/acme"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func TestACMEIssuerExpandPlaceholders(t *testing.T) {
