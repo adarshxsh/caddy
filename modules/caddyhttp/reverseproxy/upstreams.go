@@ -106,6 +106,9 @@ func (su *SRVUpstreams) Provision(ctx caddy.Context) error {
 		su.resolver = &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				if len(su.Resolver.netAddrs) == 0 {
+					return nil, fmt.Errorf("no resolver addresses available")
+				}
 				//nolint:gosec
 				addr := su.Resolver.netAddrs[weakrand.IntN(len(su.Resolver.netAddrs))]
 				return d.DialContext(ctx, addr.Network, addr.JoinHostPort(0))
@@ -341,6 +344,9 @@ func (au *AUpstreams) Provision(ctx caddy.Context) error {
 		au.resolver = &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				if len(au.Resolver.netAddrs) == 0 {
+					return nil, fmt.Errorf("no resolver addresses available")
+				}
 				//nolint:gosec
 				addr := au.Resolver.netAddrs[weakrand.IntN(len(au.Resolver.netAddrs))]
 				return d.DialContext(ctx, addr.Network, addr.JoinHostPort(0))
@@ -535,6 +541,10 @@ type UpstreamResolver struct {
 // ParseAddresses parses all the configured network addresses
 // and ensures they're ready to be used.
 func (u *UpstreamResolver) ParseAddresses() error {
+	u.netAddrs = nil
+	if len(u.Addresses) == 0 {
+		return fmt.Errorf("no resolver addresses configured")
+	}
 	for _, v := range u.Addresses {
 		addr, err := caddy.ParseNetworkAddressWithDefaults(v, "udp", 53)
 		if err != nil {

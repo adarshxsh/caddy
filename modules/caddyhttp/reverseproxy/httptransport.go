@@ -267,6 +267,9 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 		dialer.Resolver = &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				if len(h.Resolver.netAddrs) == 0 {
+					return nil, fmt.Errorf("no resolver addresses available")
+				}
 				//nolint:gosec
 				addr := h.Resolver.netAddrs[weakrand.IntN(len(h.Resolver.netAddrs))]
 				return d.DialContext(ctx, addr.Network, addr.JoinHostPort(0))
