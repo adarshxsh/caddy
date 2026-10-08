@@ -168,11 +168,11 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 		// out and an error will be returned alongside the remaining results, if any." Thus, we
 		// only return an error if no records were also returned.
 		if len(records) == 0 {
-			if su.GracePeriod > 0 {
+			if su.GracePeriod > 0 && len(cached.upstreams) > 0 {
 				if c := su.logger.Check(zapcore.ErrorLevel, "SRV lookup failed; using previously cached"); c != nil {
 					c.Write(zap.Error(err))
 				}
-				cached.freshness = time.Now().Add(time.Duration(su.GracePeriod) - time.Duration(su.Refresh))
+				cached.expiresAt = time.Now().Add(time.Duration(su.GracePeriod))
 				srvs[suAddr] = cached
 				return allNew(cached.upstreams), nil
 			}
@@ -201,7 +201,7 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	}
 
 	// before adding a new one to the cache (as opposed to replacing stale one), make room if cache is full
-	if cached.freshness.IsZero() && len(srvs) >= 100 {
+	if cached.expiresAt.IsZero() && len(srvs) >= 100 {
 		for randomKey := range srvs {
 			delete(srvs, randomKey)
 			break
@@ -210,7 +210,7 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 
 	srvs[suAddr] = srvLookup{
 		srvUpstreams: su,
-		freshness:    time.Now(),
+		expiresAt:    time.Now().Add(time.Duration(su.Refresh)),
 		upstreams:    upstreams,
 	}
 
@@ -249,12 +249,12 @@ func (SRVUpstreams) formattedAddr(service, proto, name string) string {
 
 type srvLookup struct {
 	srvUpstreams SRVUpstreams
-	freshness    time.Time
+	expiresAt    time.Time
 	upstreams    []Upstream
 }
 
 func (sl srvLookup) isFresh() bool {
-	return time.Since(sl.freshness) < time.Duration(sl.srvUpstreams.Refresh)
+	return time.Now().Before(sl.expiresAt)
 }
 
 type IPVersions struct {
