@@ -268,7 +268,7 @@ func (m MatchClientIP) MatchWithError(r *http.Request) (bool, error) {
 		return false, Error(http.StatusTooEarly, fmt.Errorf("TLS handshake not complete, remote IP cannot be verified"))
 	}
 
-	address := GetVar(r.Context(), ClientIPVarKey).(string)
+	address, _ := GetVar(r.Context(), ClientIPVarKey).(string)
 	clientIP, zoneID, err := parseIPZoneFromString(address)
 	if err != nil {
 		m.logger.Error("getting client IP", zap.Error(err))

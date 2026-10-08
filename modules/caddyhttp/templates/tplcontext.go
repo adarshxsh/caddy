@@ -290,7 +290,7 @@ func (c TemplateContext) RemoteIP() string {
 // if the request is trusted (see trusted_proxies), otherwise returns
 // the connection's remote IP.
 func (c TemplateContext) ClientIP() string {
-	address := caddyhttp.GetVar(c.Req.Context(), caddyhttp.ClientIPVarKey).(string)
+	address, _ := caddyhttp.GetVar(c.Req.Context(), caddyhttp.ClientIPVarKey).(string)
 	clientIP, _, err := net.SplitHostPort(address)
 	if err != nil {
 		clientIP = address // no port
