@@ -484,6 +484,21 @@ func TestClientIPHashPolicy(t *testing.T) {
 		// If it is nil, it means we missed a host even though one is available
 		t.Error("Expected ip hash policy host to not be nil, but it is nil.")
 	}
+
+	// Requests with missing context variables or uninitialized context should not panic
+	pool = testPool()
+	reqNoCtx, _ := http.NewRequest("GET", "/", nil)
+	h = ipHash.Select(pool, reqNoCtx, nil)
+	if h == nil {
+		t.Error("Expected ip hash policy host to not be nil for request without context variables.")
+	}
+
+	reqNoClientIP, _ := http.NewRequest("GET", "/", nil)
+	reqNoClientIP = reqNoClientIP.WithContext(context.WithValue(reqNoClientIP.Context(), caddyhttp.VarsCtxKey, make(map[string]any)))
+	h = ipHash.Select(pool, reqNoClientIP, nil)
+	if h == nil {
+		t.Error("Expected ip hash policy host to not be nil for request missing client IP var key.")
+	}
 }
 
 func TestFirstPolicy(t *testing.T) {
