@@ -8,10 +8,8 @@ run:
     - nopgx
 output:
   formats:
-    text:
+    colored-line-number:
       path: stdout
-      print-linter-name: true
-      print-issued-lines: true
 linters:
   default: none
   enable:
