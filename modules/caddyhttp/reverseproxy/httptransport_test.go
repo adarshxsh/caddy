@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -275,6 +276,64 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			t.Cleanup(func() { conn.Close() })
 			if got := conn.RemoteAddr().String(); got != ln.Addr().String() {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_DialTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	tests := []struct {
+		name                 string
+		dialTimeout          caddy.Duration
+		wantValidateErr      bool
+		wantNewTransportErr  bool
+		expectedFinalTimeout caddy.Duration
+	}{
+		{
+			name:                "negative dial timeout",
+			dialTimeout:         caddy.Duration(-1 * time.Second),
+			wantValidateErr:     true,
+			wantNewTransportErr: true,
+		},
+		{
+			name:                 "zero dial timeout applies default 3s",
+			dialTimeout:          0,
+			wantValidateErr:      false,
+			wantNewTransportErr:  false,
+			expectedFinalTimeout: caddy.Duration(3 * time.Second),
+		},
+		{
+			name:                 "positive dial timeout preserved",
+			dialTimeout:          caddy.Duration(5 * time.Second),
+			wantValidateErr:      false,
+			wantNewTransportErr:  false,
+			expectedFinalTimeout: caddy.Duration(5 * time.Second),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ht := &HTTPTransport{
+				DialTimeout: tt.dialTimeout,
+			}
+
+			err := ht.Validate()
+			if (err != nil) != tt.wantValidateErr {
+				t.Errorf("HTTPTransport.Validate() error = %v, wantValidateErr %v", err, tt.wantValidateErr)
+			}
+
+			_, err = ht.NewTransport(ctx)
+			if (err != nil) != tt.wantNewTransportErr {
+				t.Errorf("HTTPTransport.NewTransport() error = %v, wantNewTransportErr %v", err, tt.wantNewTransportErr)
+			}
+
+			if !tt.wantNewTransportErr {
+				if ht.DialTimeout != tt.expectedFinalTimeout {
+					t.Errorf("HTTPTransport.DialTimeout = %v, want %v", ht.DialTimeout, tt.expectedFinalTimeout)
+				}
 			}
 		})
 	}
