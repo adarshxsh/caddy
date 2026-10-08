@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -25,7 +26,6 @@ func TestAddForwardedHeadersNonIP(t *testing.T) {
 
 	// Execute the unexported function
 	err := h.addForwardedHeaders(req)
-
 	// Expectation: No error should be returned for non-IP addresses.
 	// The function should simply skip the trusted proxy check.
 	if err != nil {
@@ -123,5 +123,111 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestPrepareRequest_MissingContextVars(t *testing.T) {
+	h := Handler{}
+
+	testCases := []struct {
+		name string
+		vars map[string]any
+	}{
+		{
+			name: "no_vars_in_context",
+			vars: nil,
+		},
+		{
+			name: "empty_vars_map",
+			vars: map[string]any{},
+		},
+		{
+			name: "wrong_type_vars",
+			vars: map[string]any{
+				caddyhttp.ClientIPVarKey:     12345,
+				caddyhttp.TrustedProxyVarKey: "not_a_bool",
+			},
+		},
+		{
+			name: "nil_type_vars",
+			vars: map[string]any{
+				caddyhttp.ClientIPVarKey:     nil,
+				caddyhttp.TrustedProxyVarKey: nil,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com/test", nil)
+			req.RemoteAddr = "192.168.1.1:1234"
+			req.Header.Set("X-Forwarded-For", "spoofed.ip")
+
+			if tc.vars != nil {
+				ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, tc.vars)
+				req = req.WithContext(ctx)
+			}
+
+			repl := caddy.NewReplacer()
+			preparedReq, err := h.prepareRequest(req, repl)
+			if err != nil {
+				t.Fatalf("prepareRequest returned unexpected error: %v", err)
+			}
+
+			if got := preparedReq.Header.Get("Via"); got == "" {
+				t.Errorf("Via header missing after prepareRequest")
+			}
+
+			// When TrustedProxyVarKey is missing or invalid, trusted evaluates to false,
+			// so existing X-Forwarded-For ("spoofed.ip") should be replaced with RemoteAddr IP.
+			if got := preparedReq.Header.Get("X-Forwarded-For"); got == "spoofed.ip" {
+				t.Errorf("X-Forwarded-For was not sanitized for untrusted request")
+			}
+		})
+	}
+}
+
+func TestAddForwardedHeaders_MissingOrInvalidContextVars(t *testing.T) {
+	h := Handler{}
+
+	testCases := []struct {
+		name string
+		vars map[string]any
+	}{
+		{
+			name: "no_vars_in_context",
+			vars: nil,
+		},
+		{
+			name: "wrong_types",
+			vars: map[string]any{
+				caddyhttp.TrustedProxyVarKey: "true",
+				caddyhttp.ClientIPVarKey:     999,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com/", nil)
+			req.RemoteAddr = "10.0.0.1:5000"
+			req.Header.Set("X-Forwarded-For", "203.0.113.195")
+
+			if tc.vars != nil {
+				ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, tc.vars)
+				req = req.WithContext(ctx)
+			}
+
+			err := h.addForwardedHeaders(req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// Since trusted_proxy is missing or invalid (not bool), trusted evaluates to false.
+			// Untrusted X-Forwarded-For header should be replaced with remote IP.
+			if got := req.Header.Get("X-Forwarded-For"); got != "10.0.0.1" {
+				t.Errorf("X-Forwarded-For = %q, want %q", got, "10.0.0.1")
+			}
+		})
 	}
 }
