@@ -26,7 +26,6 @@ func TestAddForwardedHeadersNonIP(t *testing.T) {
 
 	// Execute the unexported function
 	err := h.addForwardedHeaders(req)
-
 	// Expectation: No error should be returned for non-IP addresses.
 	// The function should simply skip the trusted proxy check.
 	if err != nil {
