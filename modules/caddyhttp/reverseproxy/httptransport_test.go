@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -278,4 +279,44 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPTransport_NegativeDialTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	ht := &HTTPTransport{
+		DialTimeout: caddy.Duration(-1 * time.Second),
+	}
+
+	rt, err := ht.NewTransport(ctx)
+	if err != nil {
+		t.Fatalf("NewTransport failed: %v", err)
+	}
+
+	if ht.DialTimeout != caddy.Duration(3*time.Second) {
+		t.Errorf("expected DialTimeout to be sanitized to 3s, got %v", ht.DialTimeout)
+	}
+
+	conn, err := rt.DialContext(ctx, "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("DialContext failed: %v", err)
+	}
+	conn.Close()
 }

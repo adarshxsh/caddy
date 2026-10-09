@@ -221,7 +221,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 
 	// Set a relatively short default dial timeout.
 	// This is helpful to make load-balancer retries more speedy.
-	if h.DialTimeout == 0 {
+	if h.DialTimeout <= 0 {
 		h.DialTimeout = caddy.Duration(3 * time.Second)
 	}
 
