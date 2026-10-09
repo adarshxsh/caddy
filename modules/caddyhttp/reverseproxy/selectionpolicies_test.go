@@ -484,6 +484,14 @@ func TestClientIPHashPolicy(t *testing.T) {
 		// If it is nil, it means we missed a host even though one is available
 		t.Error("Expected ip hash policy host to not be nil, but it is nil.")
 	}
+
+	// Should not panic when client IP context variable is missing or context is uninitialized
+	pool = testPool()
+	uninitReq, _ := http.NewRequest("GET", "/", nil)
+	h = ipHash.Select(pool, uninitReq, nil)
+	if h == nil {
+		t.Error("Expected host selection to succeed when ClientIPVarKey is missing in context.")
+	}
 }
 
 func TestFirstPolicy(t *testing.T) {

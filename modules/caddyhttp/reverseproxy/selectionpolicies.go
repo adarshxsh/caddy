@@ -407,7 +407,7 @@ func (ClientIPHashSelection) CaddyModule() caddy.ModuleInfo {
 
 // Select returns an available host, if any.
 func (ClientIPHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.ResponseWriter) *Upstream {
-	address := caddyhttp.GetVar(req.Context(), caddyhttp.ClientIPVarKey).(string)
+	address, _ := caddyhttp.GetVar(req.Context(), caddyhttp.ClientIPVarKey).(string)
 	clientIP, _, err := net.SplitHostPort(address)
 	if err != nil {
 		clientIP = address // no port
