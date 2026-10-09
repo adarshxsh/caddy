@@ -39,7 +39,7 @@ func TestHandlerCopyResponse(t *testing.T) {
 
 func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 	var wg sync.WaitGroup
-	var errc = make(chan error, 1)
+	errc := make(chan error, 1)
 	var dst bytes.Buffer
 
 	copier := switchProtocolCopier{
