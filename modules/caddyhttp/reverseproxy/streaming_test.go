@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +82,60 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+type testFlushRecorder struct {
+	*httptest.ResponseRecorder
+	flushCount atomic.Int32
+}
+
+func (r *testFlushRecorder) Flush() {
+	r.flushCount.Add(1)
+	r.ResponseRecorder.Flush()
+}
+
+func TestHandlerCopyResponseNegativeFlushInterval(t *testing.T) {
+	h := Handler{}
+
+	pr, pw := io.Pipe()
+	recorder := &testFlushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- h.copyResponse(recorder, pr, -1, caddy.Log())
+	}()
+
+	// Ensure no background timer triggers a flush when flushInterval is negative
+	time.Sleep(50 * time.Millisecond)
+	if count := recorder.flushCount.Load(); count != 0 {
+		t.Fatalf("expected 0 flushes before writes for negative flushInterval, got %d", count)
+	}
+
+	// Write first chunk and verify immediate inline flush
+	_, err := pw.Write([]byte("chunk1"))
+	if err != nil {
+		t.Fatalf("failed to write chunk1: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if count := recorder.flushCount.Load(); count != 1 {
+		t.Fatalf("expected 1 flush after chunk1 write, got %d", count)
+	}
+
+	// Write second chunk and verify immediate inline flush
+	_, err = pw.Write([]byte("chunk2"))
+	if err != nil {
+		t.Fatalf("failed to write chunk2: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if count := recorder.flushCount.Load(); count != 2 {
+		t.Fatalf("expected 2 flushes after chunk2 write, got %d", count)
+	}
+
+	pw.Close()
+	if err := <-errCh; err != nil {
+		t.Fatalf("copyResponse returned error: %v", err)
+	}
+
+	if got := recorder.Body.String(); got != "chunk1chunk2" {
+		t.Fatalf("expected body %q, got %q", "chunk1chunk2", got)
+	}
+}
