@@ -1124,11 +1124,11 @@ func TestDoImportTokenSplicingAndCursor(t *testing.T) {
 		}
 	`
 	p := testParser(input)
-	p.Next()      // (my_snippet)
-	p.parseOne()  // parses (my_snippet) into definedSnippets
-	p.Next()      // example.com
-	p.Next()      // {
-	p.Next()      // import
+	p.Next()     // (my_snippet)
+	p.parseOne() // parses (my_snippet) into definedSnippets
+	p.Next()     // example.com
+	p.Next()     // {
+	p.Next()     // import
 
 	importIdx := p.cursor
 	err := p.doImport(1)
