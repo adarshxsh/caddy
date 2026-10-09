@@ -48,57 +48,57 @@ import (
 var (
 	defaultDirectiveOrderMu sync.RWMutex
 	defaultDirectiveOrder   = []string{
-	"tracing",
+		"tracing",
 
-	// set variables that may be used by other directives
-	"map",
-	"vars",
-	"fs",
-	"root",
-	"log_append",
-	"skip_log", // TODO: deprecated, renamed to log_skip
-	"log_skip",
-	"log_name",
+		// set variables that may be used by other directives
+		"map",
+		"vars",
+		"fs",
+		"root",
+		"log_append",
+		"skip_log", // TODO: deprecated, renamed to log_skip
+		"log_skip",
+		"log_name",
 
-	"header",
-	"copy_response_headers", // only in reverse_proxy's handle_response
-	"request_body",
+		"header",
+		"copy_response_headers", // only in reverse_proxy's handle_response
+		"request_body",
 
-	"redir",
+		"redir",
 
-	// incoming request manipulation
-	"method",
-	"rewrite",
-	"uri",
-	"try_files",
+		// incoming request manipulation
+		"method",
+		"rewrite",
+		"uri",
+		"try_files",
 
-	// middleware handlers; some wrap responses
-	"basicauth", // TODO: deprecated, renamed to basic_auth
-	"basic_auth",
-	"forward_auth",
-	"request_header",
-	"encode",
-	"push",
-	"intercept",
-	"templates",
+		// middleware handlers; some wrap responses
+		"basicauth", // TODO: deprecated, renamed to basic_auth
+		"basic_auth",
+		"forward_auth",
+		"request_header",
+		"encode",
+		"push",
+		"intercept",
+		"templates",
 
-	// special routing & dispatching directives
-	"invoke",
-	"handle",
-	"handle_path",
-	"route",
+		// special routing & dispatching directives
+		"invoke",
+		"handle",
+		"handle_path",
+		"route",
 
-	// handlers that typically respond to requests
-	"abort",
-	"error",
-	"copy_response", // only in reverse_proxy's handle_response
-	"respond",
-	"metrics",
-	"reverse_proxy",
-	"php_fastcgi",
-	"file_server",
-	"acme_server",
-}
+		// handlers that typically respond to requests
+		"abort",
+		"error",
+		"copy_response", // only in reverse_proxy's handle_response
+		"respond",
+		"metrics",
+		"reverse_proxy",
+		"php_fastcgi",
+		"file_server",
+		"acme_server",
+	}
 )
 
 func getDefaultDirectiveOrder() []string {
