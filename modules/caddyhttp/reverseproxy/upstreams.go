@@ -106,6 +106,9 @@ func (su *SRVUpstreams) Provision(ctx caddy.Context) error {
 		su.resolver = &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				if len(su.Resolver.netAddrs) == 0 {
+					return nil, fmt.Errorf("no resolver addresses configured")
+				}
 				//nolint:gosec
 				addr := su.Resolver.netAddrs[weakrand.IntN(len(su.Resolver.netAddrs))]
 				return d.DialContext(ctx, addr.Network, addr.JoinHostPort(0))
@@ -341,6 +344,9 @@ func (au *AUpstreams) Provision(ctx caddy.Context) error {
 		au.resolver = &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				if len(au.Resolver.netAddrs) == 0 {
+					return nil, fmt.Errorf("no resolver addresses configured")
+				}
 				//nolint:gosec
 				addr := au.Resolver.netAddrs[weakrand.IntN(len(au.Resolver.netAddrs))]
 				return d.DialContext(ctx, addr.Network, addr.JoinHostPort(0))
@@ -544,6 +550,9 @@ func (u *UpstreamResolver) ParseAddresses() error {
 			return fmt.Errorf("resolver address must have exactly one address; cannot call %v", addr)
 		}
 		u.netAddrs = append(u.netAddrs, addr)
+	}
+	if len(u.netAddrs) == 0 {
+		return fmt.Errorf("no resolver addresses configured")
 	}
 	return nil
 }
