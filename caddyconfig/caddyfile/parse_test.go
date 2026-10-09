@@ -1034,3 +1034,121 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 func testParser(input string) parser {
 	return parser{Dispenser: NewTestDispenser(input)}
 }
+
+func TestImportBlockTokenSplicingAndCursor(t *testing.T) {
+	snippetDef := `(my_snippet) {
+		respond "hello"
+	}`
+
+	tests := []struct {
+		name                 string
+		input                string
+		forbiddenTokens      []string
+		expectedSegmentCount int
+	}{
+		{
+			name: "import with non-empty block",
+			input: snippetDef + `
+				example.com {
+					import my_snippet {
+						# block arg comment
+					}
+				}
+			`,
+			forbiddenTokens:      []string{"import"},
+			expectedSegmentCount: 1,
+		},
+		{
+			name: "import with empty block",
+			input: snippetDef + `
+				example.com {
+					import my_snippet {}
+				}
+			`,
+			forbiddenTokens:      []string{"import"},
+			expectedSegmentCount: 1,
+		},
+		{
+			name: "import without block",
+			input: snippetDef + `
+				example.com {
+					import my_snippet
+				}
+			`,
+			forbiddenTokens:      []string{"import"},
+			expectedSegmentCount: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testParser(tc.input)
+			blocks, err := p.parseAll()
+			if err != nil {
+				t.Fatalf("parseAll failed: %v", err)
+			}
+
+			if len(blocks) != 1 {
+				t.Fatalf("expected 1 server block, got %d", len(blocks))
+			}
+
+			if len(blocks[0].Segments) != tc.expectedSegmentCount {
+				t.Fatalf("expected %d segments, got %d", tc.expectedSegmentCount, len(blocks[0].Segments))
+			}
+
+			if directive := blocks[0].Segments[0].Directive(); directive != "respond" {
+				t.Fatalf("expected directive 'respond', got %q", directive)
+			}
+
+			// Verify token stream cleanliness: no "import" token remains in p.tokens
+			for idx, token := range p.tokens {
+				for _, forbidden := range tc.forbiddenTokens {
+					if token.Text == forbidden {
+						t.Errorf("found phantom token %q at index %d in p.tokens after doImport: %v", forbidden, idx, p.tokens)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestDoImportTokenSplicingAndCursor(t *testing.T) {
+	snippetDef := `(my_snippet) {
+		respond "hello"
+	}`
+	input := snippetDef + `
+		example.com {
+			import my_snippet {
+				# block arg comment
+			}
+		}
+	`
+	p := testParser(input)
+	p.Next()      // (my_snippet)
+	p.parseOne()  // parses (my_snippet) into definedSnippets
+	p.Next()      // example.com
+	p.Next()      // {
+	p.Next()      // import
+
+	importIdx := p.cursor
+	err := p.doImport(1)
+	if err != nil {
+		t.Fatalf("doImport failed: %v", err)
+	}
+
+	// directives() rolls back one more before continue
+	p.cursor--
+	if !p.Next() {
+		t.Fatalf("p.Next() returned false")
+	}
+	if p.Val() != "respond" {
+		t.Fatalf("expected next token after doImport to be 'respond', got %q at cursor %d", p.Val(), p.cursor)
+	}
+
+	// Verify p.tokens has no "import" or "my_snippet" at or after importIdx
+	for i := importIdx; i < len(p.tokens); i++ {
+		if p.tokens[i].Text == "import" || p.tokens[i].Text == "my_snippet" {
+			t.Errorf("found residual token %q at index %d in p.tokens: %v", p.tokens[i].Text, i, p.tokens)
+		}
+	}
+}
