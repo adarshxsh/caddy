@@ -1585,35 +1585,23 @@ func parseMatcherDefinitions(d *caddyfile.Dispenser, matchers map[string]caddy.M
 		return fmt.Errorf("matcher module '%s' is not a request matcher", matcherName)
 	}
 
-	// if the next token is quoted, we can assume it's not a matcher name
-	// and that it's probably an 'expression' matcher
-	if d.NextArg() {
-		if d.Token().Quoted() {
-			// since it was missing the matcher name, we insert a token
-			// in front of the expression token itself; we use Clone() to
-			// make the new token to keep the same the import location as
-			// the next token, if this is within a snippet or imported file.
-			// see https://github.com/caddyserver/caddy/issues/6287
-			expressionToken := d.Token().Clone()
-			expressionToken.Text = "expression"
-			err := makeMatcher("expression", []caddyfile.Token{expressionToken, d.Token()})
-			if err != nil {
-				return err
-			}
-			return nil
-		}
-
-		// if it wasn't quoted, then we need to rewind after calling
-		// d.NextArg() so the below properly grabs the matcher name
-		d.Prev()
-	}
-
 	// in case there are multiple instances of the same matcher, concatenate
 	// their tokens (we expect that UnmarshalCaddyfile should be able to
 	// handle more than one segment); otherwise, we'd overwrite other
 	// instances of the matcher in this set
 	tokensByMatcherName := make(map[string][]caddyfile.Token)
 	for nesting := d.Nesting(); d.NextArg() || d.NextBlock(nesting); {
+		if d.Token().Quoted() {
+			// if the token is quoted, treat it as a shorthand for an expression matcher.
+			// since it was missing the matcher name, we insert a token in front of the
+			// expression token itself; we use Clone() to make the new token to keep the
+			// same import location as the next token, if this is within a snippet or imported file.
+			// see https://github.com/caddyserver/caddy/issues/6287
+			expressionToken := d.Token().Clone()
+			expressionToken.Text = "expression"
+			tokensByMatcherName["expression"] = append(tokensByMatcherName["expression"], expressionToken, d.Token())
+			continue
+		}
 		matcherName := d.Val()
 		tokensByMatcherName[matcherName] = append(tokensByMatcherName[matcherName], d.NextSegment()...)
 	}

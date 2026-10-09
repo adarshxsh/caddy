@@ -91,6 +91,25 @@ func TestMatcherSyntax(t *testing.T) {
 			`,
 			expectError: true,
 		},
+		{
+			input: `http://localhost {
+				@m "a == b" path /api/*
+				respond @m "hello"
+			}
+			`,
+			expectError: false,
+		},
+		{
+			input: `http://localhost {
+				@m {
+					"a == b"
+					path /api/*
+				}
+				respond @m "hello"
+			}
+			`,
+			expectError: false,
+		},
 	} {
 
 		adapter := caddyfile.Adapter{
@@ -296,5 +315,82 @@ func TestDefaultSNIWithoutHTTPS(t *testing.T) {
 
 	if !found {
 		t.Errorf("Expected default_sni 'my-sni.com' in TLS connection policies, but it was missing. Generated JSON: %s", string(result))
+	}
+}
+
+func TestNamedMatcherQuotedExpressionWithTrailingMatchers(t *testing.T) {
+	testCases := []struct {
+		name      string
+		caddyfile string
+	}{
+		{
+			name: "inline quoted expression with trailing path matcher",
+			caddyfile: `http://localhost {
+				@m "a == b" path /api/*
+				respond @m "hello"
+			}`,
+		},
+		{
+			name: "block quoted expression with trailing path matcher",
+			caddyfile: `http://localhost {
+				@m {
+					"a == b"
+					path /api/*
+				}
+				respond @m "hello"
+			}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := caddyfile.Adapter{
+				ServerType: ServerType{},
+			}
+
+			result, _, err := adapter.Adapt([]byte(tc.caddyfile), nil)
+			if err != nil {
+				t.Fatalf("Failed to adapt Caddyfile: %v", err)
+			}
+
+			var config struct {
+				Apps struct {
+					HTTP struct {
+						Servers map[string]struct {
+							Routes []struct {
+								Handle []struct {
+									Routes []struct {
+										Match []map[string]any `json:"match"`
+									} `json:"routes"`
+								} `json:"handle"`
+							} `json:"routes"`
+						} `json:"servers"`
+					} `json:"http"`
+				} `json:"apps"`
+			}
+
+			if err := json.Unmarshal(result, &config); err != nil {
+				t.Fatalf("Failed to unmarshal JSON config: %v", err)
+			}
+
+			server, ok := config.Apps.HTTP.Servers["srv0"]
+			if !ok {
+				t.Fatalf("Expected server 'srv0' to be created")
+			}
+
+			if len(server.Routes) == 0 || len(server.Routes[0].Handle) == 0 ||
+				len(server.Routes[0].Handle[0].Routes) == 0 ||
+				len(server.Routes[0].Handle[0].Routes[0].Match) == 0 {
+				t.Fatalf("Expected route with subroute matchers, got none. Generated JSON: %s", string(result))
+			}
+
+			matcherSet := server.Routes[0].Handle[0].Routes[0].Match[0]
+			if _, hasExpr := matcherSet["expression"]; !hasExpr {
+				t.Errorf("Expected matcher set to contain 'expression', but it was missing. Matcher set: %v", matcherSet)
+			}
+			if _, hasPath := matcherSet["path"]; !hasPath {
+				t.Errorf("Expected matcher set to contain 'path', but it was missing. Matcher set: %v", matcherSet)
+			}
+		})
 	}
 }
