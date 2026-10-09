@@ -665,7 +665,7 @@ func (st *ServerType) serversFromPairings(
 			var iLongestHost, jLongestHost string
 			var iWildcardHost, jWildcardHost bool
 			for _, addr := range p.serverBlocks[i].parsedKeys {
-				if strings.Contains(addr.Host, "*") || addr.Host == "" {
+				if strings.Contains(addr.Host, "*") {
 					iWildcardHost = true
 				}
 				if specificity(addr.Host) > specificity(iLongestHost) {
@@ -676,7 +676,7 @@ func (st *ServerType) serversFromPairings(
 				}
 			}
 			for _, addr := range p.serverBlocks[j].parsedKeys {
-				if strings.Contains(addr.Host, "*") || addr.Host == "" {
+				if strings.Contains(addr.Host, "*") {
 					jWildcardHost = true
 				}
 				if specificity(addr.Host) > specificity(jLongestHost) {
@@ -688,10 +688,10 @@ func (st *ServerType) serversFromPairings(
 			}
 			// catch-all blocks (blocks with no hostname) should always go
 			// last, even after blocks with wildcard hosts
-			if specificity(iLongestHost) == 0 {
+			if iLongestHost == "" && jLongestHost != "" {
 				return false
 			}
-			if specificity(jLongestHost) == 0 {
+			if jLongestHost == "" && iLongestHost != "" {
 				return true
 			}
 			if iWildcardHost != jWildcardHost {
@@ -699,6 +699,11 @@ func (st *ServerType) serversFromPairings(
 				// must always be less specific than blocks without one; see
 				// https://github.com/caddyserver/caddy/issues/3410
 				return jWildcardHost && !iWildcardHost
+			}
+			iHasPlaceholder := strings.Contains(iLongestHost, "{") && strings.Contains(iLongestHost, "}")
+			jHasPlaceholder := strings.Contains(jLongestHost, "{") && strings.Contains(jLongestHost, "}")
+			if iHasPlaceholder != jHasPlaceholder {
+				return !iHasPlaceholder && jHasPlaceholder
 			}
 			if specificity(iLongestHost) == specificity(jLongestHost) {
 				return len(iLongestPath) > len(jLongestPath)
@@ -1738,7 +1743,7 @@ func specificity(s string) int {
 		if end <= start {
 			return l
 		}
-		l -= end - start
+		l -= (end - start) - 1
 		s = s[end:]
 	}
 	return l
