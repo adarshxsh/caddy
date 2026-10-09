@@ -70,8 +70,7 @@ func Main() {
 	}
 
 	if err := defaultFactory.Build().Execute(); err != nil {
-		var exitError *exitError
-		if errors.As(err, &exitError) {
+		if exitError, ok := errors.AsType[*exitError](err); ok {
 			os.Exit(exitError.ExitCode)
 		}
 		os.Exit(1)
