@@ -53,6 +53,13 @@ func TestParseAddress(t *testing.T) {
 		{`https://host:443/path/foo`, "https", "host", "443", "/path/foo", false},
 		{`host:80/path`, "", "host", "80", "/path", false},
 		{`/path`, "", "", "", "/path", false},
+		{`{$HOST:localhost}`, "", "{$HOST:localhost}", "", "", false},
+		{`{$HOST:localhost}:8080`, "", "{$HOST:localhost}", "8080", "", false},
+		{`http://{$HOST:localhost}`, "http", "{$HOST:localhost}", "", "", false},
+		{`{env.LISTEN_ADDR:127.0.0.1:8080}`, "", "{env.LISTEN_ADDR:127.0.0.1:8080}", "", "", false},
+		{`{env.LISTEN_ADDR:127.0.0.1:8080}:9090`, "", "{env.LISTEN_ADDR:127.0.0.1:8080}", "9090", "", false},
+		{`sub.{env.MY_DOMAIN:localhost}:8080`, "", "sub.{env.MY_DOMAIN:localhost}", "8080", "", false},
+		{`sub.\{env.MY_DOMAIN\}:80`, "", `sub.\{env.MY_DOMAIN\}`, "80", "", false},
 	} {
 		actual, err := ParseAddress(test.input)
 
@@ -227,6 +234,32 @@ func TestKeyNormalization(t *testing.T) {
 			input: "::ffff:cff4:e77d",
 			expect: Address{
 				Host: "::ffff:cff4:e77d",
+			},
+		},
+		{
+			input: "{$HOST:localhost}",
+			expect: Address{
+				Host: "{$HOST:localhost}",
+			},
+		},
+		{
+			input: "{$HOST:localhost}:8080",
+			expect: Address{
+				Host: "{$HOST:localhost}",
+				Port: "8080",
+			},
+		},
+		{
+			input: "{env.LISTEN_ADDR:127.0.0.1:8080}",
+			expect: Address{
+				Host: "{env.LISTEN_ADDR:127.0.0.1:8080}",
+			},
+		},
+		{
+			input: "{env.LISTEN_ADDR:127.0.0.1:8080}:9090",
+			expect: Address{
+				Host: "{env.LISTEN_ADDR:127.0.0.1:8080}",
+				Port: "9090",
 			},
 		},
 	}
