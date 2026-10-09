@@ -773,7 +773,6 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	err = goodProxy.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}))
-
 	if err != nil {
 		t.Fatalf("Expected no error from goodProxy.ServeHTTP, got: %v", err)
 	}

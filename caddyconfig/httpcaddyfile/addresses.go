@@ -393,12 +393,10 @@ func ParseAddress(str string) (Address, error) {
 	// extract host and port
 	hostSplit := strings.SplitN(remaining, "/", 2)
 	if len(hostSplit) > 0 {
-		host, port, err := net.SplitHostPort(hostSplit[0])
+		host, port, err := splitHostPort(hostSplit[0])
 		if err != nil {
-			host, port, err = net.SplitHostPort(hostSplit[0] + ":")
-			if err != nil {
-				host = hostSplit[0]
-			}
+			host = hostSplit[0]
+			port = ""
 		}
 		a.Host = host
 		a.Port = port
@@ -418,6 +416,65 @@ func ParseAddress(str string) (Address, error) {
 	}
 
 	return a, nil
+}
+
+// splitHostPort splits a network address string into host and port parts.
+// Unlike net.SplitHostPort, it ignores colons inside unescaped placeholder braces {...}.
+func splitHostPort(s string) (host, port string, err error) {
+	if strings.HasPrefix(s, "[") {
+		endBracket := strings.LastIndex(s, "]")
+		if endBracket > 0 {
+			host = s[1:endBracket]
+			rest := s[endBracket+1:]
+			if rest == "" {
+				return host, "", nil
+			}
+			if strings.HasPrefix(rest, ":") {
+				return host, rest[1:], nil
+			}
+			return "", "", fmt.Errorf("invalid character after ']': %s", rest)
+		}
+		return "", "", fmt.Errorf("missing ']' in address")
+	}
+
+	var colons []int
+	var braceDepth int
+	var escaped bool
+
+	for i, r := range s {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == '{' {
+			braceDepth++
+			continue
+		}
+		if r == '}' {
+			if braceDepth > 0 {
+				braceDepth--
+			}
+			continue
+		}
+		if r == ':' && braceDepth == 0 {
+			colons = append(colons, i)
+		}
+	}
+
+	switch len(colons) {
+	case 0:
+		return s, "", nil
+	case 1:
+		idx := colons[0]
+		return s[:idx], s[idx+1:], nil
+	default:
+		// More than one colon outside braces (e.g. unbracketed IPv6 like ::1)
+		return s, "", nil
+	}
 }
 
 // String returns a human-readable form of a. It will
