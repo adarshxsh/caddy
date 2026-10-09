@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 )
 
@@ -388,4 +390,48 @@ func TestDynamicUpstreamMaxRequestsFromUnhealthyRequestCount(t *testing.T) {
 	if !u.Full() {
 		t.Error("upstream should be full at UnhealthyRequestCount concurrent requests")
 	}
+}
+
+// TestCountFailureWithoutActiveHealthChecks verifies that countFailure operates
+// correctly when active health checking is omitted (Active == nil) and does not
+// panic during failure or error logging.
+func TestCountFailureWithoutActiveHealthChecks(t *testing.T) {
+	resetDynamicHosts()
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// Handler configured with passive health checks, but Active == nil.
+	h := &Handler{
+		ctx:    caddyCtx,
+		logger: zap.NewNop(),
+		HealthChecks: &HealthChecks{
+			Passive: &PassiveHealthChecks{
+				FailDuration: caddy.Duration(10 * time.Millisecond),
+				logger:       zap.NewNop(),
+			},
+			Active: nil,
+		},
+	}
+
+	u := &Upstream{Dial: "10.4.0.1:80", Host: new(Host)}
+
+	// 1. Normal failure counting when Active == nil.
+	h.countFailure(u)
+	if u.Host.Fails() != 1 {
+		t.Fatalf("expected fail count 1, got %d", u.Host.Fails())
+	}
+
+	// 2. Trigger error path in countFail(1) when Active == nil.
+	uError := &Upstream{Dial: "10.4.0.2:80", Host: new(Host)}
+	uError.Host.fails.Store(-2) // countFail(1) will result in -1 (< 0), returning error
+	// Without the fix, this panicked due to nil h.HealthChecks.Active.logger.
+	h.countFailure(uError)
+
+	// 3. Trigger error path in forgetter countFail(-1) when Active == nil.
+	uForgetErr := &Upstream{Dial: "10.4.0.3:80", Host: new(Host)}
+	h.countFailure(uForgetErr)
+	// Reset fails to 0 before forgetter timer fires so countFail(-1) returns error (-1 < 0).
+	uForgetErr.Host.fails.Store(0)
+
+	time.Sleep(50 * time.Millisecond) // wait for forgetter goroutine to fire
 }
