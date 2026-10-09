@@ -121,25 +121,72 @@ func TestSpecificity(t *testing.T) {
 		{"", 0},
 		{"*", 0},
 		{"*.*", 1},
-		{"{placeholder}", 0},
-		{"/{placeholder}", 1},
+		{"{placeholder}", 1},
+		{"/{placeholder}", 2},
 		{"foo", 3},
 		{"example.com", 11},
 		{"a.example.com", 13},
 		{"*.example.com", 12},
 		{"/foo", 4},
 		{"/foo*", 4},
-		{"{placeholder}.example.com", 12},
+		{"{placeholder}.example.com", 13},
 		{"{placeholder.example.com", 24},
 		{"}.", 2},
 		{"}{", 2},
-		{"{}", 0},
-		{"{{{}}", 1},
+		{"{}", 1},
+		{"{{{}}", 2},
+		{"{env.DOMAIN}", 1},
+		{"{env.DOMAIN}:80", 4},
 	} {
 		actual := specificity(tc.input)
 		if actual != tc.expect {
 			t.Errorf("Test %d (%s): Expected %d but got %d", i, tc.input, tc.expect, actual)
 		}
+	}
+}
+
+func TestServerBlockSorting(t *testing.T) {
+	caddyfileInput := `
+http://:80 {
+	respond "catch-all"
+}
+
+http://*.example.com {
+	respond "wildcard"
+}
+
+http://{env.DOMAIN} {
+	respond "placeholder"
+}
+
+http://app.example.com {
+	respond "static"
+}
+`
+	adapter := caddyfile.Adapter{
+		ServerType: ServerType{},
+	}
+
+	result, _, err := adapter.Adapt([]byte(caddyfileInput), nil)
+	if err != nil {
+		t.Fatalf("Failed to adapt Caddyfile: %v", err)
+	}
+
+	resultStr := string(result)
+
+	posStatic := strings.Index(resultStr, "app.example.com")
+	posPlaceholder := strings.Index(resultStr, "{env.DOMAIN}")
+	posWildcard := strings.Index(resultStr, "*.example.com")
+	posCatchAll := strings.Index(resultStr, "catch-all")
+
+	if posStatic == -1 || posPlaceholder == -1 || posWildcard == -1 || posCatchAll == -1 {
+		t.Fatalf("Missing expected route strings in result JSON: %s", resultStr)
+	}
+
+	if !(posStatic < posPlaceholder && posPlaceholder < posWildcard && posWildcard < posCatchAll) {
+		t.Errorf("Incorrect server block sorting order in JSON output:\n"+
+			"static pos: %d\nplaceholder pos: %d\nwildcard pos: %d\ncatch-all pos: %d\nJSON:\n%s",
+			posStatic, posPlaceholder, posWildcard, posCatchAll, resultStr)
 	}
 }
 
