@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -278,4 +279,85 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTCPRWTimeoutConn_ClearDeadlines(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		srvConn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer srvConn.Close()
+
+		buf := make([]byte, 10)
+		// Read initial data from client
+		n, err := srvConn.Read(buf)
+		if err != nil {
+			return
+		}
+		// Echo response back
+		_, _ = srvConn.Write(buf[:n])
+
+		// Wait longer than readTimeout (100ms vs 30ms timeout) before sending second payload
+		time.Sleep(100 * time.Millisecond)
+		_, _ = srvConn.Write([]byte("keepalive"))
+	}()
+
+	clientRawConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer clientRawConn.Close()
+
+	tcpConn, ok := clientRawConn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("expected *net.TCPConn")
+	}
+
+	timeoutConn := &tcpRWTimeoutConn{
+		TCPConn:      tcpConn,
+		readTimeout:  30 * time.Millisecond,
+		writeTimeout: 30 * time.Millisecond,
+	}
+
+	// 1. Write request
+	_, err = timeoutConn.Write([]byte("ping"))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// 2. Read first response
+	buf := make([]byte, 10)
+	n, err := timeoutConn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if string(buf[:n]) != "ping" {
+		t.Fatalf("unexpected read data: %s", string(buf[:n]))
+	}
+
+	// 3. Pause for 80ms (longer than 30ms readTimeout).
+	// If read deadline was not cleared by Read(), the socket read deadline would remain set to
+	// (time of Read call + 30ms), which has passed, causing subsequent reads to time out.
+	time.Sleep(80 * time.Millisecond)
+
+	// 4. Read second response sent by server after delay
+	buf2 := make([]byte, 20)
+	n2, err := timeoutConn.Read(buf2)
+	if err != nil {
+		t.Fatalf("Read after idle interval failed (keep-alive connection timed out prematurely): %v", err)
+	}
+	if string(buf2[:n2]) != "keepalive" {
+		t.Fatalf("unexpected read data after idle: %s", string(buf2[:n2]))
+	}
+
+	<-serverDone
 }
