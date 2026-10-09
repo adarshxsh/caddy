@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -125,3 +126,38 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
 	}
 }
+
+func TestAddForwardedHeaders_MissingContextVars(t *testing.T) {
+	h := Handler{}
+
+	// Request without any caddy vars set in context
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "192.168.1.1:12345"
+
+	err := h.addForwardedHeaders(req)
+	if err != nil {
+		t.Fatalf("expected no error when context vars are missing, got: %v", err)
+	}
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "192.168.1.1" {
+		t.Errorf("X-Forwarded-For = %q, want %q", got, "192.168.1.1")
+	}
+}
+
+func TestPrepareRequest_MissingContextVars(t *testing.T) {
+	h := Handler{}
+
+	// Request without any caddy vars set in context
+	req := httptest.NewRequest("GET", "http://example.com/test", nil)
+	req.RemoteAddr = "10.0.0.1:54321"
+
+	finalReq, err := h.prepareRequest(req, caddy.NewReplacer())
+	if err != nil {
+		t.Fatalf("expected prepareRequest to succeed without context vars, got: %v", err)
+	}
+
+	if finalReq == nil {
+		t.Fatal("expected non-nil final request")
+	}
+}
+
