@@ -843,7 +843,7 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 	}
 
 	// Set up the PROXY protocol info
-	address := caddyhttp.GetVar(req.Context(), caddyhttp.ClientIPVarKey).(string)
+	address, _ := caddyhttp.GetVar(req.Context(), caddyhttp.ClientIPVarKey).(string)
 	addrPort, err := netip.ParseAddrPort(address)
 	if err != nil {
 		// OK; probably didn't have a port
@@ -887,7 +887,7 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 // that we can glean from the request.
 func (h Handler) addForwardedHeaders(req *http.Request) error {
 	// Check if the client is a trusted proxy
-	trusted := caddyhttp.GetVar(req.Context(), caddyhttp.TrustedProxyVarKey).(bool)
+	trusted, _ := caddyhttp.GetVar(req.Context(), caddyhttp.TrustedProxyVarKey).(bool)
 
 	var clientIP string
 
