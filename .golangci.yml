@@ -68,6 +68,12 @@ linters:
           - gosec
         text: G115 # TODO: Either we should fix the issues or nuke the linter if it's bad
       - linters:
+          - staticcheck
+        text: "SA1019: golang.org/x/net/http2"
+      - linters:
+          - modernize
+        text: "errorsastype"
+      - linters:
           - gosec
         text: G107 # we aren't calling unknown URL
       - linters:
