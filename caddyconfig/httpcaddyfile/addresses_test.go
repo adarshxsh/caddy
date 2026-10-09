@@ -229,6 +229,36 @@ func TestKeyNormalization(t *testing.T) {
 				Host: "::ffff:cff4:e77d",
 			},
 		},
+		{
+			input: "sub.{env.HOST_{http.request.Host}_SUFFIX}.com",
+			expect: Address{
+				Host: "sub.{env.HOST_{http.request.Host}_SUFFIX}.com",
+			},
+		},
+		{
+			input: "{env.VAR_{http.request.host}}",
+			expect: Address{
+				Host: "{env.VAR_{http.request.host}}",
+			},
+		},
+		{
+			input: "sub.{env.MY_\\{KEY\\}_VAR}.com",
+			expect: Address{
+				Host: "sub.{env.MY_\\{KEY\\}_VAR}.com",
+			},
+		},
+		{
+			input: "sub.{env.MY_DOMAIN.com",
+			expect: Address{
+				Host: "sub.{env.MY_DOMAIN.com",
+			},
+		},
+		{
+			input: "sub.com}",
+			expect: Address{
+				Host: "sub.com}",
+			},
+		},
 	}
 	for i, tc := range testCases {
 		addr, err := ParseAddress(tc.input)
