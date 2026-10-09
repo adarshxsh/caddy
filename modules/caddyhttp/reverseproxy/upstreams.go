@@ -172,7 +172,7 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 				if c := su.logger.Check(zapcore.ErrorLevel, "SRV lookup failed; using previously cached"); c != nil {
 					c.Write(zap.Error(err))
 				}
-				cached.freshness = time.Now().Add(time.Duration(su.GracePeriod) - time.Duration(su.Refresh))
+				cached.freshness = time.Now().Add(time.Duration(su.GracePeriod))
 				srvs[suAddr] = cached
 				return allNew(cached.upstreams), nil
 			}
