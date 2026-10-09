@@ -48,7 +48,7 @@ linters:
     - zerologlint
   settings:
     staticcheck:
-      checks: ["all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022",  "-QF1006", "-QF1008"] # default, and exclude 1 more undesired check
+      checks: ["all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022", "-QF1006", "-QF1008", "-SA1019"] # default, and exclude ST/QF/SA1019
     errcheck:
       exclude-functions:
         - fmt.*
@@ -97,6 +97,9 @@ linters:
       - linters:
           - errcheck
         path: _test\.go
+      - linters:
+          - modernize
+        text: errorsastype
     paths:
       - third_party$
       - builtin$

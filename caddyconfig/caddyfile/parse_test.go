@@ -636,6 +636,11 @@ func TestParseAll(t *testing.T) {
 func TestEnvironmentReplacement(t *testing.T) {
 	os.Setenv("FOOBAR", "foobar")
 	os.Setenv("CHAINED", "$FOOBAR")
+	os.Setenv("NAME", "FOO")
+	os.Setenv("PREFIX_FOO", "bar")
+	os.Setenv("ENV_VAL", "prod")
+	os.Setenv("APP_ENV_prod", "production_app")
+	os.Setenv("JSON_VAL", "actual_json")
 
 	for i, test := range []struct {
 		input  string
@@ -720,6 +725,38 @@ func TestEnvironmentReplacement(t *testing.T) {
 		{
 			input:  "}{$",
 			expect: "}{$",
+		},
+		{
+			input:  "{$PREFIX_{$NAME}:default}",
+			expect: "bar",
+		},
+		{
+			input:  "{$PREFIX_{$UNKNOWN}:default_val}",
+			expect: "default_val",
+		},
+		{
+			input:  "{$APP_ENV_{$ENV_VAL}:fallback}",
+			expect: "production_app",
+		},
+		{
+			input:  "{$CONFIG:{\"key\":\"value\"}}",
+			expect: "{\"key\":\"value\"}",
+		},
+		{
+			input:  "{$CONFIG:{\"key\":\"{$JSON_VAL}\"}}",
+			expect: "{\"key\":\"actual_json\"}",
+		},
+		{
+			input:  "{$UNSET:{\"nested\":{\"a\":\"b\"}}}",
+			expect: "{\"nested\":{\"a\":\"b\"}}",
+		},
+		{
+			input:  "foo{$UNSET:{\"a\":\"b\"}}bar",
+			expect: "foo{\"a\":\"b\"}bar",
+		},
+		{
+			input:  "{$FOO{BAR}",
+			expect: "{$FOO{BAR}",
 		},
 	} {
 		actual := replaceEnvVars([]byte(test.input))
