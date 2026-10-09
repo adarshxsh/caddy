@@ -74,11 +74,11 @@ func replaceEnvVars(input []byte) []byte {
 			break
 		}
 		begin += offset // make beginning relative to input, not offset
-		end := bytes.Index(input[begin+len(spanOpen):], spanClose)
+		end := findSpanEnd(input, begin)
 		if end < 0 {
-			break
+			offset = begin + len(spanOpen)
+			continue
 		}
-		end += begin + len(spanOpen) // make end relative to input, not begin
 
 		// get the name; if there is no name, skip it
 		envString := input[begin+len(spanOpen) : end]
@@ -86,6 +86,9 @@ func replaceEnvVars(input []byte) []byte {
 			offset = end + len(spanClose)
 			continue
 		}
+
+		// evaluate nested environment variables in envString
+		envString = replaceEnvVars(envString)
 
 		// split the string into a key and an optional default
 		envParts := strings.SplitN(string(envString), envVarDefaultDelimiter, 2)
@@ -108,6 +111,24 @@ func replaceEnvVars(input []byte) []byte {
 		offset = begin + len(envVarBytes)
 	}
 	return input
+}
+
+// findSpanEnd finds the index of the matching closing brace for the span
+// opening at start, taking into account nested braces.
+func findSpanEnd(input []byte, start int) int {
+	depth := 1
+	for i := start + len(spanOpen); i < len(input); i++ {
+		switch input[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 type parser struct {
