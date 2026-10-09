@@ -1,0 +1,44 @@
+localhost:80
+
+respond * "{host:localhost} {header.User-Agent:unknown} {vars.foo:bar}"
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":80"
+					],
+					"routes": [
+						{
+							"match": [
+								{
+									"host": [
+										"localhost"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"handle": [
+												{
+													"body": "{http.request.host:localhost} {http.request.header.User-Agent:unknown} {http.vars.foo:bar}",
+													"handler": "static_response"
+												}
+											]
+										}
+									]
+								}
+							],
+							"terminal": true
+						}
+					]
+				}
+			}
+		}
+	}
+}
