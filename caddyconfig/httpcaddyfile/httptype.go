@@ -1644,6 +1644,7 @@ func encodeMatcherSet(matchers map[string]caddyhttp.RequestMatcherWithError) (ca
 // output destinations from overlapping with one of the
 // predefined shorthands.
 func WasReplacedPlaceholderShorthand(token string) string {
+	trimmed := strings.Trim(token, "{}")
 	prev := ""
 	for i, item := range placeholderShorthands() {
 		// only look at every 2nd item, which is the replacement
@@ -1651,10 +1652,15 @@ func WasReplacedPlaceholderShorthand(token string) string {
 			prev = item
 			continue
 		}
-		if strings.Trim(token, "{}") == strings.Trim(item, "{}") {
+		if trimmed == strings.Trim(item, "{}") {
 			// we return the original shorthand so it
 			// can be used for an error message
 			return prev
+		}
+	}
+	for _, c := range complexShorthands {
+		if c.inverseSearch.MatchString(trimmed) {
+			return c.inverseSearch.ReplaceAllString(trimmed, c.shorthandTemplate)
 		}
 	}
 	return ""
