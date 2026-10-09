@@ -490,6 +490,33 @@ import ./conf.d/matcher_not_my_subnet.caddy
 	order appsec after crowdsec
 }`,
 		},
+		{
+			description: "unspaced quote with internal braces remains on a single line",
+			input: `example.com {
+	directive option="foo { bar }"
+}`,
+			expect: `example.com {
+	directive option="foo { bar }"
+}`,
+		},
+		{
+			description: "unspaced double quote following non-whitespace text",
+			input: `example.com {
+	header_down -Set-Cookie "^(.*)$; SameSite=Strict; Secure"
+}`,
+			expect: `example.com {
+	header_down -Set-Cookie "^(.*)$; SameSite=Strict; Secure"
+}`,
+		},
+		{
+			description: "unspaced double quote with nested braces inside block",
+			input: `example.com {
+	respond foo="bar { baz }" 200
+}`,
+			expect: `example.com {
+	respond foo="bar { baz }" 200
+}`,
+		},
 	} {
 		// the formatter should output a trailing newline,
 		// even if the tests aren't written to expect that
@@ -503,5 +530,13 @@ import ./conf.d/matcher_not_my_subnet.caddy
 			t.Errorf("\n[TEST %d: %s]\n====== EXPECTED ======\n%s\n====== ACTUAL ======\n%s^^^^^^^^^^^^^^^^^^^^^",
 				i, tc.description, string(tc.expect), string(actual))
 		}
+	}
+}
+
+func TestFormattingDifference_UnspacedQuotes(t *testing.T) {
+	input := []byte("example.com {\n\tdirective option=\"foo { bar }\"\n}\n")
+	warn, diff := FormattingDifference("Caddyfile", input)
+	if diff {
+		t.Errorf("expected no formatting difference warning for unspaced quoted strings with braces, got: %v", warn)
 	}
 }
