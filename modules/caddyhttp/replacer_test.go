@@ -296,3 +296,36 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPVarsMissingContextNoPanic(t *testing.T) {
+	// Minimal request with empty context, lacking start_time, uuid, ExtraLogFieldsCtxKey, ServerCtxKey, VarsCtxKey
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	placeholders := []string{
+		"http.request.duration",
+		"http.request.duration_ms",
+		"http.request.uuid",
+		"http.shutting_down",
+		"http.time_until_shutdown",
+	}
+
+	for _, ph := range placeholders {
+		t.Run(ph, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("evaluating placeholder %s panicked: %v", ph, r)
+				}
+			}()
+
+			val, ok := repl.Get(ph)
+			if !ok {
+				t.Errorf("expected placeholder %s to be recognized (ok=true), got ok=false", ph)
+			}
+			if val != nil {
+				t.Errorf("expected nil value for missing context placeholder %s, got %v", ph, val)
+			}
+		})
+	}
+}

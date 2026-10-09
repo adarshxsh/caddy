@@ -120,9 +120,12 @@ func (h LogAppend) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 func (h LogAppend) addLogField(r *http.Request, buf *bytes.Buffer) {
 	ctx := r.Context()
 
-	vars := ctx.Value(caddyhttp.VarsCtxKey).(map[string]any)
-	repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	extra := ctx.Value(caddyhttp.ExtraLogFieldsCtxKey).(*caddyhttp.ExtraLogFields)
+	vars, _ := ctx.Value(caddyhttp.VarsCtxKey).(map[string]any)
+	repl, _ := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	extra, ok := ctx.Value(caddyhttp.ExtraLogFieldsCtxKey).(*caddyhttp.ExtraLogFields)
+	if !ok || extra == nil {
+		return
+	}
 
 	var varValue any
 
