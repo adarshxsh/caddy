@@ -78,15 +78,15 @@ func TestParseVariadic(t *testing.T) {
 		},
 		{
 			input:  "{args[-1:]}",
-			result: false,
+			result: true,
 		},
 		{
 			input:  "{args[:11]}",
-			result: false,
+			result: true,
 		},
 		{
 			input:  "{args[10:0]}",
-			result: false,
+			result: true,
 		},
 		{
 			input:  "{args[0:10]}",
@@ -1033,4 +1033,92 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 
 func testParser(input string) parser {
 	return parser{Dispenser: NewTestDispenser(input)}
+}
+
+func TestParseVariadicOutOfBounds(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Test 1: Single token import with out-of-bounds variadic placeholder {args[2:5]} with 1 argument
+	fileOutOfBounds := filepath.Join(tempDir, "oob.caddy")
+	err := os.WriteFile(fileOutOfBounds, []byte(`
+		example.com {
+			respond {args[0]} {args[2:5]}
+		}
+	`), 0o644)
+	if err != nil {
+		t.Fatalf("writing oob file: %v", err)
+	}
+
+	p := testParser(`import ` + fileOutOfBounds + ` hello`)
+	blocks, err := p.parseAll()
+	if err != nil {
+		t.Fatalf("unexpected error parsing out of bounds variadic import: %v", err)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block, got %d", len(blocks))
+	}
+	if len(blocks[0].Segments) != 1 {
+		t.Fatalf("expected 1 segment, got %d", len(blocks[0].Segments))
+	}
+	tokens := blocks[0].Segments[0]
+	if len(tokens) != 2 {
+		t.Fatalf("expected 2 tokens in segment, got %d: %v", len(tokens), tokens)
+	}
+	if tokens[0].Text != "respond" || tokens[1].Text != "hello" {
+		t.Fatalf("unexpected segment tokens: %v", tokens)
+	}
+
+	// Test 2: Zero-argument variadic expansion {args[1:]} with 1 argument
+	fileZeroArg := filepath.Join(tempDir, "zero_arg.caddy")
+	err = os.WriteFile(fileZeroArg, []byte(`
+		example.com {
+			respond {args[0]} {args[1:]}
+		}
+	`), 0o644)
+	if err != nil {
+		t.Fatalf("writing zero_arg file: %v", err)
+	}
+
+	p = testParser(`import ` + fileZeroArg + ` world`)
+	blocks, err = p.parseAll()
+	if err != nil {
+		t.Fatalf("unexpected error parsing zero-arg variadic import: %v", err)
+	}
+	if len(blocks) != 1 || len(blocks[0].Segments) != 1 {
+		t.Fatalf("unexpected block/segment count")
+	}
+	tokens = blocks[0].Segments[0]
+	if len(tokens) != 2 {
+		t.Fatalf("expected 2 tokens in segment, got %d: %v", len(tokens), tokens)
+	}
+	if tokens[0].Text != "respond" || tokens[1].Text != "world" {
+		t.Fatalf("unexpected segment tokens: %v", tokens)
+	}
+
+	// Test 3: Non-variadic placeholders with colon {args[0]}:{args[1]}
+	fileColon := filepath.Join(tempDir, "colon.caddy")
+	err = os.WriteFile(fileColon, []byte(`
+		example.com {
+			respond {args[0]}:{args[1]}
+		}
+	`), 0o644)
+	if err != nil {
+		t.Fatalf("writing colon file: %v", err)
+	}
+
+	p = testParser(`import ` + fileColon + ` host 8080`)
+	blocks, err = p.parseAll()
+	if err != nil {
+		t.Fatalf("unexpected error parsing colon non-variadic import: %v", err)
+	}
+	if len(blocks) != 1 || len(blocks[0].Segments) != 1 {
+		t.Fatalf("unexpected block/segment count")
+	}
+	tokens = blocks[0].Segments[0]
+	if len(tokens) != 2 {
+		t.Fatalf("expected 2 tokens in segment, got %d: %v", len(tokens), tokens)
+	}
+	if tokens[0].Text != "respond" || tokens[1].Text != "host:8080" {
+		t.Fatalf("unexpected segment tokens: %v", tokens)
+	}
 }

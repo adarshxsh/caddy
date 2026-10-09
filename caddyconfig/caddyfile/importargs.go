@@ -70,7 +70,7 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 			caddy.Log().Named("caddyfile").Warn(
 				"Variadic placeholder "+token.Text+" has an invalid start index",
 				zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-			return false, 0, 0
+			return true, 0, 0
 		}
 	}
 	if end != "" {
@@ -79,7 +79,7 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 			caddy.Log().Named("caddyfile").Warn(
 				"Variadic placeholder "+token.Text+" has an invalid end index",
 				zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-			return false, 0, 0
+			return true, 0, 0
 		}
 	}
 
@@ -88,7 +88,7 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 		caddy.Log().Named("caddyfile").Warn(
 			"Variadic placeholder "+token.Text+" indices are out of bounds, only "+strconv.Itoa(argCount)+" argument(s) exist",
 			zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-		return false, 0, 0
+		return true, 0, 0
 	}
 	return true, startIndex, endIndex
 }
