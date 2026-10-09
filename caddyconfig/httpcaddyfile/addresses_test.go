@@ -251,3 +251,50 @@ func TestKeyNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestListenersForServerBlockAddress(t *testing.T) {
+	st := new(ServerType)
+
+	// Test case 1: Multiple bind directives targeting the same network address preserve all protocols
+	sblock := serverBlock{
+		pile: map[string][]ConfigValue{
+			"bind": {
+				{
+					Value: addressesWithProtocols{
+						addresses: []string{"127.0.0.1"},
+						protocols: []string{"h1"},
+					},
+				},
+				{
+					Value: addressesWithProtocols{
+						addresses: []string{"127.0.0.1"},
+						protocols: []string{"h2"},
+					},
+				},
+			},
+		},
+	}
+
+	addr, err := ParseAddress("example.com")
+	if err != nil {
+		t.Fatalf("unexpected error parsing address: %v", err)
+	}
+
+	listeners, err := st.listenersForServerBlockAddress(sblock, addr, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from listenersForServerBlockAddress: %v", err)
+	}
+
+	if len(listeners) == 0 {
+		t.Fatalf("expected listener entry, got none")
+	}
+
+	for netKey, protocols := range listeners {
+		if _, ok := protocols["h1"]; !ok {
+			t.Errorf("expected protocol 'h1' to be preserved for listener %s, but it was missing. Got: %v", netKey, protocols)
+		}
+		if _, ok := protocols["h2"]; !ok {
+			t.Errorf("expected protocol 'h2' to be present for listener %s, but it was missing. Got: %v", netKey, protocols)
+		}
+	}
+}
