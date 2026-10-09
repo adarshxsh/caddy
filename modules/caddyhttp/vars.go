@@ -55,8 +55,12 @@ func (VarsMiddleware) CaddyModule() caddy.ModuleInfo {
 }
 
 func (m VarsMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next Handler) error {
-	vars := r.Context().Value(VarsCtxKey).(map[string]any)
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	vars, ok := r.Context().Value(VarsCtxKey).(map[string]any)
+	if !ok || vars == nil {
+		vars = make(map[string]any)
+		r = r.WithContext(context.WithValue(r.Context(), VarsCtxKey, vars))
+	}
+	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	for k, v := range m {
 		keyExpanded := repl.ReplaceAll(k, "")
 		if valStr, ok := v.(string); ok {
@@ -178,8 +182,8 @@ func (m VarsMatcher) MatchWithError(r *http.Request) (bool, error) {
 		return true, nil
 	}
 
-	vars := r.Context().Value(VarsCtxKey).(map[string]any)
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	vars, _ := r.Context().Value(VarsCtxKey).(map[string]any)
+	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	var matcherValExpanded, varStr, v string
 	var varValue any
@@ -314,8 +318,8 @@ func (m MatchVarsRE) Match(r *http.Request) bool {
 
 // MatchWithError returns true if r matches m.
 func (m MatchVarsRE) MatchWithError(r *http.Request) (bool, error) {
-	vars := r.Context().Value(VarsCtxKey).(map[string]any)
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	vars, _ := r.Context().Value(VarsCtxKey).(map[string]any)
+	repl, _ := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	var match bool
 	var varStr string
@@ -431,8 +435,11 @@ func (m MatchVarsRE) Validate() error {
 // GetVar gets a value out of the context's variable table by key.
 // If the key does not exist, the return value will be nil.
 func GetVar(ctx context.Context, key string) any {
+	if ctx == nil {
+		return nil
+	}
 	varMap, ok := ctx.Value(VarsCtxKey).(map[string]any)
-	if !ok {
+	if !ok || varMap == nil {
 		return nil
 	}
 	return varMap[key]
@@ -446,8 +453,11 @@ func GetVar(ctx context.Context, key string) any {
 // underlying value does not count) and the key exists in
 // the table, the key+value will be deleted from the table.
 func SetVar(ctx context.Context, key string, value any) {
+	if ctx == nil {
+		return
+	}
 	varMap, ok := ctx.Value(VarsCtxKey).(map[string]any)
-	if !ok {
+	if !ok || varMap == nil {
 		return
 	}
 	if value == nil {

@@ -206,19 +206,29 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				}
 				return "?" + req.URL.RawQuery, true
 			case "http.request.duration":
-				start := GetVar(req.Context(), "start_time").(time.Time)
+				start, ok := GetVar(req.Context(), "start_time").(time.Time)
+				if !ok {
+					return nil, true
+				}
 				return time.Since(start), true
 			case "http.request.duration_ms":
-				start := GetVar(req.Context(), "start_time").(time.Time)
+				start, ok := GetVar(req.Context(), "start_time").(time.Time)
+				if !ok {
+					return nil, true
+				}
 				return time.Since(start).Seconds() * 1e3, true // multiply seconds to preserve decimal (see #4666)
 
 			case "http.request.uuid":
 				// fetch the UUID for this request
-				id := GetVar(req.Context(), "uuid").(*requestID)
+				id, ok := GetVar(req.Context(), "uuid").(*requestID)
+				if !ok || id == nil {
+					return nil, true
+				}
 
 				// set it to this request's access log
-				extra := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields)
-				extra.Set(zap.String("uuid", id.String()))
+				if extra, ok := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields); ok && extra != nil {
+					extra.Set(zap.String("uuid", id.String()))
+				}
 
 				return id.String(), true
 
@@ -394,10 +404,16 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 
 		switch key {
 		case "http.shutting_down":
-			server := req.Context().Value(ServerCtxKey).(*Server)
+			server, ok := req.Context().Value(ServerCtxKey).(*Server)
+			if !ok || server == nil {
+				return nil, true
+			}
 			return server.shutdownAt.Load() != nil, true
 		case "http.time_until_shutdown":
-			server := req.Context().Value(ServerCtxKey).(*Server)
+			server, ok := req.Context().Value(ServerCtxKey).(*Server)
+			if !ok || server == nil {
+				return nil, true
+			}
 			t := server.shutdownAt.Load()
 			if t == nil {
 				return nil, true
