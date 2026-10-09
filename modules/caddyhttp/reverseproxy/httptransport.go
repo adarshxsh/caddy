@@ -939,6 +939,9 @@ func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
 				ce.Write(zap.Error(err))
 			}
 		}
+		defer func() {
+			_ = c.TCPConn.SetReadDeadline(time.Time{})
+		}()
 	}
 	return c.TCPConn.Read(b)
 }
@@ -951,6 +954,9 @@ func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
 				ce.Write(zap.Error(err))
 			}
 		}
+		defer func() {
+			_ = c.TCPConn.SetWriteDeadline(time.Time{})
+		}()
 	}
 	return c.TCPConn.Write(b)
 }
