@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -193,8 +194,8 @@ func (l *lexer) next() (bool, error) {
 				// All characters on the current line preceding the marker must be horizontal whitespace (' ' or '\t').
 				prefix := val[:len(val)-len(markerRunes)]
 				lineStart := 0
-				for i := len(prefix) - 1; i >= 0; i-- {
-					if prefix[i] == '\n' {
+				for i, r := range slices.Backward(prefix) {
+					if r == '\n' {
 						lineStart = i + 1
 						break
 					}
