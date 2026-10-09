@@ -1,6 +1,10 @@
 package fastcgi
 
 import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -8,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -353,5 +359,38 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 
 	for _, p := range payloads {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
+	}
+}
+
+func TestFastCGIDialErrorReturnsDialError(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	tr := Transport{}
+	if err := tr.Provision(ctx); err != nil {
+		t.Fatalf("Provision error = %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen error = %v", err)
+	}
+	deadAddr := ln.Addr().String()
+	ln.Close()
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+deadAddr+"/", nil)
+	if err != nil {
+		t.Fatalf("NewRequest error = %v", err)
+	}
+	req = caddyhttp.PrepareRequest(req, caddy.NewReplacer(), nil, &caddyhttp.Server{})
+
+	_, err = tr.RoundTrip(req)
+	if err == nil {
+		t.Fatalf("expected error from RoundTrip")
+	}
+
+	var dialErr reverseproxy.DialError
+	if !errors.As(err, &dialErr) {
+		t.Errorf("RoundTrip error %v is not reverseproxy.DialError", err)
 	}
 }
