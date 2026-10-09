@@ -58,6 +58,13 @@ func (st ServerType) Setup(
 	inputServerBlocks []caddyfile.ServerBlock,
 	options map[string]any,
 ) (*caddy.Config, []caddyconfig.Warning, error) {
+	if options == nil {
+		options = make(map[string]any)
+	}
+	if _, ok := options["order"].([]string); !ok {
+		options["order"] = getDefaultDirectiveOrder()
+	}
+
 	var warnings []caddyconfig.Warning
 	gc := counter{new(int)}
 	state := make(map[string]any)
@@ -873,7 +880,7 @@ func (st *ServerType) serversFromPairings(
 
 			// set up each handler directive, making sure to honor directive order
 			dirRoutes := sblock.pile["route"]
-			siteSubroute, err := buildSubroute(dirRoutes, groupCounter, true)
+			siteSubroute, err := buildSubroute(dirRoutes, groupCounter, true, directiveOrderFromOptions(options))
 			if err != nil {
 				return nil, err
 			}
@@ -1291,15 +1298,15 @@ func appendSubrouteToRouteList(routeList caddyhttp.RouteList,
 
 // buildSubroute turns the config values, which are expected to be routes
 // into a clean and orderly subroute that has all the routes within it.
-func buildSubroute(routes []ConfigValue, groupCounter counter, needsSorting bool) (*caddyhttp.Subroute, error) {
+func buildSubroute(routes []ConfigValue, groupCounter counter, needsSorting bool, order []string) (*caddyhttp.Subroute, error) {
 	if needsSorting {
 		for _, val := range routes {
-			if !slices.Contains(directiveOrder, val.directive) {
+			if !slices.Contains(order, val.directive) {
 				return nil, fmt.Errorf("directive '%s' is not an ordered HTTP handler, so it cannot be used here - try placing within a route block or using the order global option", val.directive)
 			}
 		}
 
-		sortRoutes(routes)
+		sortRoutes(routes, order)
 	}
 
 	subroute := new(caddyhttp.Subroute)

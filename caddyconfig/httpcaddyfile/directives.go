@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -44,7 +45,9 @@ import (
 //
 // e.g. The 'respond' directive is near the end because it
 // writes a response and terminates the middleware chain.
-var defaultDirectiveOrder = []string{
+var (
+	defaultDirectiveOrderMu sync.RWMutex
+	defaultDirectiveOrder   = []string{
 	"tracing",
 
 	// set variables that may be used by other directives
@@ -96,11 +99,20 @@ var defaultDirectiveOrder = []string{
 	"file_server",
 	"acme_server",
 }
+)
 
-// directiveOrder specifies the order to apply directives
-// in HTTP routes, after being modified by either the
-// plugins or by the user via the "order" global option.
-var directiveOrder = defaultDirectiveOrder
+func getDefaultDirectiveOrder() []string {
+	defaultDirectiveOrderMu.RLock()
+	defer defaultDirectiveOrderMu.RUnlock()
+	return slices.Clone(defaultDirectiveOrder)
+}
+
+func directiveOrderFromOptions(options map[string]any) []string {
+	if order, ok := options["order"].([]string); ok && order != nil {
+		return order
+	}
+	return getDefaultDirectiveOrder()
+}
 
 // RegisterDirective registers a unique directive dir with an
 // associated unmarshaling (setup) function. When directive dir
@@ -151,8 +163,11 @@ func RegisterHandlerDirective(dir string, setupFunc UnmarshalHandlerFunc) {
 //
 // EXPERIMENTAL: This API may change or be removed.
 func RegisterDirectiveOrder(dir string, position Positional, standardDir string) {
+	defaultDirectiveOrderMu.Lock()
+	defer defaultDirectiveOrderMu.Unlock()
+
 	// check if directive was already ordered
-	if slices.Contains(directiveOrder, dir) {
+	if slices.Contains(defaultDirectiveOrder, dir) {
 		panic("directive '" + dir + "' already ordered")
 	}
 
@@ -169,21 +184,19 @@ func RegisterDirectiveOrder(dir string, position Positional, standardDir string)
 	}
 
 	// insert directive into proper position
-	newOrder := directiveOrder
-	for i, d := range newOrder {
+	for i, d := range defaultDirectiveOrder {
 		if d != standardDir {
 			continue
 		}
 		switch position {
 		case Before:
-			newOrder = append(newOrder[:i], append([]string{dir}, newOrder[i:]...)...)
+			defaultDirectiveOrder = slices.Insert(defaultDirectiveOrder, i, dir)
 		case After:
-			newOrder = append(newOrder[:i+1], append([]string{dir}, newOrder[i+1:]...)...)
+			defaultDirectiveOrder = slices.Insert(defaultDirectiveOrder, i+1, dir)
 		case First, Last:
 		}
 		break
 	}
-	directiveOrder = newOrder
 }
 
 // RegisterGlobalOption registers a unique global option opt with
@@ -216,6 +229,10 @@ type Helper struct {
 // Option gets the option keyed by name.
 func (h Helper) Option(name string) any {
 	return h.options[name]
+}
+
+func (h Helper) directiveOrder() []string {
+	return directiveOrderFromOptions(h.options)
 }
 
 // Caddyfiles returns the list of config files from
@@ -347,7 +364,7 @@ func ParseSegmentAsSubroute(h Helper) (caddyhttp.MiddlewareHandler, error) {
 		return nil, err
 	}
 
-	return buildSubroute(allResults, h.groupCounter, true)
+	return buildSubroute(allResults, h.groupCounter, true, h.directiveOrder())
 }
 
 // parseSegmentAsConfig parses the segment such that its subdirectives
@@ -443,9 +460,9 @@ type ConfigValue struct {
 	directive string
 }
 
-func sortRoutes(routes []ConfigValue) {
+func sortRoutes(routes []ConfigValue, order []string) {
 	dirPositions := make(map[string]int)
-	for i, dir := range directiveOrder {
+	for i, dir := range order {
 		dirPositions[dir] = i
 	}
 
