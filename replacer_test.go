@@ -514,10 +514,74 @@ func BenchmarkReplacer(b *testing.B) {
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
+		{
+			name:  "nested placeholder",
+			input: `{env.VAR_{http.request.host}}`,
+		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
+			}
+		})
+	}
+}
+
+func TestNestedPlaceholders(t *testing.T) {
+	os.Setenv("VAR_example.com", "nested_env_val")
+	defer os.Setenv("VAR_example.com", "")
+
+	os.Setenv("VAR_escaped_example.com", "escaped_env_val")
+	defer os.Setenv("VAR_escaped_example.com", "")
+
+	rep := NewReplacer()
+	rep.Set("http.request.host", "example.com")
+	rep.Set("c", "val1")
+	rep.Set("b_val1", "val2")
+	rep.Set("a_val2", "deep_val")
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "nested env var resolution",
+			input:    "{env.VAR_{http.request.host}}",
+			expected: "nested_env_val",
+		},
+		{
+			name:     "nested env var with surrounding text",
+			input:    "prefix_{env.VAR_{http.request.host}}_suffix",
+			expected: "prefix_nested_env_val_suffix",
+		},
+		{
+			name:     "deeply nested placeholders",
+			input:    "{a_{b_{c}}}",
+			expected: "deep_val",
+		},
+		{
+			name:     "nested placeholder with escaped braces",
+			input:    "{env.VAR_escaped_{http.request.host}}",
+			expected: "escaped_env_val",
+		},
+		{
+			name:     "unclosed nested placeholder fails safely",
+			input:    "{env.VAR_{http.request.host}",
+			expected: "",
+		},
+		{
+			name:     "no dangling closing braces remain",
+			input:    "{env.VAR_{http.request.host}} and {a_{b_{c}}}",
+			expected: "nested_env_val and deep_val",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual := rep.ReplaceAll(tt.input, "")
+			if actual != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, actual)
 			}
 		})
 	}
