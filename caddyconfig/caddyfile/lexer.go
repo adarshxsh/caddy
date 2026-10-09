@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -185,18 +186,48 @@ func (l *lexer) next() (bool, error) {
 				l.skippedLines++
 			}
 
-			// check if we're done, i.e. that the last few characters are the marker
-			if len(val) >= len(heredocMarker) && heredocMarker == string(val[len(val)-len(heredocMarker):]) {
-				// set the final value
-				val, err = l.finalizeHeredoc(val, heredocMarker)
-				if err != nil {
-					return false, err
+			// check if we're done, i.e. that the last few characters are the marker,
+			// preceded by line start / horizontal whitespace and followed by whitespace or EOF
+			markerRunes := []rune(heredocMarker)
+			if len(val) >= len(markerRunes) && string(val[len(val)-len(markerRunes):]) == heredocMarker {
+				// 1. Verify line boundary before the marker:
+				// All characters on the current line preceding the marker must be horizontal whitespace (' ' or '\t').
+				prefix := val[:len(val)-len(markerRunes)]
+				lineStart := 0
+				for i, r := range slices.Backward(prefix) {
+					if r == '\n' {
+						lineStart = i + 1
+						break
+					}
+				}
+				isValidLineStart := true
+				for _, r := range prefix[lineStart:] {
+					if r != ' ' && r != '\t' {
+						isValidLineStart = false
+						break
+					}
 				}
 
-				// set the line counter, and make the token
-				l.line += l.skippedLines
-				l.skippedLines = 0
-				return makeToken('<'), nil
+				if isValidLineStart {
+					// 2. Verify trailing boundary after the marker:
+					// The next rune must be whitespace (' ', '\t', '\r', '\n') or EOF.
+					nextRune, _, err := l.reader.ReadRune()
+					if err == nil {
+						_ = l.reader.UnreadRune()
+					}
+					if err == io.EOF || unicode.IsSpace(nextRune) {
+						// set the final value
+						val, err = l.finalizeHeredoc(val, heredocMarker)
+						if err != nil {
+							return false, err
+						}
+
+						// set the line counter, and make the token
+						l.line += l.skippedLines
+						l.skippedLines = 0
+						return makeToken('<'), nil
+					}
+				}
 			}
 
 			// stay in the heredoc until we find the ending marker

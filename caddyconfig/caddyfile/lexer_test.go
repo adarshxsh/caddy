@@ -499,6 +499,53 @@ EOF`),
 			expectErr:    true,
 			errorMessage: "mismatched leading whitespace in heredoc <<EOF on line #3 [\t], expected whitespace [\t\t] to match the closing marker",
 		},
+		{
+			input: []byte(`heredoc <<END
+my FRIEND is here
+END`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "my FRIEND is here"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<END
+ENDLESS summer
+END`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "ENDLESS summer"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<END
+this is the END of line
+LEGENDARY SLENDERNESS
+END`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "this is the END of line\nLEGENDARY SLENDERNESS"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<END
+hello 世界 FRIEND
+END`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "hello 世界 FRIEND"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<END
+	END_EXTRA
+	END_ANOTHER
+	END`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "END_EXTRA\nEND_ANOTHER"},
+			},
+		},
 	}
 
 	for i, testCase := range testCases {
