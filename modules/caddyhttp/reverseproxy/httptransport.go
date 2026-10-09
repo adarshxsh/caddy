@@ -294,7 +294,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			// identify this error as one that occurred during
 			// dialing, which can be important when trying to
 			// decide whether to retry a request
-			return nil, DialError{err}
+			return nil, DialError{Cause: err}
 		}
 
 		if h.ProxyProtocol != "" {
@@ -348,7 +348,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				// identify this error as one that occurred during
 				// dialing, which can be important when trying to
 				// decide whether to retry a request
-				return nil, DialError{err}
+				return nil, DialError{Cause: err}
 			}
 		}
 
@@ -456,7 +456,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				err = tlsConn.HandshakeContext(ctx)
 				if err != nil {
 					_ = tlsConn.Close()
-					return nil, err
+					return nil, DialError{Cause: err}
 				}
 				return tlsConn, nil
 			}
@@ -515,9 +515,13 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 					tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
 					udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
 					if err != nil {
-						return nil, err
+						return nil, DialError{Cause: err}
 					}
-					return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+					conn, err := h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+					if err != nil {
+						return nil, DialError{Cause: err}
+					}
+					return conn, nil
 				}
 			}
 		}

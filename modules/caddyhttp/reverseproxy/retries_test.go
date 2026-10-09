@@ -3,6 +3,7 @@ package reverseproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -783,5 +785,110 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	expectedBody := "hello world"
 	if rec.Body.String() != expectedBody {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
+	}
+}
+
+func TestTLSHandshakeDialErrorRetry(t *testing.T) {
+	goodServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(goodServer.Close)
+
+	// Bad TLS upstream: accepts connection then closes it immediately causing TLS handshake error.
+	badLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for bad tls: %v", err)
+	}
+	defer badLn.Close()
+	go func() {
+		for {
+			conn, err := badLn.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: badLn.Addr().String()},
+	}
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			InsecureSkipVerify: true,
+			ServerName:         "{http.request.host}",
+		},
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	handler := minimalHandler(1, upstreams...)
+	handler.Transport = ht
+
+	const requestBody = "tls retry body"
+	bodyReader := newCloseOnCloseReader(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "https://localhost/", bodyReader)
+	req.Body = bodyReader
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err = handler.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("ServeHTTP error = %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status code = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if rec.Body.String() != requestBody {
+		t.Errorf("body = %q, want %q", rec.Body.String(), requestBody)
+	}
+}
+
+type dummyTimeoutError struct{}
+
+func (dummyTimeoutError) Error() string   { return "i/o timeout" }
+func (dummyTimeoutError) Timeout() bool   { return true }
+func (dummyTimeoutError) Temporary() bool { return true }
+
+func TestStatusErrorTimeoutClassification(t *testing.T) {
+	// Wrapped DialError with a timeout cause
+	dialErr := DialError{Cause: fmt.Errorf("dial tcp 127.0.0.1:80: %w", dummyTimeoutError{})}
+	err := statusError(dialErr)
+
+	var hErr caddyhttp.HandlerError
+	if !errors.As(err, &hErr) {
+		t.Fatalf("statusError did not return HandlerError")
+	}
+	if hErr.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("status code = %d, want %d", hErr.StatusCode, http.StatusGatewayTimeout)
+	}
+}
+
+func TestWrappedDialErrorShouldRetry(t *testing.T) {
+	lb := LoadBalancing{Retries: 2}
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/", nil)
+	req = prepareTestRequest(req)
+
+	wrappedErr := fmt.Errorf("outer wrapper: %w", DialError{Cause: errors.New("connection refused")})
+	retry := lb.tryAgain(ctx, time.Now(), 0, wrappedErr, req, zap.NewNop())
+	if !retry {
+		t.Errorf("tryAgain returned false for wrapped DialError on POST, want true")
 	}
 }
