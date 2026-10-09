@@ -2,9 +2,14 @@ package reverseproxy
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
+	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -123,5 +128,117 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+type test1xxResponseWriter struct {
+	header      http.Header
+	statusCodes []int
+	written     [][]byte
+}
+
+func newTest1xxResponseWriter() *test1xxResponseWriter {
+	return &test1xxResponseWriter{
+		header: make(http.Header),
+	}
+}
+
+func (w *test1xxResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *test1xxResponseWriter) WriteHeader(statusCode int) {
+	w.statusCodes = append(w.statusCodes, statusCode)
+}
+
+func (w *test1xxResponseWriter) Write(b []byte) (int, error) {
+	w.written = append(w.written, append([]byte(nil), b...))
+	return len(b), nil
+}
+
+func Test1xxResponseHeaderPreservation(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", "</style.css>; rel=preload")
+		w.Header().Set("X-1xx-Only", "1xx-value")
+		w.WriteHeader(http.StatusEarlyHints) // 103
+
+		// Backend clears 1xx headers before 200 OK response
+		w.Header().Del("Link")
+		w.Header().Del("X-1xx-Only")
+
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+
+	h := &Handler{
+		logger: zap.NewNop(),
+		Upstreams: UpstreamPool{
+			{
+				Dial: backendURL.Host,
+				Host: new(Host),
+			},
+		},
+		LoadBalancing: &LoadBalancing{
+			SelectionPolicy: &RoundRobinSelection{},
+		},
+		Transport: testTransport{&http.Transport{}},
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	vars := map[string]any{
+		caddyhttp.TrustedProxyVarKey: true,
+		caddyhttp.ClientIPVarKey:     "127.0.0.1",
+	}
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+	ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, caddy.NewReplacer())
+	server := &caddyhttp.Server{
+		Logs: &caddyhttp.ServerLogConfig{},
+	}
+	ctx = context.WithValue(ctx, caddyhttp.ServerCtxKey, server)
+	req = req.WithContext(ctx)
+
+	rw := newTest1xxResponseWriter()
+	// Outer middleware sets headers prior to reverse proxying
+	rw.Header().Set("X-Outer-Middleware", "outer-value")
+	rw.Header().Set("Access-Control-Allow-Origin", "*")
+
+	err = h.ServeHTTP(rw, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(rw.statusCodes) < 2 {
+		t.Fatalf("expected at least 2 WriteHeader calls (1xx and 200), got %v", rw.statusCodes)
+	}
+	if rw.statusCodes[0] != http.StatusEarlyHints {
+		t.Errorf("first WriteHeader status = %d, want %d", rw.statusCodes[0], http.StatusEarlyHints)
+	}
+	if rw.statusCodes[1] != http.StatusOK {
+		t.Errorf("second WriteHeader status = %d, want %d", rw.statusCodes[1], http.StatusOK)
+	}
+
+	// Outer middleware headers must persist in final response header map
+	if got := rw.Header().Get("X-Outer-Middleware"); got != "outer-value" {
+		t.Errorf("X-Outer-Middleware = %q, want %q", got, "outer-value")
+	}
+	if got := rw.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "*")
+	}
+
+	// 1xx headers from backend must NOT leak into final response header map
+	if got := rw.Header().Get("X-1xx-Only"); got != "" {
+		t.Errorf("X-1xx-Only should not leak into final response headers, got %q", got)
+	}
+	if got := rw.Header().Get("Link"); got != "" {
+		t.Errorf("Link header from 1xx should not leak into final response headers, got %q", got)
 	}
 }
