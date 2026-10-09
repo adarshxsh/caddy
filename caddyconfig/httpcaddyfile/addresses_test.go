@@ -1,6 +1,7 @@
 package httpcaddyfile
 
 import (
+	"net/url"
 	"testing"
 )
 
@@ -95,10 +96,24 @@ func TestAddressString(t *testing.T) {
 		{Address{Scheme: "", Host: "host", Port: "80", Path: "/path"}, "http://host/path"},
 		{Address{Scheme: "http", Host: "", Port: "1234", Path: ""}, "http://:1234"},
 		{Address{Scheme: "", Host: "", Port: "", Path: ""}, ""},
+		{Address{Scheme: "http", Host: "::1", Port: "", Path: ""}, "http://[::1]"},
+		{Address{Scheme: "https", Host: "2001:db8::1", Port: "443", Path: ""}, "https://[2001:db8::1]"},
+		{Address{Scheme: "http", Host: "::1", Port: "8080", Path: ""}, "http://[::1]:8080"},
+		{Address{Scheme: "http", Host: "[::1]", Port: "", Path: ""}, "http://[::1]"},
 	} {
 		actual := test.addr.String()
 		if actual != test.expected {
 			t.Errorf("Test %d: expected '%s' but got '%s'", i, test.expected, actual)
+		}
+		if actual != "" {
+			u, err := url.Parse(actual)
+			if err != nil {
+				t.Errorf("Test %d: net/url.Parse('%s') error: %v", i, actual, err)
+			} else if test.addr.Host != "" && (test.addr.Host == "::1" || test.addr.Host == "2001:db8::1") {
+				if u.Host != "["+test.addr.Host+"]" && (test.addr.Port != "" && test.addr.Port != "80" && test.addr.Port != "443") == false {
+					t.Errorf("Test %d: expected url host '[%s]' but got '%s'", i, test.addr.Host, u.Host)
+				}
+			}
 		}
 	}
 }
