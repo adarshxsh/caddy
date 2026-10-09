@@ -298,3 +298,53 @@ func TestDefaultSNIWithoutHTTPS(t *testing.T) {
 		t.Errorf("Expected default_sni 'my-sni.com' in TLS connection policies, but it was missing. Generated JSON: %s", string(result))
 	}
 }
+
+func TestServerTypeSetupNilOptions(t *testing.T) {
+	st := ServerType{}
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "global options block",
+			input: `{
+				email test@example.com
+				admin off
+			}
+			localhost:8080`,
+		},
+		{
+			name: "named routes",
+			input: `&(my_route) {
+				respond "hello"
+			}
+			localhost:8080 {
+				invoke my_route
+			}`,
+		},
+		{
+			name: "basic server block",
+			input: `localhost:8080 {
+				respond "ok"
+			}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			serverBlocks, err := caddyfile.Parse("Caddyfile", []byte(tc.input))
+			if err != nil {
+				t.Fatalf("Failed to parse Caddyfile: %v", err)
+			}
+
+			cfg, _, err := st.Setup(serverBlocks, nil)
+			if err != nil {
+				t.Fatalf("Setup failed with nil options: %v", err)
+			}
+			if cfg == nil {
+				t.Fatalf("Expected non-nil config, got nil")
+			}
+		})
+	}
+}

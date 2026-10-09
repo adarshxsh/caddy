@@ -58,6 +58,9 @@ func (st ServerType) Setup(
 	inputServerBlocks []caddyfile.ServerBlock,
 	options map[string]any,
 ) (*caddy.Config, []caddyconfig.Warning, error) {
+	if options == nil {
+		options = make(map[string]any)
+	}
 	var warnings []caddyconfig.Warning
 	gc := counter{new(int)}
 	state := make(map[string]any)
