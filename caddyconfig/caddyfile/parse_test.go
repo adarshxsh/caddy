@@ -1031,6 +1031,116 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 	}
 }
 
+func TestImportBlockSubBlockFiltering(t *testing.T) {
+	tempDir := t.TempDir()
+	snippetFile := filepath.Join(tempDir, "snippet.caddy")
+	snippetFile2 := filepath.Join(tempDir, "snippet2.caddy")
+
+	err := os.WriteFile(snippetFile, []byte(`
+		(site_template) {
+			example.com {
+				respond "start"
+				{blocks.custom_auth}
+				{block}
+				respond "end"
+			}
+		}
+	`), 0o644)
+	if err != nil {
+		t.Fatalf("writing snippet file: %v", err)
+	}
+
+	err = os.WriteFile(snippetFile2, []byte(`
+		(site_template2) {
+			example.com {
+				respond "start"
+				{blocks.custom_auth}
+				{blocks.tls_config}
+				{block}
+				respond "end"
+			}
+		}
+	`), 0o644)
+	if err != nil {
+		t.Fatalf("writing snippet file 2: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name               string
+		input              string
+		expectedDirectives []string
+	}{
+		{
+			name: "sub block filtered from general block placeholder",
+			input: `
+				import ` + snippetFile + `
+
+				import site_template {
+					custom_auth {
+						basic_auth / secret
+					}
+					reverse_proxy localhost:8080
+				}
+			`,
+			expectedDirectives: []string{"respond", "basic_auth", "reverse_proxy", "respond"},
+		},
+		{
+			name: "unreferenced sub block remains in general block placeholder",
+			input: `
+				import ` + snippetFile + `
+
+				import site_template {
+					custom_auth {
+						basic_auth / secret
+					}
+					other_directive arg1
+					reverse_proxy localhost:8080
+				}
+			`,
+			expectedDirectives: []string{"respond", "basic_auth", "other_directive", "reverse_proxy", "respond"},
+		},
+		{
+			name: "multiple sub blocks filtered from general block placeholder",
+			input: `
+				import ` + snippetFile2 + `
+
+				import site_template2 {
+					custom_auth {
+						basic_auth / secret
+					}
+					tls_config {
+						tls off
+					}
+					encode gzip
+				}
+			`,
+			expectedDirectives: []string{"respond", "basic_auth", "tls", "encode", "respond"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testParser(tc.input)
+			blocks, err := p.parseAll()
+			if err != nil {
+				t.Fatalf("parseAll: %v", err)
+			}
+
+			if len(blocks) != 1 {
+				t.Fatalf("expected 1 server block, got %d", len(blocks))
+			}
+
+			if len(blocks[0].Segments) != len(tc.expectedDirectives) {
+				t.Fatalf("expected %d segments, got %d", len(tc.expectedDirectives), len(blocks[0].Segments))
+			}
+
+			for i, directive := range tc.expectedDirectives {
+				if actual := blocks[0].Segments[i].Directive(); actual != directive {
+					t.Fatalf("segment %d: expected directive %q, got %q", i, directive, actual)
+				}
+			}
+		})
+	}
+}
+
 func testParser(input string) parser {
 	return parser{Dispenser: NewTestDispenser(input)}
 }
