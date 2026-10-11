@@ -848,3 +848,97 @@ func TestCookieHashPolicyWithFirstFallback(t *testing.T) {
 		t.Error("Expected cookieHashPolicy to set a new cookie.")
 	}
 }
+
+func TestQueryHashPolicyWithCookieFallback(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	queryPolicy := QueryHashSelection{
+		Key:         "foo",
+		FallbackRaw: caddyconfig.JSONModuleObject(CookieHashSelection{}, "policy", "cookie", nil),
+	}
+	if err := queryPolicy.Provision(ctx); err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	pool := testPool()
+	pool[0].Dial = "localhost:8080"
+	pool[1].Dial = "localhost:8081"
+	pool[2].Dial = "localhost:8082"
+
+	// When query parameter is absent and ResponseWriter is provided, fallback to CookieHashSelection should set a cookie.
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	w := httptest.NewRecorder()
+	h := queryPolicy.Select(pool, req, w)
+	if h == nil {
+		t.Fatal("Expected non-nil upstream host")
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Error("Expected cookie to be set by fallback CookieHashSelection")
+	} else if cookies[0].Name != "lb" {
+		t.Errorf("Expected cookie name 'lb', got '%s'", cookies[0].Name)
+	}
+
+	// When query parameter is absent and ResponseWriter is nil, fallback should not panic and return upstream host.
+	req = httptest.NewRequest(http.MethodGet, "/test", nil)
+	h = queryPolicy.Select(pool, req, nil)
+	if h == nil {
+		t.Fatal("Expected non-nil upstream host when ResponseWriter is nil")
+	}
+}
+
+func TestHeaderHashPolicyWithCookieFallback(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	headerPolicy := HeaderHashSelection{
+		Field:       "X-Test",
+		FallbackRaw: caddyconfig.JSONModuleObject(CookieHashSelection{}, "policy", "cookie", nil),
+	}
+	if err := headerPolicy.Provision(ctx); err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	pool := testPool()
+	pool[0].Dial = "localhost:8080"
+	pool[1].Dial = "localhost:8081"
+	pool[2].Dial = "localhost:8082"
+
+	// When header is absent and ResponseWriter is provided, fallback to CookieHashSelection should set a cookie.
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	w := httptest.NewRecorder()
+	h := headerPolicy.Select(pool, req, w)
+	if h == nil {
+		t.Fatal("Expected non-nil upstream host")
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Error("Expected cookie to be set by fallback CookieHashSelection")
+	} else if cookies[0].Name != "lb" {
+		t.Errorf("Expected cookie name 'lb', got '%s'", cookies[0].Name)
+	}
+
+	// When header is absent and ResponseWriter is nil, fallback should not panic and return upstream host.
+	req = httptest.NewRequest(http.MethodGet, "/test", nil)
+	h = headerPolicy.Select(pool, req, nil)
+	if h == nil {
+		t.Fatal("Expected non-nil upstream host when ResponseWriter is nil")
+	}
+}
+
+func TestCookieHashPolicyNilWriter(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	cookiePolicy := CookieHashSelection{}
+	if err := cookiePolicy.Provision(ctx); err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	pool := testPool()
+	pool[0].Dial = "localhost:8080"
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	h := cookiePolicy.Select(pool, req, nil)
+	if h == nil {
+		t.Fatal("Expected non-nil upstream host when ResponseWriter is nil")
+	}
+}
