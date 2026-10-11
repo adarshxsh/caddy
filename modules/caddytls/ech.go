@@ -295,19 +295,35 @@ func (ech *ECH) rotationNeeded(rotationInterval, deleteAfter time.Duration) bool
 	return false
 }
 
+// GetKeys returns a thread-safe defensive copy of the ECH keys.
+func (ech *ECH) GetKeys() []tls.EncryptedClientHelloKey {
+	if ech == nil || ech.configsMu == nil {
+		return nil
+	}
+	ech.configsMu.RLock()
+	defer ech.configsMu.RUnlock()
+	if len(ech.stdlibReady) == 0 {
+		return nil
+	}
+	keys := make([]tls.EncryptedClientHelloKey, len(ech.stdlibReady))
+	copy(keys, ech.stdlibReady)
+	return keys
+}
+
 // updateKeyList updates the list of ECH keys the std lib uses to serve ECH.
 // It must be called inside a write lock on ech.configsMu.
 func (ech *ECH) updateKeyList() {
-	ech.stdlibReady = []tls.EncryptedClientHelloKey{}
+	var keys []tls.EncryptedClientHelloKey
 	for _, cfgs := range ech.configs {
 		for _, cfg := range cfgs {
-			ech.stdlibReady = append(ech.stdlibReady, tls.EncryptedClientHelloKey{
+			keys = append(keys, tls.EncryptedClientHelloKey{
 				Config:      cfg.configBin,
 				PrivateKey:  cfg.privKeyBin,
 				SendAsRetry: cfg.meta.Replaced.IsZero(), // only send during retries if key has not been rotated out
 			})
 		}
 	}
+	ech.stdlibReady = keys
 }
 
 // publishECHConfigs publishes any configs that are configured for publication and which haven't been published already.

@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -360,4 +361,111 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestECHGetKeys_NilAndEmpty(t *testing.T) {
+	var nilECH *ECH
+	if keys := nilECH.GetKeys(); keys != nil {
+		t.Fatalf("expected nil keys for nil *ECH, got %v", keys)
+	}
+
+	uninitializedECH := &ECH{}
+	if keys := uninitializedECH.GetKeys(); keys != nil {
+		t.Fatalf("expected nil keys for uninitialized *ECH, got %v", keys)
+	}
+
+	ech := &ECH{
+		configsMu: new(sync.RWMutex),
+	}
+	if keys := ech.GetKeys(); keys != nil {
+		t.Fatalf("expected nil keys for empty stdlibReady, got %v", keys)
+	}
+}
+
+func TestECHGetKeys_DefensiveCopy(t *testing.T) {
+	ech := &ECH{
+		configsMu: new(sync.RWMutex),
+		stdlibReady: []tls.EncryptedClientHelloKey{
+			{Config: []byte("config1")},
+			{Config: []byte("config2")},
+		},
+	}
+
+	keys1 := ech.GetKeys()
+	if len(keys1) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys1))
+	}
+
+	// Mutate returned slice
+	keys1[0].Config = []byte("modified")
+
+	// Get keys again and verify original stdlibReady was not mutated
+	keys2 := ech.GetKeys()
+	if string(keys2[0].Config) != "config1" {
+		t.Fatalf("expected original config 'config1', got '%s'", string(keys2[0].Config))
+	}
+}
+
+func TestECH_ConcurrentGetKeysAndRotation(t *testing.T) {
+	ech := &ECH{
+		configsMu: new(sync.RWMutex),
+		configs:   make(map[string][]echConfig),
+	}
+
+	// Initial key list setup
+	ech.configsMu.Lock()
+	ech.configs["example.com"] = []echConfig{
+		{
+			configBin:  []byte("cfg1"),
+			privKeyBin: []byte("key1"),
+		},
+	}
+	ech.updateKeyList()
+	ech.configsMu.Unlock()
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Readers
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					keys := ech.GetKeys()
+					for _, k := range keys {
+						_ = len(k.Config)
+						_ = len(k.PrivateKey)
+					}
+				}
+			}
+		}()
+	}
+
+	// Writers
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				ech.configsMu.Lock()
+				ech.configs["example.com"] = []echConfig{
+					{
+						configBin:  []byte(fmt.Sprintf("cfg-%d-%d", id, j)),
+						privKeyBin: []byte(fmt.Sprintf("key-%d-%d", id, j)),
+					},
+				}
+				ech.updateKeyList()
+				ech.configsMu.Unlock()
+			}
+		}(i)
+	}
+
+	// Let readers run briefly alongside writers
+	close(stop)
+	wg.Wait()
 }
