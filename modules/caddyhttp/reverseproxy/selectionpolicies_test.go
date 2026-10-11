@@ -635,52 +635,169 @@ func TestURIHashPolicy(t *testing.T) {
 }
 
 func TestLeastRequests(t *testing.T) {
-	pool := testPool()
-	pool[0].Dial = "localhost:8080"
-	pool[1].Dial = "localhost:8081"
-	pool[2].Dial = "localhost:8082"
-	pool[0].setHealthy(true)
-	pool[1].setHealthy(true)
-	pool[2].setHealthy(true)
-	pool[0].countRequest(10)
-	pool[1].countRequest(20)
-	pool[2].countRequest(30)
+	// Test ascending request counts
+	t.Run("ascending", func(t *testing.T) {
+		pool := testPool()
+		pool[0].Dial = "localhost:8080"
+		pool[1].Dial = "localhost:8081"
+		pool[2].Dial = "localhost:8082"
+		pool[0].setHealthy(true)
+		pool[1].setHealthy(true)
+		pool[2].setHealthy(true)
+		pool[0].countRequest(10)
+		pool[1].countRequest(20)
+		pool[2].countRequest(30)
 
-	result := leastRequests(pool)
+		result := leastRequests(pool)
+		if result == nil {
+			t.Fatal("Least request should not return nil")
+		}
+		if result != pool[0] {
+			t.Errorf("Expected pool[0] (10 reqs), got %v", result)
+		}
+	})
 
-	if result == nil {
-		t.Error("Least request should not return nil")
-	}
+	// Test descending request counts
+	t.Run("descending", func(t *testing.T) {
+		pool := testPool()
+		pool[0].Dial = "localhost:8080"
+		pool[1].Dial = "localhost:8081"
+		pool[2].Dial = "localhost:8082"
+		pool[0].setHealthy(true)
+		pool[1].setHealthy(true)
+		pool[2].setHealthy(true)
+		pool[0].countRequest(30)
+		pool[1].countRequest(20)
+		pool[2].countRequest(10)
 
-	if result != pool[0] {
-		t.Error("Least request should return pool[0]")
-	}
+		result := leastRequests(pool)
+		if result == nil {
+			t.Fatal("Least request should not return nil")
+		}
+		if result != pool[2] {
+			t.Errorf("Expected pool[2] (10 reqs), got %v", result)
+		}
+	})
+
+	// Test mixed request counts
+	t.Run("mixed", func(t *testing.T) {
+		pool := testPool()
+		pool[0].Dial = "localhost:8080"
+		pool[1].Dial = "localhost:8081"
+		pool[2].Dial = "localhost:8082"
+		pool[0].setHealthy(true)
+		pool[1].setHealthy(true)
+		pool[2].setHealthy(true)
+		pool[0].countRequest(30)
+		pool[1].countRequest(10)
+		pool[2].countRequest(20)
+
+		result := leastRequests(pool)
+		if result == nil {
+			t.Fatal("Least request should not return nil")
+		}
+		if result != pool[1] {
+			t.Errorf("Expected pool[1] (10 reqs), got %v", result)
+		}
+	})
+
+	// Test tied minimum request counts
+	t.Run("tied minimums", func(t *testing.T) {
+		pool := testPool()
+		pool[0].Dial = "localhost:8080"
+		pool[1].Dial = "localhost:8081"
+		pool[2].Dial = "localhost:8082"
+		pool[0].setHealthy(true)
+		pool[1].setHealthy(true)
+		pool[2].setHealthy(true)
+		pool[0].countRequest(30)
+		pool[1].countRequest(10)
+		pool[2].countRequest(10)
+
+		for range 10 {
+			result := leastRequests(pool)
+			if result == nil {
+				t.Fatal("Least request should not return nil")
+			}
+			if result != pool[1] && result != pool[2] {
+				t.Errorf("Expected pool[1] or pool[2] (10 reqs), got %v", result)
+			}
+		}
+	})
 }
 
 func TestRandomChoicePolicy(t *testing.T) {
-	pool := testPool()
-	pool[0].Dial = "localhost:8080"
-	pool[1].Dial = "localhost:8081"
-	pool[2].Dial = "localhost:8082"
-	pool[0].setHealthy(false)
-	pool[1].setHealthy(true)
-	pool[2].setHealthy(true)
-	pool[0].countRequest(10)
-	pool[1].countRequest(20)
-	pool[2].countRequest(30)
+	t.Run("skips unhealthy host", func(t *testing.T) {
+		pool := testPool()
+		pool[0].Dial = "localhost:8080"
+		pool[1].Dial = "localhost:8081"
+		pool[2].Dial = "localhost:8082"
+		pool[0].setHealthy(false)
+		pool[1].setHealthy(true)
+		pool[2].setHealthy(true)
+		pool[0].countRequest(10)
+		pool[1].countRequest(20)
+		pool[2].countRequest(30)
 
-	request := httptest.NewRequest(http.MethodGet, "/test", nil)
-	randomChoicePolicy := RandomChoiceSelection{Choose: 2}
+		request := httptest.NewRequest(http.MethodGet, "/test", nil)
+		randomChoicePolicy := RandomChoiceSelection{Choose: 2}
 
-	h := randomChoicePolicy.Select(pool, request, nil)
+		h := randomChoicePolicy.Select(pool, request, nil)
 
-	if h == nil {
-		t.Error("RandomChoicePolicy should not return nil")
-	}
+		if h == nil {
+			t.Error("RandomChoicePolicy should not return nil")
+		}
 
-	if h == pool[0] {
-		t.Error("RandomChoicePolicy should not choose pool[0]")
-	}
+		if h == pool[0] {
+			t.Error("RandomChoicePolicy should not choose pool[0]")
+		}
+	})
+
+	t.Run("descending request counts", func(t *testing.T) {
+		pool := testPool()
+		pool[0].Dial = "localhost:8080"
+		pool[1].Dial = "localhost:8081"
+		pool[2].Dial = "localhost:8082"
+		pool[0].setHealthy(true)
+		pool[1].setHealthy(true)
+		pool[2].setHealthy(true)
+		pool[0].countRequest(30)
+		pool[1].countRequest(20)
+		pool[2].countRequest(10)
+
+		request := httptest.NewRequest(http.MethodGet, "/test", nil)
+		randomChoicePolicy := RandomChoiceSelection{Choose: 2}
+
+		for range 50 {
+			h := randomChoicePolicy.Select(pool, request, nil)
+			if h == pool[0] {
+				t.Errorf("RandomChoicePolicy should never choose pool[0] (30 reqs) when pool[1] (20 reqs) or pool[2] (10 reqs) are available")
+			}
+		}
+	})
+
+	t.Run("mixed request counts", func(t *testing.T) {
+		pool := testPool()
+		pool[0].Dial = "localhost:8080"
+		pool[1].Dial = "localhost:8081"
+		pool[2].Dial = "localhost:8082"
+		pool[0].setHealthy(true)
+		pool[1].setHealthy(true)
+		pool[2].setHealthy(true)
+		pool[0].countRequest(30)
+		pool[1].countRequest(10)
+		pool[2].countRequest(20)
+
+		request := httptest.NewRequest(http.MethodGet, "/test", nil)
+		randomChoicePolicy := RandomChoiceSelection{Choose: 2}
+
+		for range 50 {
+			h := randomChoicePolicy.Select(pool, request, nil)
+			if h == pool[0] {
+				t.Errorf("RandomChoicePolicy should never choose pool[0] (30 reqs) when pool[1] (10 reqs) or pool[2] (20 reqs) are available")
+			}
+		}
+	})
 }
 
 func TestCookieHashPolicy(t *testing.T) {
