@@ -95,6 +95,13 @@ func TestAddressString(t *testing.T) {
 		{Address{Scheme: "", Host: "host", Port: "80", Path: "/path"}, "http://host/path"},
 		{Address{Scheme: "http", Host: "", Port: "1234", Path: ""}, "http://:1234"},
 		{Address{Scheme: "", Host: "", Port: "", Path: ""}, ""},
+		{Address{Scheme: "", Host: "::1", Port: "", Path: ""}, "http://[::1]"},
+		{Address{Scheme: "http", Host: "::1", Port: "80", Path: ""}, "http://[::1]"},
+		{Address{Scheme: "https", Host: "::1", Port: "443", Path: ""}, "https://[::1]"},
+		{Address{Scheme: "http", Host: "::1", Port: "1234", Path: ""}, "http://[::1]:1234"},
+		{Address{Scheme: "", Host: "[::1]", Port: "", Path: ""}, "http://[::1]"},
+		{Address{Scheme: "http", Host: "[::1]", Port: "1234", Path: ""}, "http://[::1]:1234"},
+		{Address{Scheme: "", Host: "2001:db8::1", Port: "", Path: "/path"}, "http://[2001:db8::1]/path"},
 	} {
 		actual := test.addr.String()
 		if actual != test.expected {
