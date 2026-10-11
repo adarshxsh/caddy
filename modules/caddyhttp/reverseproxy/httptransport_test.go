@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -278,4 +282,209 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPTransport_IdleConnTimeout_With_ReadTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(100 * time.Millisecond),
+		KeepAlive: &KeepAlive{
+			IdleConnTimeout: caddy.Duration(2 * time.Second),
+		},
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+	defer ht.Cleanup()
+
+	// First request
+	req1, _ := http.NewRequest("GET", ts.URL, nil)
+	resp1, err := ht.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if string(body1) != "ok" {
+		t.Fatalf("unexpected first body: %s", string(body1))
+	}
+
+	// Pause longer than ReadTimeout (100ms) but shorter than IdleConnTimeout (2s)
+	time.Sleep(200 * time.Millisecond)
+
+	// Second request should reuse pooled idle connection without timing out
+	req2, _ := http.NewRequest("GET", ts.URL, nil)
+	resp2, err := ht.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("second request failed after idle period: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if string(body2) != "ok" {
+		t.Fatalf("unexpected second body: %s", string(body2))
+	}
+}
+
+func TestHTTPTransport_HTTP2_Multiplexing_With_ReadTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("h2 ok"))
+	}))
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	defer ts.Close()
+
+	ht := &HTTPTransport{
+		TLS:         &TLSConfig{InsecureSkipVerify: true},
+		ReadTimeout: caddy.Duration(100 * time.Millisecond),
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+	defer ht.Cleanup()
+
+	// Request 1
+	req1, _ := http.NewRequest("GET", ts.URL, nil)
+	resp1, err := ht.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("first h2 request failed: %v", err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if resp1.ProtoMajor != 2 {
+		t.Fatalf("expected HTTP/2, got proto major %d", resp1.ProtoMajor)
+	}
+	if string(body1) != "h2 ok" {
+		t.Fatalf("unexpected h2 body: %s", string(body1))
+	}
+
+	// Quiet interval longer than ReadTimeout
+	time.Sleep(200 * time.Millisecond)
+
+	// Request 2 over same HTTP/2 transport
+	req2, _ := http.NewRequest("GET", ts.URL, nil)
+	resp2, err := ht.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("second h2 request failed after quiet interval: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if string(body2) != "h2 ok" {
+		t.Fatalf("unexpected second h2 body: %s", string(body2))
+	}
+}
+
+func TestHTTPTransport_ActiveRequestBody_WriteTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	ht := &HTTPTransport{
+		WriteTimeout: caddy.Duration(100 * time.Millisecond),
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+	defer ht.Cleanup()
+
+	slowBody := &slowReader{
+		data:  []byte("hello world"),
+		pause: 250 * time.Millisecond,
+	}
+
+	req, _ := http.NewRequest("POST", ts.URL, slowBody)
+	resp, err := ht.RoundTrip(req)
+	if err == nil && resp != nil {
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+
+	if err == nil {
+		t.Fatalf("expected error due to WriteTimeout, got nil")
+	}
+}
+
+func TestHTTPTransport_ActiveResponseBody_ReadTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			_, _ = w.Write([]byte("part 1"))
+			flusher.Flush()
+			time.Sleep(250 * time.Millisecond)
+			_, _ = w.Write([]byte("part 2"))
+		}
+	}))
+	defer ts.Close()
+
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(100 * time.Millisecond),
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+	defer ht.Cleanup()
+
+	req, _ := http.NewRequest("GET", ts.URL, nil)
+	resp, err := ht.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	buf := make([]byte, 100)
+	n, err := resp.Body.Read(buf)
+	if err != nil {
+		t.Fatalf("first read failed: %v", err)
+	}
+	if string(buf[:n]) != "part 1" {
+		t.Fatalf("unexpected chunk 1: %s", string(buf[:n]))
+	}
+
+	// Second read should pause for 250ms and time out against 100ms ReadTimeout
+	_, err = resp.Body.Read(buf)
+	if err == nil {
+		t.Fatalf("expected ReadTimeout error on second read, got nil")
+	}
+}
+
+type slowReader struct {
+	data    []byte
+	pause   time.Duration
+	hasRead bool
+}
+
+func (s *slowReader) Read(p []byte) (int, error) {
+	if !s.hasRead {
+		s.hasRead = true
+		time.Sleep(s.pause)
+	}
+	if len(s.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, s.data)
+	s.data = s.data[n:]
+	return n, nil
 }

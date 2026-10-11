@@ -21,9 +21,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	weakrand "math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"reflect"
@@ -35,7 +37,6 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
 
 	"github.com/caddyserver/caddy/v2"
@@ -352,17 +353,6 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			}
 		}
 
-		// if read/write timeouts are configured and this is a TCP connection,
-		// enforce the timeouts by wrapping the connection with our own type
-		if tcpConn, ok := conn.(*net.TCPConn); ok && (h.ReadTimeout > 0 || h.WriteTimeout > 0) {
-			conn = &tcpRWTimeoutConn{
-				TCPConn:      tcpConn,
-				readTimeout:  time.Duration(h.ReadTimeout),
-				writeTimeout: time.Duration(h.WriteTimeout),
-				logger:       caddyCtx.Logger(),
-			}
-		}
-
 		return conn, nil
 	}
 
@@ -398,11 +388,16 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 		return u, nil
 	}
 
+	responseHeaderTimeout := time.Duration(h.ResponseHeaderTimeout)
+	if responseHeaderTimeout == 0 && h.ReadTimeout > 0 {
+		responseHeaderTimeout = time.Duration(h.ReadTimeout)
+	}
+
 	rt := &http.Transport{
 		Proxy:                  proxyWrapper,
 		DialContext:            dialContext,
 		MaxConnsPerHost:        h.MaxConnsPerHost,
-		ResponseHeaderTimeout:  time.Duration(h.ResponseHeaderTimeout),
+		ResponseHeaderTimeout:  responseHeaderTimeout,
 		ExpectContinueTimeout:  time.Duration(h.ExpectContinueTimeout),
 		MaxResponseHeaderBytes: h.MaxResponseHeaderSize,
 		WriteBufferSize:        h.WriteBufferSize,
@@ -642,7 +637,73 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return h.h3Transport.RoundTrip(req)
 	}
 
-	return h.Transport.RoundTrip(req)
+	readTimeout := time.Duration(h.ReadTimeout)
+	writeTimeout := time.Duration(h.WriteTimeout)
+
+	if readTimeout <= 0 && writeTimeout <= 0 {
+		return h.Transport.RoundTrip(req)
+	}
+
+	reqCtx, cancel := context.WithCancel(req.Context())
+
+	var conn net.Conn
+	oldTrace := httptrace.ContextClientTrace(req.Context())
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			conn = info.Conn
+			if oldTrace != nil && oldTrace.GotConn != nil {
+				oldTrace.GotConn(info)
+			}
+		},
+	}
+	if oldTrace != nil {
+		*trace = *oldTrace
+		trace.GotConn = func(info httptrace.GotConnInfo) {
+			conn = info.Conn
+			if oldTrace.GotConn != nil {
+				oldTrace.GotConn(info)
+			}
+		}
+	}
+
+	req = req.WithContext(httptrace.WithClientTrace(reqCtx, trace))
+
+	if writeTimeout > 0 && req.Body != nil {
+		req.Body = &requestBodyWrapper{
+			ReadCloser: req.Body,
+			getConn:    func() net.Conn { return conn },
+			timeout:    writeTimeout,
+			cancel:     cancel,
+		}
+	}
+
+	resp, err := h.Transport.RoundTrip(req)
+	if err != nil {
+		if conn != nil && !isHTTP2Conn(conn) {
+			clearSocketDeadlines(conn)
+		}
+		cancel()
+		return nil, err
+	}
+
+	isH2 := (resp.ProtoMajor == 2) || isHTTP2Conn(conn)
+
+	if resp.Body != nil {
+		resp.Body = &responseBodyWrapper{
+			ReadCloser: resp.Body,
+			getConn:    func() net.Conn { return conn },
+			isH2:       isH2,
+			timeout:    readTimeout,
+			cancel:     cancel,
+		}
+	} else {
+		if conn != nil && !isH2 {
+			clearSocketDeadlines(conn)
+		}
+		cancel()
+	}
+
+	return resp, nil
 }
 
 // SetScheme ensures that the outbound request req
@@ -921,38 +982,114 @@ type KeepAlive struct {
 	IdleConnTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 }
 
-// tcpRWTimeoutConn enforces read/write timeouts for a TCP connection.
-// If it fails to set deadlines, the error is logged but does not abort
-// the read/write attempt (ignoring the error is consistent with what
-// the standard library does: https://github.com/golang/go/blob/c5da4fb7ac5cb7434b41fc9a1df3bee66c7f1a4d/src/net/http/server.go#L981-L986)
-type tcpRWTimeoutConn struct {
-	*net.TCPConn
-	readTimeout, writeTimeout time.Duration
-	logger                    *zap.Logger
+func isHTTP2Conn(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		return tlsConn.ConnectionState().NegotiatedProtocol == "h2"
+	}
+	return false
 }
 
-func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
-	if c.readTimeout > 0 {
-		err := c.TCPConn.SetReadDeadline(time.Now().Add(c.readTimeout))
-		if err != nil {
-			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
-				ce.Write(zap.Error(err))
-			}
-		}
+func clearSocketDeadlines(conn net.Conn) {
+	if conn == nil {
+		return
 	}
-	return c.TCPConn.Read(b)
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
 }
 
-func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
-	if c.writeTimeout > 0 {
-		err := c.TCPConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-		if err != nil {
-			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
-				ce.Write(zap.Error(err))
-			}
+type requestBodyWrapper struct {
+	io.ReadCloser
+	getConn func() net.Conn
+	timeout time.Duration
+	cancel  context.CancelFunc
+}
+
+func (w *requestBodyWrapper) Read(p []byte) (int, error) {
+	conn := w.getConn()
+	isH2 := isHTTP2Conn(conn)
+
+	if conn != nil && !isH2 && w.timeout > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(w.timeout))
+	}
+
+	var timer *time.Timer
+	if w.cancel != nil && w.timeout > 0 {
+		timer = time.AfterFunc(w.timeout, w.cancel)
+	}
+
+	n, err := w.ReadCloser.Read(p)
+
+	if timer != nil {
+		timer.Stop()
+	}
+
+	if err != nil && conn != nil && !isH2 {
+		_ = conn.SetWriteDeadline(time.Time{})
+	}
+
+	return n, err
+}
+
+func (w *requestBodyWrapper) Close() error {
+	conn := w.getConn()
+	if conn != nil && !isHTTP2Conn(conn) {
+		_ = conn.SetWriteDeadline(time.Time{})
+	}
+	if w.cancel != nil {
+		w.cancel()
+	}
+	return w.ReadCloser.Close()
+}
+
+type responseBodyWrapper struct {
+	io.ReadCloser
+	getConn func() net.Conn
+	isH2    bool
+	timeout time.Duration
+	cancel  context.CancelFunc
+}
+
+func (w *responseBodyWrapper) Read(p []byte) (int, error) {
+	conn := w.getConn()
+	if !w.isH2 && conn != nil && w.timeout > 0 {
+		_ = conn.SetReadDeadline(time.Now().Add(w.timeout))
+	}
+
+	var timer *time.Timer
+	if w.cancel != nil && w.timeout > 0 {
+		timer = time.AfterFunc(w.timeout, w.cancel)
+	}
+
+	n, err := w.ReadCloser.Read(p)
+
+	if timer != nil {
+		timer.Stop()
+	}
+
+	if err != nil {
+		if !w.isH2 && conn != nil {
+			clearSocketDeadlines(conn)
+		}
+		if w.cancel != nil {
+			w.cancel()
 		}
 	}
-	return c.TCPConn.Write(b)
+
+	return n, err
+}
+
+func (w *responseBodyWrapper) Close() error {
+	conn := w.getConn()
+	if !w.isH2 && conn != nil {
+		clearSocketDeadlines(conn)
+	}
+	if w.cancel != nil {
+		w.cancel()
+	}
+	return w.ReadCloser.Close()
 }
 
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
