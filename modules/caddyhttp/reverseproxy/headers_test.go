@@ -2,9 +2,11 @@ package reverseproxy
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -125,3 +127,84 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
 	}
 }
+
+func TestCopyResponseHeadersHandler_Include(t *testing.T) {
+	h := CopyResponseHeadersHandler{
+		Include: []string{"x-custom-header", "X-Canonical-Header"},
+	}
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("unexpected provision error: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	hrc := &handleResponseContext{
+		response: &http.Response{
+			Header: http.Header{
+				"x-custom-header":    []string{"custom-val"},
+				"x-canonical-header": []string{"canonical-val"},
+				"x-excluded-header":  []string{"excluded-val"},
+			},
+		},
+	}
+	ctx := context.WithValue(req.Context(), proxyHandleResponseContextCtxKey, hrc)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) error {
+		return nil
+	})
+
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatalf("ServeHTTP failed: %v", err)
+	}
+
+	resHeader := rec.Header()
+	if got := resHeader.Get("x-custom-header"); got != "custom-val" {
+		t.Errorf("expected x-custom-header 'custom-val', got %q", got)
+	}
+	if got := resHeader.Get("x-canonical-header"); got != "canonical-val" {
+		t.Errorf("expected x-canonical-header 'canonical-val', got %q", got)
+	}
+	if got := resHeader.Get("x-excluded-header"); got != "" {
+		t.Errorf("expected x-excluded-header to be absent, got %q", got)
+	}
+}
+
+func TestCopyResponseHeadersHandler_Exclude(t *testing.T) {
+	h := CopyResponseHeadersHandler{
+		Exclude: []string{"x-custom-header"},
+	}
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("unexpected provision error: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	hrc := &handleResponseContext{
+		response: &http.Response{
+			Header: http.Header{
+				"x-custom-header": []string{"custom-val"},
+				"x-kept-header":   []string{"kept-val"},
+			},
+		},
+	}
+	ctx := context.WithValue(req.Context(), proxyHandleResponseContextCtxKey, hrc)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) error {
+		return nil
+	})
+
+	if err := h.ServeHTTP(rec, req, next); err != nil {
+		t.Fatalf("ServeHTTP failed: %v", err)
+	}
+
+	resHeader := rec.Header()
+	if got := resHeader.Get("x-custom-header"); got != "" {
+		t.Errorf("expected x-custom-header to be excluded, got %q", got)
+	}
+	if got := resHeader.Get("x-kept-header"); got != "kept-val" {
+		t.Errorf("expected x-kept-header 'kept-val', got %q", got)
+	}
+}
+
