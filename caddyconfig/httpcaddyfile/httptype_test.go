@@ -298,3 +298,44 @@ func TestDefaultSNIWithoutHTTPS(t *testing.T) {
 		t.Errorf("Expected default_sni 'my-sni.com' in TLS connection policies, but it was missing. Generated JSON: %s", string(result))
 	}
 }
+
+func TestWasReplacedPlaceholderShorthand(t *testing.T) {
+	testCases := []struct {
+		input    string
+		expected string
+	}{
+		// Static shorthands
+		{"{http.request.host}", "{host}"},
+		{"http.request.host", "{host}"},
+		{"{http.vars.client_ip}", "{client_ip}"},
+		{"{http.request.uri.path}", "{path}"},
+
+		// Regex shorthands
+		{"{http.request.header.X-Forwarded-For}", "{header.X-Forwarded-For}"},
+		{"http.request.header.X-Forwarded-For", "{header.X-Forwarded-For}"},
+		{"{http.request.cookie.session_id}", "{cookie.session_id}"},
+		{"{http.request.host.labels.1}", "{labels.1}"},
+		{"{http.request.uri.path.my_path}", "{path.my_path}"},
+		{"{http.request.uri.path.file.ext}", "{file.ext}"},
+		{"{http.request.uri.query.page}", "{query.page}"},
+		{"{http.regexp.match.1}", "{re.match.1}"},
+		{"{http.vars.my_var}", "{vars.my_var}"},
+		{"{http.reverse_proxy.upstream}", "{rp.upstream}"},
+		{"{http.intercept.status}", "{resp.status}"},
+		{"{http.error.status_code}", "{err.status_code}"},
+		{"{http.matchers.file.type}", "{file_match.type}"},
+
+		// Non-shorthand custom names
+		{"custom_variable", ""},
+		{"{custom_variable}", ""},
+		{"{http.custom.destination}", ""},
+		{"http.custom.destination", ""},
+	}
+
+	for _, tc := range testCases {
+		actual := WasReplacedPlaceholderShorthand(tc.input)
+		if actual != tc.expected {
+			t.Errorf("WasReplacedPlaceholderShorthand(%q) = %q; expected %q", tc.input, actual, tc.expected)
+		}
+	}
+}
