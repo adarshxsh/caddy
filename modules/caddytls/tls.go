@@ -142,7 +142,7 @@ type TLS struct {
 	events             *caddyevents.App
 
 	serverNames   map[string]serverNameRegistration
-	serverNamesMu *sync.Mutex
+	serverNamesMu sync.RWMutex
 
 	// set of subjects with managed certificates,
 	// and hashes of manually-loaded certificates
@@ -170,7 +170,6 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 	repl := caddy.NewReplacer()
 	t.managing, t.loaded = make(map[string]string), make(map[string]string)
 	t.serverNames = make(map[string]serverNameRegistration)
-	t.serverNamesMu = new(sync.Mutex)
 
 	// set up default DNS module, if any, and make sure it implements all the
 	// common libdns interfaces, since it could be used for a variety of things
@@ -697,9 +696,21 @@ func (t *TLS) RegisterServerNames(dnsNames, alpnValues []string) {
 	}
 }
 
+// ServerNames returns a thread-safe snapshot of all registered server names.
+func (t *TLS) ServerNames() []string {
+	t.serverNamesMu.RLock()
+	defer t.serverNamesMu.RUnlock()
+
+	names := make([]string, 0, len(t.serverNames))
+	for name := range t.serverNames {
+		names = append(names, name)
+	}
+	return names
+}
+
 func (t *TLS) alpnValuesForServerNames(dnsNames []string) map[string][]string {
-	t.serverNamesMu.Lock()
-	defer t.serverNamesMu.Unlock()
+	t.serverNamesMu.RLock()
+	defer t.serverNamesMu.RUnlock()
 
 	result := make(map[string][]string, len(dnsNames))
 	for _, name := range dnsNames {
