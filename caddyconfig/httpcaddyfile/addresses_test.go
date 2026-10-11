@@ -35,6 +35,12 @@ func TestParseAddress(t *testing.T) {
 		{`{env.APP_DOMAIN}:80`, "", "{env.APP_DOMAIN}", "80", "", false},
 		{`{env.APP_DOMAIN}/path`, "", "{env.APP_DOMAIN}", "", "/path", false},
 		{`example.com/{env.APP_PATH}`, "", "example.com", "", "/{env.APP_PATH}", false},
+		{`localhost:{env.PORT:8080}`, "", "localhost", "{env.PORT:8080}", "", false},
+		{`{env.HOST:localhost}:{env.PORT:8080}`, "", "{env.HOST:localhost}", "{env.PORT:8080}", "", false},
+		{`http://{env.HOST:localhost}:{env.PORT:8080}/path`, "http", "{env.HOST:localhost}", "{env.PORT:8080}", "/path", false},
+		{`[::1]:{env.PORT:8080}`, "", "::1", "{env.PORT:8080}", "", false},
+		{`:{env.PORT:8080}`, "", "", "{env.PORT:8080}", "", false},
+		{`{env.HOST:localhost}`, "", "{env.HOST:localhost}", "", "", false},
 		{`http://127.0.0.1`, "http", "127.0.0.1", "", "", false},
 		{`https://127.0.0.1`, "https", "127.0.0.1", "", "", false},
 		{`http://[::1]`, "http", "::1", "", "", false},
@@ -168,6 +174,20 @@ func TestKeyNormalization(t *testing.T) {
 			input: "sub.{env.MY_DOMAIN}.com",
 			expect: Address{
 				Host: "sub.{env.MY_DOMAIN}.com",
+			},
+		},
+		{
+			input: "localhost:{env.PORT:8080}",
+			expect: Address{
+				Host: "localhost",
+				Port: "{env.PORT:8080}",
+			},
+		},
+		{
+			input: "sub.{env.MY_DOMAIN:example.com}:8080",
+			expect: Address{
+				Host: "sub.{env.MY_DOMAIN:example.com}",
+				Port: "8080",
 			},
 		},
 		{
