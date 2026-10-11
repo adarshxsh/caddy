@@ -520,14 +520,8 @@ func (t *TLS) Cleanup() error {
 			}
 		}
 
-		// remove the certs
-		certCacheMu.RLock()
-		certCache.RemoveManaged(noLongerManaged)
-		certCache.Remove(noLongerLoaded)
-		certCacheMu.RUnlock()
-
 		// give the new TLS app a "kick" to manage certs that it is configured for
-		// with its own configuration instead of the one we just evicted
+		// with its own configuration before we evict the obsolete ones
 		if err := nextTLSApp.Manage(reManage); err != nil {
 			if c := t.logger.Check(zapcore.ErrorLevel, "re-managing unloaded certificates with new config"); c != nil {
 				c.Write(
@@ -536,15 +530,23 @@ func (t *TLS) Cleanup() error {
 				)
 			}
 		}
+
+		// remove the certs
+		certCacheMu.Lock()
+		if certCache != nil {
+			certCache.RemoveManaged(noLongerManaged)
+			certCache.Remove(noLongerLoaded)
+		}
+		certCacheMu.Unlock()
 	} else {
 		// no more TLS app running, so delete in-memory cert cache, if it was created yet
-		certCacheMu.RLock()
-		hasCache := certCache != nil
-		certCacheMu.RUnlock()
-		if hasCache {
-			certCache.Stop()
-			certCacheMu.Lock()
+		certCacheMu.Lock()
+		if certCache != nil {
+			cache := certCache
 			certCache = nil
+			certCacheMu.Unlock()
+			cache.Stop()
+		} else {
 			certCacheMu.Unlock()
 		}
 	}
@@ -881,12 +883,18 @@ func (t *TLS) getAutomationPolicyForName(name string) *AutomationPolicy {
 func AllMatchingCertificates(san string) []certmagic.Certificate {
 	certCacheMu.RLock()
 	defer certCacheMu.RUnlock()
+	if certCache == nil {
+		return nil
+	}
 	return certCache.AllMatchingCertificates(san)
 }
 
 func (t *TLS) HasCertificateForSubject(subject string) bool {
 	certCacheMu.RLock()
-	allMatchingCerts := certCache.AllMatchingCertificates(subject)
+	var allMatchingCerts []certmagic.Certificate
+	if certCache != nil {
+		allMatchingCerts = certCache.AllMatchingCertificates(subject)
+	}
 	certCacheMu.RUnlock()
 	for _, cert := range allMatchingCerts {
 		// check if the cert is manually loaded by this config
