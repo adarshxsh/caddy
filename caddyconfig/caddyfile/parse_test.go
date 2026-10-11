@@ -1034,3 +1034,116 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 func testParser(input string) parser {
 	return parser{Dispenser: NewTestDispenser(input)}
 }
+
+func TestDoImportNoPhantomTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		input             string
+		siteKey           string
+		unexpectedInSite  []string
+		expectedSiteTexts []string
+	}{
+		{
+			name: "snippet import with block arguments",
+			input: `
+				(site) {
+					http://{args[0]} {
+						respond "hello"
+						{block}
+						respond "world"
+					}
+				}
+
+				import site example.com {
+					header_up Host {host}
+				}
+			`,
+			siteKey:          "http://example.com",
+			unexpectedInSite: []string{"import", "site"},
+			expectedSiteTexts: []string{
+				"http://example.com", "{",
+				"respond", "hello",
+				"header_up", "Host", "{host}",
+				"respond", "world",
+				"}",
+			},
+		},
+		{
+			name: "multi-level snippet import with block arguments",
+			input: `
+				(base) {
+					header {args[0]}
+					{block}
+					footer
+				}
+
+				(middle) {
+					import base custom_header {
+						body_directive
+					}
+				}
+
+				example.com {
+					import middle
+				}
+			`,
+			siteKey:          "example.com",
+			unexpectedInSite: []string{"import", "base", "middle"},
+			expectedSiteTexts: []string{
+				"example.com", "{",
+				"header", "custom_header",
+				"body_directive",
+				"footer",
+				"}",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testParser(tc.input)
+			blocks, err := p.parseAll()
+			if err != nil {
+				t.Fatalf("parseAll failed: %v", err)
+			}
+
+			if len(blocks) != 1 {
+				t.Fatalf("expected 1 block, got %d", len(blocks))
+			}
+
+			// Find index where site key starts in p.tokens
+			var siteTokens []Token
+			foundSite := false
+			for _, tok := range p.tokens {
+				if tok.Text == tc.siteKey {
+					foundSite = true
+				}
+				if foundSite {
+					siteTokens = append(siteTokens, tok)
+				}
+			}
+
+			if !foundSite {
+				t.Fatalf("site key %q not found in p.tokens: %v", tc.siteKey, p.tokens)
+			}
+
+			var siteTexts []string
+			for _, tok := range siteTokens {
+				siteTexts = append(siteTexts, tok.Text)
+				for _, unexp := range tc.unexpectedInSite {
+					if tok.Text == unexp {
+						t.Errorf("found residual import token %q in site tokens: %v", unexp, siteTexts)
+					}
+				}
+			}
+
+			if len(siteTexts) != len(tc.expectedSiteTexts) {
+				t.Fatalf("expected site tokens %v, got %v", tc.expectedSiteTexts, siteTexts)
+			}
+
+			for i, exp := range tc.expectedSiteTexts {
+				if siteTexts[i] != exp {
+					t.Errorf("token %d: expected %q, got %q", i, exp, siteTexts[i])
+				}
+			}
+		})
+	}
+}

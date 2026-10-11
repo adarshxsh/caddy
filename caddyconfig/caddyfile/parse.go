@@ -370,10 +370,12 @@ func (p *parser) doImport(nesting int) error {
 	repl := makeArgsReplacer(args)
 
 	// grab all the tokens (if it exists) from within a block that follows the import
+	cursorBeforeBlock := p.cursor
 	var blockTokens []Token
 	for currentNesting := p.Nesting(); p.NextBlock(currentNesting); {
 		blockTokens = append(blockTokens, p.Token())
 	}
+	blockOffset := p.cursor - cursorBeforeBlock - len(blockTokens)
 	// initialize with size 1
 	blockMapping := make(map[string][]Token, 1)
 	if len(blockTokens) > 0 {
@@ -402,7 +404,7 @@ func (p *parser) doImport(nesting int) error {
 
 	// splice out the import directive and its arguments
 	// (2 tokens, plus the length of args)
-	tokensBefore := p.tokens[:p.cursor-1-len(args)-len(blockTokens)]
+	tokensBefore := p.tokens[:p.cursor-1-len(args)-len(blockTokens)-blockOffset]
 	tokensAfter := p.tokens[p.cursor+1:]
 	var importedTokens []Token
 	var nodes []string
@@ -578,7 +580,7 @@ func (p *parser) doImport(nesting int) error {
 	// splice the imported tokens in the place of the import statement
 	// and rewind cursor so Next() will land on first imported token
 	p.tokens = append(tokensBefore, append(tokensCopy, tokensAfter...)...)
-	p.cursor -= len(args) + len(blockTokens) + 1
+	p.cursor -= len(args) + len(blockTokens) + blockOffset + 1
 
 	return nil
 }
