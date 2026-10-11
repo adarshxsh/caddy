@@ -224,6 +224,9 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 	if h.DialTimeout == 0 {
 		h.DialTimeout = caddy.Duration(3 * time.Second)
 	}
+	if h.DialTimeout < 0 {
+		return nil, fmt.Errorf("dial_timeout must be non-negative")
+	}
 
 	dialer := &net.Dialer{
 		Timeout:       time.Duration(h.DialTimeout),
