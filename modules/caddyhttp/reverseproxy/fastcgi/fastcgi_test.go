@@ -1,6 +1,9 @@
 package fastcgi
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -8,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -353,5 +357,36 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 
 	for _, p := range payloads {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
+	}
+}
+
+func TestBuildEnvIgnoreProxyHeader(t *testing.T) {
+	tr := Transport{
+		Root: "/var/www",
+	}
+
+	proxyCasings := []string{"Proxy", "PROXY", "proxy", "pROXY", "PrOxY"}
+
+	for _, casing := range proxyCasings {
+		t.Run(casing, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://localhost/index.php", nil)
+			req.Header[casing] = []string{"http://attacker.com:8080"}
+			req.Header.Set("User-Agent", "TestAgent")
+			req.Header.Set("X-Forwarded-For", "192.168.1.1")
+
+			ctx := req.Context()
+			ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, caddy.NewReplacer())
+			ctx = context.WithValue(ctx, caddyhttp.OriginalRequestCtxKey, *req)
+			req = req.WithContext(ctx)
+
+			env, err := tr.buildEnv(req)
+			require.NoError(t, err)
+
+			_, hasProxy := env["HTTP_PROXY"]
+			assert.False(t, hasProxy, "HTTP_PROXY should not be set for request header %q", casing)
+
+			assert.Equal(t, "TestAgent", env["HTTP_USER_AGENT"])
+			assert.Equal(t, "192.168.1.1", env["HTTP_X_FORWARDED_FOR"])
+		})
 	}
 }

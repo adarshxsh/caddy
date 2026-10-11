@@ -409,7 +409,13 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 
 	// Add all HTTP headers to env variables
 	for field, val := range r.Header {
+		if strings.EqualFold(field, "Proxy") {
+			continue
+		}
 		header := strings.ToUpper(field)
+		if header == "PROXY" {
+			continue
+		}
 		header = headerNameReplacer.Replace(header)
 		env["HTTP_"+header] = strings.Join(val, ", ")
 	}
