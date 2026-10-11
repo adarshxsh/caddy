@@ -25,7 +25,6 @@ func TestAddForwardedHeadersNonIP(t *testing.T) {
 
 	// Execute the unexported function
 	err := h.addForwardedHeaders(req)
-
 	// Expectation: No error should be returned for non-IP addresses.
 	// The function should simply skip the trusted proxy check.
 	if err != nil {
@@ -117,6 +116,66 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 
 	if got := req.Header.Get("X-Forwarded-For"); got != "" {
 		t.Errorf("X-Forwarded-For should be empty when no prior XFF exists, got %q", got)
+	}
+	if got := req.Header.Get("X-Forwarded-Proto"); got != "http" {
+		t.Errorf("X-Forwarded-Proto = %q, want %q", got, "http")
+	}
+	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
+		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestAddForwardedHeaders_UntrustedEmptyClientIP(t *testing.T) {
+	h := Handler{}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = ":8080"
+	req.Header.Set("X-Forwarded-For", "spoofed.client.ip")
+
+	vars := map[string]any{
+		caddyhttp.TrustedProxyVarKey: false,
+		caddyhttp.ClientIPVarKey:     "",
+	}
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	err := h.addForwardedHeaders(req)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "" {
+		t.Errorf("X-Forwarded-For should be deleted for untrusted request with empty client IP, got %q", got)
+	}
+	if got := req.Header.Get("X-Forwarded-Proto"); got != "http" {
+		t.Errorf("X-Forwarded-Proto = %q, want %q", got, "http")
+	}
+	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
+		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestAddForwardedHeaders_TrustedEmptyClientIP(t *testing.T) {
+	h := Handler{}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = ":8080"
+	req.Header.Set("X-Forwarded-For", "10.0.0.1")
+
+	vars := map[string]any{
+		caddyhttp.TrustedProxyVarKey: true,
+		caddyhttp.ClientIPVarKey:     "",
+	}
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	err := h.addForwardedHeaders(req)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "10.0.0.1" {
+		t.Errorf("X-Forwarded-For = %q, want %q", got, "10.0.0.1")
 	}
 	if got := req.Header.Get("X-Forwarded-Proto"); got != "http" {
 		t.Errorf("X-Forwarded-Proto = %q, want %q", got, "http")
