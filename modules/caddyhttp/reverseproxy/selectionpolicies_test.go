@@ -848,3 +848,18 @@ func TestCookieHashPolicyWithFirstFallback(t *testing.T) {
 		t.Error("Expected cookieHashPolicy to set a new cookie.")
 	}
 }
+
+func TestClientIPHashSelection_MissingClientIPVar(t *testing.T) {
+	ipHash := ClientIPHashSelection{}
+	pool := UpstreamPool{
+		{Host: new(Host), Dial: "0.0.0.1"},
+		{Host: new(Host), Dial: "0.0.0.2"},
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	// req context has no ClientIPVarKey set
+	h := ipHash.Select(pool, req, nil)
+	if h == nil {
+		t.Error("Expected host selection to return an upstream even when ClientIPVarKey is missing")
+	}
+}

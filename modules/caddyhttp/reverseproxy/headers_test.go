@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -25,7 +26,6 @@ func TestAddForwardedHeadersNonIP(t *testing.T) {
 
 	// Execute the unexported function
 	err := h.addForwardedHeaders(req)
-
 	// Expectation: No error should be returned for non-IP addresses.
 	// The function should simply skip the trusted proxy check.
 	if err != nil {
@@ -123,5 +123,50 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestAddForwardedHeaders_MissingContextVars(t *testing.T) {
+	h := Handler{}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "1.2.3.4:12345"
+
+	// Request with no VarsCtxKey at all (missing TrustedProxyVarKey)
+	err := h.addForwardedHeaders(req)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "1.2.3.4" {
+		t.Errorf("X-Forwarded-For = %q, want %q", got, "1.2.3.4")
+	}
+}
+
+func TestPrepareRequest_MissingContextVars(t *testing.T) {
+	h := Handler{}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = "1.2.3.4:12345"
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	// Request with no ClientIPVarKey or TrustedProxyVarKey set
+	outReq, err := h.prepareRequest(req, caddy.NewReplacer())
+	if err != nil {
+		t.Fatalf("expected no error from prepareRequest, got: %v", err)
+	}
+
+	if outReq == nil {
+		t.Fatal("expected non-nil prepared request")
+	}
+
+	info, ok := caddyhttp.GetVar(outReq.Context(), proxyProtocolInfoVarKey).(ProxyProtocolInfo)
+	if !ok {
+		t.Error("expected ProxyProtocolInfo to be set in context")
+	}
+	if info.AddrPort.IsValid() {
+		t.Errorf("expected zero AddrPort when ClientIPVarKey is missing, got %v", info.AddrPort)
 	}
 }

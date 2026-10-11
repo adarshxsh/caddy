@@ -424,9 +424,9 @@ func TestStripHTML(t *testing.T) {
 			expect: ``,
 		},
 		{
-		    // false start — second '<' increments depth, single '>' only closes one level
-		    input:  `<h1<b>hi`,
-		    expect: ``,
+			// false start — second '<' increments depth, single '>' only closes one level
+			input:  `<h1<b>hi`,
+			expect: ``,
 		},
 		{
 			// XSS bypass via double opening bracket
@@ -707,4 +707,17 @@ func initTestContext() (TemplateContext, error) {
 		Req:        request,
 		RespHeader: WrappedHeader{make(http.Header)},
 	}, nil
+}
+
+func TestClientIP_MissingClientIPVar(t *testing.T) {
+	req, err := http.NewRequest("GET", "https://example.com/foo/bar", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	tplCtx := TemplateContext{Req: req}
+
+	clientIP := tplCtx.ClientIP()
+	if clientIP != "" {
+		t.Errorf("expected empty clientIP when ClientIPVarKey is missing, got %q", clientIP)
+	}
 }
