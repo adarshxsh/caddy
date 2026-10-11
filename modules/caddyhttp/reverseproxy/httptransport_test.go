@@ -3,11 +3,13 @@ package reverseproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +279,62 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestDialTLSContext_DialError(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// Create listener that accepts a TCP connection but closes it without TLS handshake
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			ServerName:       "{http.request.host}",
+			HandshakeTimeout: caddy.Duration(500 * time.Millisecond),
+		},
+	}
+	err = ht.Provision(caddyCtx)
+	if err != nil {
+		t.Fatalf("HTTPTransport.Provision failed: %v", err)
+	}
+
+	rt, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport failed: %v", err)
+	}
+
+	if rt.DialTLSContext == nil {
+		t.Fatalf("expected http.Transport with non-nil DialTLSContext")
+	}
+
+	reqCtx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, caddy.NewReplacer())
+	conn, dialErr := rt.DialTLSContext(reqCtx, "tcp", ln.Addr().String())
+	if conn != nil {
+		conn.Close()
+	}
+
+	if dialErr == nil {
+		t.Fatalf("expected error from DialTLSContext, got nil")
+	}
+
+	var dErr DialError
+	if !errors.As(dialErr, &dErr) {
+		t.Errorf("expected DialTLSContext error to be DialError, got: %T (%v)", dialErr, dialErr)
 	}
 }
