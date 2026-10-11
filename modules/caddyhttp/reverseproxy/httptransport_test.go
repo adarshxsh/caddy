@@ -279,3 +279,60 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPTransport_H2CProtocols(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	tests := []struct {
+		name                string
+		versions            []string
+		expectUnencryptedH2 bool
+		expectHTTP1         bool
+	}{
+		{
+			name:                "only h2c",
+			versions:            []string{"h2c"},
+			expectUnencryptedH2: true,
+			expectHTTP1:         false,
+		},
+		{
+			name:                "1.1 and h2c",
+			versions:            []string{"1.1", "h2c"},
+			expectUnencryptedH2: true,
+			expectHTTP1:         true,
+		},
+		{
+			name:                "h2c and 1.1",
+			versions:            []string{"h2c", "1.1"},
+			expectUnencryptedH2: true,
+			expectHTTP1:         true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ht := &HTTPTransport{
+				Versions: tt.versions,
+			}
+
+			rt, err := ht.NewTransport(ctx)
+			if err != nil {
+				t.Fatalf("NewTransport() error = %v", err)
+			}
+
+			if rt.Protocols == nil {
+				t.Fatalf("expected rt.Protocols to be non-nil")
+			}
+
+			if got := rt.Protocols.UnencryptedHTTP2(); got != tt.expectUnencryptedH2 {
+				t.Errorf("UnencryptedHTTP2() = %v, want %v", got, tt.expectUnencryptedH2)
+			}
+
+			if got := rt.Protocols.HTTP1(); got != tt.expectHTTP1 {
+				t.Errorf("HTTP1() = %v, want %v", got, tt.expectHTTP1)
+			}
+		})
+	}
+}
+
