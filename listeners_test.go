@@ -15,7 +15,9 @@
 package caddy
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 	"reflect"
 	"testing"
 
@@ -710,3 +712,99 @@ func TestSplitUnixSocketPermissionsBits(t *testing.T) {
 		}
 	}
 }
+
+func TestListenQUIC_0RTT(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on udp: %v", err)
+	}
+	addrStr := pc.LocalAddr().String()
+	pc.Close()
+
+	na, err := ParseNetworkAddress("udp/" + addrStr)
+	if err != nil {
+		t.Fatalf("failed to parse network address: %v", err)
+	}
+
+	trueVal := true
+	falseVal := false
+
+	keyTrue := listenerKey("quicudp_0rtt_true", addrStr)
+	keyFalse := listenerKey("quicudp_0rtt_false", addrStr)
+	keyUDP := listenerKey("udp", addrStr)
+
+	// 1. Listen with allow0rttconf = nil (defaults to true)
+	ln1, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("ListenQUIC with nil allow0rttconf failed: %v", err)
+	}
+
+	if count, _ := listenerPool.References(keyTrue); count != 1 {
+		t.Errorf("expected keyTrue ref count 1, got %d", count)
+	}
+	if count, _ := listenerPool.References(keyFalse); count != 0 {
+		t.Errorf("expected keyFalse ref count 0, got %d", count)
+	}
+
+	// 2. Listen with allow0rttconf = &true (should share keyTrue)
+	ln2, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, nil, nil, &trueVal)
+	if err != nil {
+		t.Fatalf("ListenQUIC with allow0rttconf=true failed: %v", err)
+	}
+
+	if count, _ := listenerPool.References(keyTrue); count != 2 {
+		t.Errorf("expected keyTrue ref count 2, got %d", count)
+	}
+	if count, _ := listenerPool.References(keyFalse); count != 0 {
+		t.Errorf("expected keyFalse ref count 0, got %d", count)
+	}
+
+	// 3. Listen with allow0rttconf = &false (should create keyFalse)
+	ln3, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, nil, nil, &falseVal)
+	if err != nil {
+		t.Fatalf("ListenQUIC with allow0rttconf=false failed: %v", err)
+	}
+
+	if count, _ := listenerPool.References(keyTrue); count != 2 {
+		t.Errorf("expected keyTrue ref count 2, got %d", count)
+	}
+	if count, _ := listenerPool.References(keyFalse); count != 1 {
+		t.Errorf("expected keyFalse ref count 1, got %d", count)
+	}
+
+	// Underlying UDP socket should be shared across all 3 listeners
+	if count, _ := listenerPool.References(keyUDP); count < 1 {
+		t.Errorf("expected underlying UDP socket ref count >= 1, got %d", count)
+	}
+
+	// 4. Close ln3 twice (fakeCloseQuicListener requires two closes to release pool reference)
+	_ = ln3.Close()
+	_ = ln3.Close()
+
+	if count, _ := listenerPool.References(keyFalse); count != 0 {
+		t.Errorf("expected keyFalse ref count 0 after close, got %d", count)
+	}
+	if count, _ := listenerPool.References(keyTrue); count != 2 {
+		t.Errorf("expected keyTrue ref count 2 after closing ln3, got %d", count)
+	}
+
+	// 5. Close ln1 twice
+	_ = ln1.Close()
+	_ = ln1.Close()
+
+	if count, _ := listenerPool.References(keyTrue); count != 1 {
+		t.Errorf("expected keyTrue ref count 1 after closing ln1, got %d", count)
+	}
+
+	// 6. Close ln2 twice
+	_ = ln2.Close()
+	_ = ln2.Close()
+
+	if count, _ := listenerPool.References(keyTrue); count != 0 {
+		t.Errorf("expected keyTrue ref count 0 after closing ln2, got %d", count)
+	}
+	if count, _ := listenerPool.References(keyUDP); count != 0 {
+		t.Errorf("expected underlying UDP ref count 0 after closing all listeners, got %d", count)
+	}
+}
+
