@@ -125,3 +125,96 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
 	}
 }
+
+func TestAddForwardedHeaders_MissingContextVars(t *testing.T) {
+	h := Handler{}
+
+	t.Run("no vars map in context", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/", nil)
+		req.RemoteAddr = "1.2.3.4:12345"
+		req.Header.Set("X-Forwarded-For", "spoofed.ip.address")
+
+		err := h.addForwardedHeaders(req)
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+
+		if got := req.Header.Get("X-Forwarded-For"); got != "1.2.3.4" {
+			t.Errorf("X-Forwarded-For = %q, want %q", got, "1.2.3.4")
+		}
+	})
+
+	t.Run("empty vars map in context", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/", nil)
+		req.RemoteAddr = "1.2.3.4:12345"
+		req.Header.Set("X-Forwarded-For", "spoofed.ip.address")
+
+		ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, map[string]any{})
+		req = req.WithContext(ctx)
+
+		err := h.addForwardedHeaders(req)
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+
+		if got := req.Header.Get("X-Forwarded-For"); got != "1.2.3.4" {
+			t.Errorf("X-Forwarded-For = %q, want %q", got, "1.2.3.4")
+		}
+	})
+
+	t.Run("unix socket without vars", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/", nil)
+		req.RemoteAddr = "@"
+		req.Header.Set("X-Forwarded-For", "spoofed.ip.address")
+		req.Header.Set("X-Forwarded-Proto", "https")
+		req.Header.Set("X-Forwarded-Host", "spoofed.example.com")
+
+		err := h.addForwardedHeaders(req)
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+
+		if got := req.Header.Get("X-Forwarded-For"); got != "" {
+			t.Errorf("X-Forwarded-For should be deleted, got %q", got)
+		}
+		if got := req.Header.Get("X-Forwarded-Proto"); got != "" {
+			t.Errorf("X-Forwarded-Proto should be deleted, got %q", got)
+		}
+		if got := req.Header.Get("X-Forwarded-Host"); got != "" {
+			t.Errorf("X-Forwarded-Host should be deleted, got %q", got)
+		}
+	})
+}
+
+func TestPrepareRequest_MissingContextVars(t *testing.T) {
+	h := Handler{}
+
+	t.Run("no vars map in context", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/", nil)
+		req.RemoteAddr = "1.2.3.4:12345"
+
+		preparedReq, err := h.prepareRequest(req, nil)
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		if preparedReq == nil {
+			t.Fatal("expected prepared request, got nil")
+		}
+	})
+
+	t.Run("empty vars map in context", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/", nil)
+		req.RemoteAddr = "1.2.3.4:12345"
+
+		ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, map[string]any{})
+		req = req.WithContext(ctx)
+
+		preparedReq, err := h.prepareRequest(req, nil)
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		if preparedReq == nil {
+			t.Fatal("expected prepared request, got nil")
+		}
+	})
+}
