@@ -492,6 +492,8 @@ func BenchmarkReplacer(b *testing.B) {
 	rep := testReplacer()
 	rep.Set("str", "a string")
 	rep.Set("int", 123.456)
+	rep.Set("host", "example.com")
+	rep.Set("path", "/api/v1")
 
 	for _, bm := range []testCase{
 		{
@@ -514,10 +516,115 @@ func BenchmarkReplacer(b *testing.B) {
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
+		{
+			name:  "multi string replacement",
+			input: `str={str} host={host}`,
+		},
+		{
+			name:  "multi placeholder template",
+			input: `http://{host}{path}?val={str}&num={int}`,
+		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
+			}
+		})
+	}
+}
+
+func BenchmarkReplacerParallel(b *testing.B) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+	rep.Set("host", "example.com")
+	rep.Set("path", "/api/v1")
+
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			rep.ReplaceAll("http://{host}{path}?val={str}&num={int}", "")
+		}
+	})
+}
+
+func BenchmarkNewReplacer(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		NewReplacer()
+	}
+}
+
+func BenchmarkNewEmptyReplacer(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		NewEmptyReplacer()
+	}
+}
+
+func BenchmarkWithoutFile(b *testing.B) {
+	repl := NewReplacer()
+	b.ReportAllocs()
+	for b.Loop() {
+		repl.WithoutFile()
+	}
+}
+
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+	rep.Set("host", "example.com")
+
+	tests := []struct {
+		name      string
+		fn        func()
+		maxAllocs float64
+	}{
+		{
+			name: "no placeholder string replacement",
+			fn: func() {
+				_ = rep.ReplaceAll("simple string with no placeholders", "")
+			},
+			maxAllocs: 0,
+		},
+		{
+			name: "static variable lookup",
+			fn: func() {
+				_, _ = rep.Get("str")
+			},
+			maxAllocs: 0,
+		},
+		{
+			name: "static string lookup via GetString",
+			fn: func() {
+				_, _ = rep.GetString("str")
+			},
+			maxAllocs: 0,
+		},
+		{
+			name: "single string replacement",
+			fn: func() {
+				_ = rep.ReplaceAll("hello {str}", "")
+			},
+			maxAllocs: 2,
+		},
+		{
+			name: "multi placeholder replacement",
+			fn: func() {
+				_ = rep.ReplaceAll("host={host} str={str} int={int}", "")
+			},
+			maxAllocs: 4,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.fn()
+			allocs := testing.AllocsPerRun(100, tc.fn)
+			if allocs > tc.maxAllocs {
+				t.Errorf("%s: expected <= %.1f allocations per run, got %.1f", tc.name, tc.maxAllocs, allocs)
 			}
 		})
 	}
