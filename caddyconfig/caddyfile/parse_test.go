@@ -1031,6 +1031,109 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 	}
 }
 
+func TestImportBlockSubBlockFiltering(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		input              string
+		expectedDirectives []string
+	}{
+		{
+			name: "both named sub-block and positional directives",
+			input: `
+				(common) {
+					header {
+						{blocks.header}
+					}
+					{block}
+				}
+
+				example.com {
+					import common {
+						header {
+							X-Frame-Options "DENY"
+						}
+						tls off
+					}
+				}
+			`,
+			expectedDirectives: []string{"header", "tls"},
+		},
+		{
+			name: "only named sub-block",
+			input: `
+				(common) {
+					header {
+						{blocks.header}
+					}
+					{block}
+				}
+
+				example.com {
+					import common {
+						header {
+							X-Frame-Options "DENY"
+						}
+					}
+				}
+			`,
+			expectedDirectives: []string{"header"},
+		},
+		{
+			name: "multiple sub-blocks and positional directives",
+			input: `
+				(common) {
+					header {
+						{blocks.header}
+					}
+					log {
+						{blocks.log}
+					}
+					{block}
+				}
+
+				example.com {
+					import common {
+						header {
+							X-Frame-Options "DENY"
+						}
+						log {
+							output stdout
+						}
+						encode gzip
+					}
+				}
+			`,
+			expectedDirectives: []string{"header", "log", "encode"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testParser(tc.input)
+			blocks, err := p.parseAll()
+			if err != nil {
+				t.Fatalf("parseAll: %v", err)
+			}
+
+			if len(blocks) != 1 {
+				t.Fatalf("expected exactly 1 server block, got %d", len(blocks))
+			}
+
+			if len(blocks[0].Segments) != len(tc.expectedDirectives) {
+				var actualDirs []string
+				for _, seg := range blocks[0].Segments {
+					actualDirs = append(actualDirs, seg.Directive())
+				}
+				t.Fatalf("expected directives %v, got %v", tc.expectedDirectives, actualDirs)
+			}
+
+			for i, expectedDir := range tc.expectedDirectives {
+				if actual := blocks[0].Segments[i].Directive(); actual != expectedDir {
+					t.Fatalf("segment %d: expected directive %q, got %q", i, expectedDir, actual)
+				}
+			}
+		})
+	}
+}
+
 func testParser(input string) parser {
 	return parser{Dispenser: NewTestDispenser(input)}
 }
