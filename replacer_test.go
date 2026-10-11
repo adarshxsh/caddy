@@ -15,10 +15,12 @@
 package caddy
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -529,4 +531,100 @@ func testReplacer() Replacer {
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
 	}
+}
+
+func TestReplacerZeroAllocations(t *testing.T) {
+	rep := NewEmptyReplacer()
+	rep.Set("known", "value")
+
+	testCases := []struct {
+		name      string
+		input     string
+		empty     string
+		onlyKnown bool
+	}{
+		{
+			name:  "static string with no braces",
+			input: "hello world static string",
+		},
+		{
+			name:  "json string with braces but no matching placeholder",
+			input: `{"json": "object", "key": "value"}`,
+		},
+		{
+			name:  "string with unclosed brace",
+			input: "foo{bar",
+		},
+		{
+			name:      "string with unrecognized placeholder in ReplaceKnown",
+			input:     "hello {unknown_placeholder} world",
+			onlyKnown: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Warm up
+			if tc.onlyKnown {
+				_ = rep.ReplaceKnown(tc.input, tc.empty)
+			} else {
+				_ = rep.ReplaceAll(tc.input, tc.empty)
+			}
+
+			allocs := testing.AllocsPerRun(100, func() {
+				if tc.onlyKnown {
+					_ = rep.ReplaceKnown(tc.input, tc.empty)
+				} else {
+					_ = rep.ReplaceAll(tc.input, tc.empty)
+				}
+			})
+
+			if allocs > 0 {
+				t.Errorf("Expected 0 allocs for %q, got %f", tc.input, allocs)
+			}
+		})
+	}
+}
+
+func TestReplacerLargeBufferPoolExclusion(t *testing.T) {
+	rep := NewEmptyReplacer()
+	// Create a large value exceeding 64 KB
+	largeVal := strings.Repeat("a", 70*1024)
+	rep.Set("large", largeVal)
+
+	// Evaluate replacement requiring buffer > 64 KB
+	out := rep.ReplaceAll("header {large} footer", "")
+	if len(out) < 70*1024 {
+		t.Fatalf("Expected output length > 70KB, got %d", len(out))
+	}
+
+	// Fetch from pool and verify capacity is not > 64 KB
+	item := bufPool.Get()
+	if buf, ok := item.(*bytes.Buffer); ok {
+		if buf.Cap() > 64*1024 {
+			t.Errorf("Found buffer in bufPool exceeding 64 KB limit: cap=%d", buf.Cap())
+		}
+	}
+}
+
+func TestReplacerPoolConcurrency(t *testing.T) {
+	rep := NewEmptyReplacer()
+	rep.Set("var", "testvalue")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				input := fmt.Sprintf("goroutine %d iter %d: {var} and {unknown}", id, j)
+				expected := fmt.Sprintf("goroutine %d iter %d: testvalue and {unknown}", id, j)
+				actual := rep.ReplaceKnown(input, "")
+				if actual != expected {
+					t.Errorf("Concurrency test mismatch: got %q, expected %q", actual, expected)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
 }
