@@ -2,9 +2,11 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -123,5 +125,74 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestEarlyDataHeaderHandling(t *testing.T) {
+	h := Handler{}
+	repl := caddy.NewReplacer()
+
+	tests := []struct {
+		name          string
+		tlsState      *tls.ConnectionState
+		clientHeaders map[string]string
+		wantEarlyData string
+	}{
+		{
+			name:          "plain HTTP request with client Early-Data header",
+			tlsState:      nil,
+			clientHeaders: map[string]string{"Early-Data": "1"},
+			wantEarlyData: "",
+		},
+		{
+			name:          "plain HTTP request with spoofed Early-Data header",
+			tlsState:      nil,
+			clientHeaders: map[string]string{"Early-Data": "something-else"},
+			wantEarlyData: "",
+		},
+		{
+			name:          "post-handshake TLS request with client Early-Data header",
+			tlsState:      &tls.ConnectionState{HandshakeComplete: true},
+			clientHeaders: map[string]string{"Early-Data": "1"},
+			wantEarlyData: "",
+		},
+		{
+			name:          "TLS 0-RTT early data request without client header",
+			tlsState:      &tls.ConnectionState{HandshakeComplete: false},
+			clientHeaders: nil,
+			wantEarlyData: "1",
+		},
+		{
+			name:          "TLS 0-RTT early data request with client header",
+			tlsState:      &tls.ConnectionState{HandshakeComplete: false},
+			clientHeaders: map[string]string{"Early-Data": "0"},
+			wantEarlyData: "1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com/", nil)
+			req.TLS = tt.tlsState
+			for k, v := range tt.clientHeaders {
+				req.Header.Set(k, v)
+			}
+			vars := map[string]any{
+				caddyhttp.ClientIPVarKey:     "127.0.0.1",
+				caddyhttp.TrustedProxyVarKey: false,
+			}
+			ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+			req = req.WithContext(ctx)
+
+			clonedReq, err := h.prepareRequest(req, repl)
+			if err != nil {
+				t.Fatalf("prepareRequest unexpected error: %v", err)
+			}
+
+			got := clonedReq.Header.Get("Early-Data")
+			if got != tt.wantEarlyData {
+				t.Errorf("Early-Data header = %q, want %q", got, tt.wantEarlyData)
+			}
+		})
 	}
 }
