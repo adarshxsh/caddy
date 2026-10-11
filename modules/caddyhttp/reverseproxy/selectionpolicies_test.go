@@ -484,6 +484,37 @@ func TestClientIPHashPolicy(t *testing.T) {
 		// If it is nil, it means we missed a host even though one is available
 		t.Error("Expected ip hash policy host to not be nil, but it is nil.")
 	}
+
+	// Fallback to req.RemoteAddr when ClientIPVarKey is missing or invalid
+	fallbackPool := testPool()
+	reqNoCtx, _ := http.NewRequest("GET", "/", nil)
+	reqNoCtx.RemoteAddr = "172.0.0.1:80"
+	if h = ipHash.Select(fallbackPool, reqNoCtx, nil); h != fallbackPool[0] {
+		t.Error("Expected fallback to RemoteAddr with uninitialized context to pick first host.")
+	}
+
+	reqUnsetVar, _ := http.NewRequest("GET", "/", nil)
+	reqUnsetVar = reqUnsetVar.WithContext(context.WithValue(reqUnsetVar.Context(), caddyhttp.VarsCtxKey, make(map[string]any)))
+	reqUnsetVar.RemoteAddr = "172.0.0.2:80"
+	if h = ipHash.Select(fallbackPool, reqUnsetVar, nil); h != fallbackPool[1] {
+		t.Error("Expected fallback to RemoteAddr when ClientIPVarKey is unset to pick second host.")
+	}
+
+	reqNonStringVar, _ := http.NewRequest("GET", "/", nil)
+	reqNonStringVar = reqNonStringVar.WithContext(context.WithValue(reqNonStringVar.Context(), caddyhttp.VarsCtxKey, make(map[string]any)))
+	caddyhttp.SetVar(reqNonStringVar.Context(), caddyhttp.ClientIPVarKey, 12345)
+	reqNonStringVar.RemoteAddr = "172.0.0.1:80"
+	if h = ipHash.Select(fallbackPool, reqNonStringVar, nil); h != fallbackPool[0] {
+		t.Error("Expected fallback to RemoteAddr when ClientIPVarKey is non-string to pick first host.")
+	}
+
+	reqEmptyStringVar, _ := http.NewRequest("GET", "/", nil)
+	reqEmptyStringVar = reqEmptyStringVar.WithContext(context.WithValue(reqEmptyStringVar.Context(), caddyhttp.VarsCtxKey, make(map[string]any)))
+	caddyhttp.SetVar(reqEmptyStringVar.Context(), caddyhttp.ClientIPVarKey, "")
+	reqEmptyStringVar.RemoteAddr = "172.0.0.2:80"
+	if h = ipHash.Select(fallbackPool, reqEmptyStringVar, nil); h != fallbackPool[1] {
+		t.Error("Expected fallback to RemoteAddr when ClientIPVarKey is empty string to pick second host.")
+	}
 }
 
 func TestFirstPolicy(t *testing.T) {
