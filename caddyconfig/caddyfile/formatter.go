@@ -225,9 +225,7 @@ func Format(input []byte) []byte {
 		if ch == '"' {
 			switch quotes {
 			case "":
-				if space {
-					quotes = "\""
-				}
+				quotes = "\""
 			case "`\"":
 				quotes = "`"
 			case "\"`":
