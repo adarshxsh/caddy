@@ -296,3 +296,77 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLazyRequestID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	repl := NewTestReplacer(req)
+
+	// Before evaluation, no requestID should be allocated or stored in Vars
+	if v := GetVar(req.Context(), "uuid"); v != nil {
+		t.Fatalf("expected GetVar('uuid') to be nil before evaluation, got %#v", v)
+	}
+
+	// First evaluation of {http.request.uuid}
+	id1, ok1 := repl.GetString("http.request.uuid")
+	if !ok1 || id1 == "" {
+		t.Fatalf("expected non-empty uuid string on first evaluation, got %q (ok=%t)", id1, ok1)
+	}
+
+	// After evaluation, GetVar('uuid') should be populated
+	if v := GetVar(req.Context(), "uuid"); v == nil {
+		t.Fatalf("expected GetVar('uuid') to be non-nil after evaluation")
+	}
+
+	// Second evaluation of {http.request.uuid}
+	id2, ok2 := repl.GetString("http.request.uuid")
+	if !ok2 || id2 == "" {
+		t.Fatalf("expected non-empty uuid string on second evaluation, got %q (ok=%t)", id2, ok2)
+	}
+
+	if id1 != id2 {
+		t.Fatalf("expected consistent UUID string across evaluations: first=%q, second=%q", id1, id2)
+	}
+
+	// Concurrent evaluation test
+	const numGoroutines = 20
+	ids := make([]string, numGoroutines)
+	done := make(chan struct{})
+
+	for i := 0; i < numGoroutines; i++ {
+		go func(index int) {
+			val, _ := repl.GetString("http.request.uuid")
+			ids[index] = val
+			done <- struct{}{}
+		}(i)
+	}
+
+	for i := 0; i < numGoroutines; i++ {
+		<-done
+	}
+
+	for i := 0; i < numGoroutines; i++ {
+		if ids[i] != id1 {
+			t.Errorf("goroutine %d got UUID %q, expected %q", i, ids[i], id1)
+		}
+	}
+}
+
+func TestAddHTTPVarsAllocations(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test/path", nil)
+	repl := NewTestReplacer(req)
+
+	// Ensure addHTTPVarsToReplacer has minimal allocations (1 for start_time time.Now() boxing, 1 for repl.Set map)
+	// and specifically 0 allocations for anonymous closures or requestID structs.
+	allocs := testing.AllocsPerRun(100, func() {
+		addHTTPVarsToReplacer(repl, req, nil)
+	})
+
+	if allocs > 2 {
+		t.Errorf("expected <= 2 allocs in addHTTPVarsToReplacer, got %f", allocs)
+	}
+
+	// Ensure requests without {http.request.uuid} evaluation do zero requestID allocations
+	if v := GetVar(req.Context(), "uuid"); v != nil {
+		t.Errorf("expected no requestID allocation for request, got %#v", v)
+	}
+}
