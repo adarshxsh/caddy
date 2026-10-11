@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -276,6 +278,87 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			if got := conn.RemoteAddr().String(); got != ln.Addr().String() {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
+		})
+	}
+}
+
+func TestHTTPTransport_DialTLSContext_NilTLSClientConfig(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	tests := []struct {
+		name          string
+		tls           *TLSConfig
+		proxyProtocol string
+	}{
+		{
+			name:          "empty TLS with proxy protocol v1",
+			tls:           &TLSConfig{},
+			proxyProtocol: "v1",
+		},
+		{
+			name:          "empty TLS with proxy protocol v2",
+			tls:           &TLSConfig{},
+			proxyProtocol: "v2",
+		},
+		{
+			name:          "TLS with handshake timeout and proxy protocol",
+			tls:           &TLSConfig{HandshakeTimeout: caddy.Duration(5 * time.Second)},
+			proxyProtocol: "v1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ht := &HTTPTransport{
+				TLS:           tt.tls,
+				ProxyProtocol: tt.proxyProtocol,
+			}
+
+			rt, err := ht.NewTransport(ctx)
+			if err != nil {
+				t.Fatalf("NewTransport() error = %v", err)
+			}
+
+			if rt.TLSClientConfig != nil {
+				t.Fatalf("expected TLSClientConfig to be nil for empty TLSConfig")
+			}
+			if rt.DialTLSContext == nil {
+				t.Fatalf("expected DialTLSContext to be non-nil")
+			}
+
+			dialCtx := context.WithValue(context.Background(), caddyhttp.VarsCtxKey, make(map[string]any))
+			dialCtx = context.WithValue(dialCtx, caddy.ReplacerCtxKey, caddy.NewReplacer())
+			if tt.proxyProtocol != "" {
+				caddyhttp.SetVar(dialCtx, proxyProtocolInfoVarKey, ProxyProtocolInfo{
+					AddrPort: netip.MustParseAddrPort("127.0.0.1:12345"),
+				})
+			}
+			caddyhttp.SetVar(dialCtx, tlsH1OnlyVarKey, true)
+
+			// DialTLSContext must run without panicking due to rt.TLSClientConfig being nil
+			conn, err := rt.DialTLSContext(dialCtx, "tcp", ln.Addr().String())
+			if conn != nil {
+				conn.Close()
+			}
+			// Note: HandshakeContext may fail because the mock server closes immediately,
+			// but we are asserting that no panic occurs during connection dialing and tls.Config initialization.
 		})
 	}
 }
