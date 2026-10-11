@@ -484,6 +484,25 @@ func TestClientIPHashPolicy(t *testing.T) {
 		// If it is nil, it means we missed a host even though one is available
 		t.Error("Expected ip hash policy host to not be nil, but it is nil.")
 	}
+
+	// Fall back to req.RemoteAddr when ClientIPVarKey is missing or empty
+	pool = testPool()
+	reqFallback, _ := http.NewRequest("GET", "/", nil)
+	reqFallback.RemoteAddr = "172.0.0.1:80"
+	h = ipHash.Select(pool, reqFallback, nil)
+	if h != pool[0] {
+		t.Error("Expected ip hash policy to fallback to req.RemoteAddr when context variable is missing.")
+	}
+
+	reqFallback.RemoteAddr = "172.0.0.2"
+	h = ipHash.Select(pool, reqFallback, nil)
+	if h != pool[1] {
+		t.Error("Expected ip hash policy to fallback to req.RemoteAddr without port.")
+	}
+
+	// Empty RemoteAddr and empty context variable should not panic
+	reqFallback.RemoteAddr = ""
+	_ = ipHash.Select(pool, reqFallback, nil)
 }
 
 func TestFirstPolicy(t *testing.T) {
