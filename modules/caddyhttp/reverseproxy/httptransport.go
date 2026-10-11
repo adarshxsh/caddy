@@ -539,7 +539,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 		if slices.Contains(h.Versions, "h2c") {
 			rt.Protocols = new(http.Protocols)
 			rt.Protocols.SetUnencryptedHTTP2(true)
-			rt.Protocols.SetHTTP1(false)
+			rt.Protocols.SetHTTP1(slices.Contains(h.Versions, "1.1"))
 		}
 	}
 
