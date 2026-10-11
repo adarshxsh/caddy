@@ -291,3 +291,86 @@ func TestMergeACMEIssuers(t *testing.T) {
 		t.Fatalf("expected base roots to remain unchanged, got %v", base.TrustedRootsPEMFiles)
 	}
 }
+
+func Test0RTTServerOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		input                          string
+		expectDisable0RTTReplayProtect bool
+	}{
+		{
+			name: "servers disable_0rtt_replay_protection",
+			input: `{
+				servers {
+					disable_0rtt_replay_protection
+				}
+			}
+			example.com {
+				respond "ok"
+			}`,
+			expectDisable0RTTReplayProtect: true,
+		},
+		{
+			name: "servers 0rtt disable_replay_protection",
+			input: `{
+				servers {
+					0rtt disable_replay_protection
+				}
+			}
+			example.com {
+				respond "ok"
+			}`,
+			expectDisable0RTTReplayProtect: true,
+		},
+		{
+			name: "servers 0rtt allow_unsafe",
+			input: `{
+				servers {
+					0rtt allow_unsafe
+				}
+			}
+			example.com {
+				respond "ok"
+			}`,
+			expectDisable0RTTReplayProtect: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := caddyfile.Adapter{
+				ServerType: ServerType{},
+			}
+			out, _, err := adapter.Adapt([]byte(tc.input), nil)
+			if err != nil {
+				t.Fatalf("adapting Caddyfile: %v", err)
+			}
+
+			var config struct {
+				Apps struct {
+					HTTP struct {
+						Servers map[string]struct {
+							Disable0RTTReplayProtection *bool `json:"disable_0rtt_replay_protection"`
+						} `json:"servers"`
+					} `json:"http"`
+				} `json:"apps"`
+			}
+			if err := json.Unmarshal(out, &config); err != nil {
+				t.Fatalf("unmarshaling adapted config: %v", err)
+			}
+
+			if len(config.Apps.HTTP.Servers) == 0 {
+				t.Fatalf("expected at least one server in config")
+			}
+
+			found := false
+			for _, server := range config.Apps.HTTP.Servers {
+				if server.Disable0RTTReplayProtection != nil && *server.Disable0RTTReplayProtection == tc.expectDisable0RTTReplayProtect {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected Disable0RTTReplayProtection=%v in adapted server config", tc.expectDisable0RTTReplayProtect)
+			}
+		})
+	}
+}

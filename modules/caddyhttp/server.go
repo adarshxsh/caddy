@@ -263,6 +263,10 @@ type Server struct {
 	// don't perform a retry, so disabling 0-RTT can smooth it out.
 	Allow0RTT *bool `json:"allow_0rtt,omitempty"`
 
+	// Disable0RTTReplayProtection, if set to true, disables automatic RFC 8470
+	// 0-RTT replay protection (method safety checks) in the enforcement handler.
+	Disable0RTTReplayProtection *bool `json:"disable_0rtt_replay_protection,omitempty"`
+
 	// If set, metrics observations will be enabled.
 	// This setting is EXPERIMENTAL and subject to change.
 	// DEPRECATED: Use the app-level `metrics` field.
@@ -522,6 +526,22 @@ func (s *Server) wrapPrimaryRoute(stack Handler) Handler {
 // enforcementHandler is an implicit middleware which performs
 // standard checks before executing the HTTP middleware chain.
 func (s *Server) enforcementHandler(w http.ResponseWriter, r *http.Request, next Handler) error {
+	// RFC 8470: Intercept QUIC 0-RTT early data requests before TLS handshake
+	// completion and reject unsafe, non-idempotent HTTP methods with HTTP 425 Too Early.
+	if r.TLS != nil && !r.TLS.HandshakeComplete && (s.Disable0RTTReplayProtection == nil || !*s.Disable0RTTReplayProtection) {
+		if !isSafeMethod(r.Method) {
+			if s.logger != nil {
+				if c := s.logger.Check(zapcore.DebugLevel, "unsafe 0-RTT early data request rejected"); c != nil {
+					c.Write(
+						zap.String("method", r.Method),
+						zap.String("remote_addr", r.RemoteAddr),
+					)
+				}
+			}
+			return Error(http.StatusTooEarly, fmt.Errorf("unsafe %s request received in 0-RTT early data", r.Method))
+		}
+	}
+
 	// enforce strict host matching, which ensures that the SNI
 	// value (if any), matches the Host header; essential for
 	// servers that rely on TLS ClientAuth sharing a listener
@@ -540,6 +560,17 @@ func (s *Server) enforcementHandler(w http.ResponseWriter, r *http.Request, next
 		}
 	}
 	return next.ServeHTTP(w, r)
+}
+
+// isSafeMethod returns true if the HTTP method is defined as safe according to RFC 7231 / RFC 9110
+// (i.e. GET, HEAD, OPTIONS, TRACE).
+func isSafeMethod(method string) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
 }
 
 // listenersUseAnyPortOtherThan returns true if there are any

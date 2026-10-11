@@ -60,6 +60,8 @@ type serverOptions struct {
 	// If set, overrides whether QUIC listeners allow 0-RTT (early data).
 	// If nil, the default behavior is used (currently allowed).
 	Allow0RTT *bool
+	// If set to true, disables automatic 0-RTT replay protection (method safety check).
+	Disable0RTTReplayProtection *bool
 }
 
 func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
@@ -313,15 +315,26 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
 			serverOpts.Trace = true
 
 		case "0rtt":
-			// only supports "off" for now
 			if !d.NextArg() {
 				return nil, d.ArgErr()
 			}
-			if d.Val() != "off" {
-				return nil, d.Errf("unsupported 0rtt argument '%s' (only 'off' is supported)", d.Val())
+			val := d.Val()
+			if val == "off" {
+				boolVal := false
+				serverOpts.Allow0RTT = &boolVal
+			} else if val == "disable_replay_protection" || val == "allow_unsafe" {
+				boolVal := true
+				serverOpts.Disable0RTTReplayProtection = &boolVal
+			} else {
+				return nil, d.Errf("unsupported 0rtt argument '%s'", val)
 			}
-			boolVal := false
-			serverOpts.Allow0RTT = &boolVal
+
+		case "disable_0rtt_replay_protection":
+			if d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			boolVal := true
+			serverOpts.Disable0RTTReplayProtection = &boolVal
 
 		default:
 			return nil, d.Errf("unrecognized servers option '%s'", d.Val())
@@ -388,6 +401,7 @@ func applyServerOptions(
 		server.TrustedProxiesUnix = opts.TrustedProxiesUnix
 		server.Metrics = opts.Metrics
 		server.Allow0RTT = opts.Allow0RTT
+		server.Disable0RTTReplayProtection = opts.Disable0RTTReplayProtection
 		if opts.ShouldLogCredentials {
 			if server.Logs == nil {
 				server.Logs = new(caddyhttp.ServerLogConfig)
