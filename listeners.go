@@ -432,7 +432,12 @@ func JoinNetworkAddress(network, host, port string) string {
 // NOTE: This API is EXPERIMENTAL and may be changed or removed.
 // NOTE: user should close the returned listener twice, once to stop accepting new connections, the second time to free up the packet conn.
 func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config net.ListenConfig, tlsConf *tls.Config, pcWrappers []PacketConnWrapper, allow0rttconf *bool) (http3.QUICListener, error) {
-	lnKey := listenerKey("quic"+na.Network, na.JoinHostPort(portOffset))
+	allow0rtt := true
+	if allow0rttconf != nil {
+		allow0rtt = *allow0rttconf
+	}
+
+	lnKey := listenerKey("quic"+na.Network+"_0rtt_"+strconv.FormatBool(allow0rtt), na.JoinHostPort(portOffset))
 
 	sharedEarlyListener, _, err := listenerPool.LoadOrNew(lnKey, func() (Destructor, error) {
 		lnAny, err := na.Listen(ctx, portOffset, config)
@@ -472,10 +477,6 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 		tr := &quic.Transport{
 			Conn:                h3ln,
 			VerifySourceAddress: func(addr net.Addr) bool { return !limiter.Allow() },
-		}
-		allow0rtt := true
-		if allow0rttconf != nil {
-			allow0rtt = *allow0rttconf
 		}
 		earlyLn, err := tr.ListenEarly(
 			http3.ConfigureTLSConfig(quicTlsConfig),
