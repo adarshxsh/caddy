@@ -1,6 +1,8 @@
 package fastcgi
 
 import (
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -8,6 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -354,4 +358,26 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 	for _, p := range payloads {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
 	}
+}
+
+func TestFastCGIDialErrorRetry(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	deadAddr := ln.Addr().String()
+	ln.Close()
+
+	tr := Transport{}
+	err = tr.Provision(caddy.Context{})
+	require.NoError(t, err)
+
+	req, err := http.NewRequest("POST", "http://"+deadAddr+"/index.php", nil)
+	require.NoError(t, err)
+	repl := caddy.NewReplacer()
+	req = caddyhttp.PrepareRequest(req, repl, nil, &caddyhttp.Server{})
+
+	_, err = tr.RoundTrip(req)
+	require.Error(t, err)
+
+	var dialErr reverseproxy.DialError
+	require.ErrorAs(t, err, &dialErr, "expected FastCGI dial error to be wrapped in reverseproxy.DialError")
 }

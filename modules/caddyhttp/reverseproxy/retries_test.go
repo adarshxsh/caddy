@@ -3,6 +3,7 @@ package reverseproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -783,5 +785,134 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	expectedBody := "hello world"
 	if rec.Body.String() != expectedBody {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
+	}
+}
+
+type mockTimeoutError struct{}
+
+func (e mockTimeoutError) Error() string   { return "i/o timeout" }
+func (e mockTimeoutError) Timeout() bool   { return true }
+func (e mockTimeoutError) Temporary() bool { return true }
+
+func TestDialErrorUnwrap(t *testing.T) {
+	innerErr := errors.New("connection refused")
+	dialErr := DialError{Err: innerErr}
+
+	if !errors.Is(dialErr, innerErr) {
+		t.Errorf("errors.Is failed: expected dialErr to match innerErr")
+	}
+	if unwrapped := errors.Unwrap(dialErr); unwrapped != innerErr {
+		t.Errorf("errors.Unwrap got %v, want %v", unwrapped, innerErr)
+	}
+	if unwrapped := dialErr.Unwrap(); unwrapped != innerErr {
+		t.Errorf("dialErr.Unwrap() got %v, want %v", unwrapped, innerErr)
+	}
+
+	wrapped := fmt.Errorf("transport failure: %w", dialErr)
+	var target DialError
+	if !errors.As(wrapped, &target) {
+		t.Errorf("errors.As failed: expected wrapped error to contain DialError")
+	}
+	if target.Err != innerErr {
+		t.Errorf("target.Err got %v, want %v", target.Err, innerErr)
+	}
+}
+
+func TestStatusErrorGatewayTimeout(t *testing.T) {
+	timeoutErr := mockTimeoutError{}
+	dialTimeoutErr := DialError{Err: timeoutErr}
+	fmtWrappedTimeoutErr := fmt.Errorf("dialing backend: %w", dialTimeoutErr)
+
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{
+			name:       "direct net timeout error",
+			err:        timeoutErr,
+			wantStatus: http.StatusGatewayTimeout,
+		},
+		{
+			name:       "dial error wrapping timeout",
+			err:        dialTimeoutErr,
+			wantStatus: http.StatusGatewayTimeout,
+		},
+		{
+			name:       "fmt wrapped dial timeout error",
+			err:        fmtWrappedTimeoutErr,
+			wantStatus: http.StatusGatewayTimeout,
+		},
+		{
+			name:       "generic dial error (non-timeout)",
+			err:        DialError{Err: errors.New("connection refused")},
+			wantStatus: http.StatusBadGateway,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			herr := statusError(tt.err)
+			if herr, ok := herr.(caddyhttp.HandlerError); ok {
+				if herr.StatusCode != tt.wantStatus {
+					t.Errorf("statusError() code = %d, want %d", herr.StatusCode, tt.wantStatus)
+				}
+			} else {
+				t.Fatalf("statusError() returned %T, want caddyhttp.HandlerError", herr)
+			}
+		})
+	}
+}
+
+func TestTLSHandshakeErrorRetry(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			InsecureSkipVerify: true,
+		},
+	}
+
+	rt, err := ht.NewTransport(ctx)
+	if err != nil {
+		t.Fatalf("NewTransport error: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "PUT", "https://"+ln.Addr().String(), nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+
+	_, err = rt.RoundTrip(req)
+	if err == nil {
+		t.Fatalf("expected error from TLS handshake failure")
+	}
+
+	var dialErr DialError
+	if !errors.As(err, &dialErr) {
+		t.Fatalf("expected TLS handshake error to be wrapped in DialError, got %T: %v", err, err)
+	}
+
+	lb := LoadBalancing{Retries: 1}
+	shouldRetry := lb.tryAgain(ctx, time.Now(), 0, err, req, zap.NewNop())
+	if !shouldRetry {
+		t.Errorf("tryAgain returned false for TLS handshake error on PUT request, expected true")
 	}
 }
