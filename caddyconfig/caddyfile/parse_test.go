@@ -721,6 +721,22 @@ func TestEnvironmentReplacement(t *testing.T) {
 			input:  "}{$",
 			expect: "}{$",
 		},
+		{
+			input:  "{$UNSET_ENV:{http.request.host}}",
+			expect: "{http.request.host}",
+		},
+		{
+			input:  "{$FOOBAR:{http.request.host}}",
+			expect: "foobar",
+		},
+		{
+			input:  "{$UNSET_ENV:a{b{c}d}e}",
+			expect: "a{b{c}d}e",
+		},
+		{
+			input:  "{$UNSET_ENV:{$FOOBAR:default}}",
+			expect: "{$FOOBAR:default}",
+		},
 	} {
 		actual := replaceEnvVars([]byte(test.input))
 		if !bytes.Equal(actual, []byte(test.expect)) {
