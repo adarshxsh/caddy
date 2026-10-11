@@ -580,6 +580,19 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 	return nil
 }
 
+// passiveLogger returns a logger suitable for passive health check logging.
+// It returns the passive health check logger if configured, otherwise falling
+// back to the main handler logger, or a no-op logger if uninitialized.
+func (h *Handler) passiveLogger() *zap.Logger {
+	if h != nil && h.HealthChecks != nil && h.HealthChecks.Passive != nil && h.HealthChecks.Passive.logger != nil {
+		return h.HealthChecks.Passive.logger
+	}
+	if h != nil && h.logger != nil {
+		return h.logger
+	}
+	return zap.NewNop()
+}
+
 // countFailure is used with passive health checks. It
 // remembers 1 failure for upstream for the configured
 // duration. If passive health checks are disabled or
@@ -595,10 +608,12 @@ func (h *Handler) countFailure(upstream *Upstream) {
 		return
 	}
 
+	logger := h.passiveLogger()
+
 	// count failure immediately
 	err := upstream.Host.countFail(1)
 	if err != nil {
-		if c := h.HealthChecks.Active.logger.Check(zapcore.ErrorLevel, "could not count failure"); c != nil {
+		if c := logger.Check(zapcore.ErrorLevel, "could not count failure"); c != nil {
 			c.Write(
 				zap.String("host", upstream.Dial),
 				zap.Error(err),
@@ -611,7 +626,7 @@ func (h *Handler) countFailure(upstream *Upstream) {
 	go func(host *Host, failDuration time.Duration) {
 		defer func() {
 			if err := recover(); err != nil {
-				if c := h.HealthChecks.Active.logger.Check(zapcore.ErrorLevel, "passive health check failure forgetter panicked"); c != nil {
+				if c := logger.Check(zapcore.ErrorLevel, "passive health check failure forgetter panicked"); c != nil {
 					c.Write(
 						zap.Any("error", err),
 						zap.ByteString("stack", debug.Stack()),
@@ -629,7 +644,7 @@ func (h *Handler) countFailure(upstream *Upstream) {
 		}
 		err := host.countFail(-1)
 		if err != nil {
-			if c := h.HealthChecks.Active.logger.Check(zapcore.ErrorLevel, "could not forget failure"); c != nil {
+			if c := logger.Check(zapcore.ErrorLevel, "could not forget failure"); c != nil {
 				c.Write(
 					zap.String("host", upstream.Dial),
 					zap.Error(err),

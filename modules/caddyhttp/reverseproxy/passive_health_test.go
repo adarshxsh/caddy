@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 )
 
@@ -387,5 +389,81 @@ func TestDynamicUpstreamMaxRequestsFromUnhealthyRequestCount(t *testing.T) {
 	_ = u.Host.countRequest(1)
 	if !u.Full() {
 		t.Error("upstream should be full at UnhealthyRequestCount concurrent requests")
+	}
+}
+
+// --- passive logger tests ---
+
+func TestPassiveLoggerFallback(t *testing.T) {
+	// Test case 1: nil Handler
+	var nilHandler *Handler
+	if nilHandler.passiveLogger() == nil {
+		t.Error("expected non-nil logger for nil handler")
+	}
+
+	// Test case 2: uninitialized Handler
+	hEmpty := &Handler{}
+	if hEmpty.passiveLogger() == nil {
+		t.Error("expected non-nil logger for empty handler")
+	}
+
+	// Test case 3: Handler with logger set, but passive logger nil
+	mainLogger := zap.NewNop()
+	hMainLogger := &Handler{
+		logger: mainLogger,
+		HealthChecks: &HealthChecks{
+			Passive: &PassiveHealthChecks{},
+		},
+	}
+	if hMainLogger.passiveLogger() != mainLogger {
+		t.Error("expected passiveLogger to fall back to main handler logger")
+	}
+
+	// Test case 4: Passive logger explicitly set
+	passiveLogger := zap.NewNop()
+	hPassiveLogger := &Handler{
+		logger: mainLogger,
+		HealthChecks: &HealthChecks{
+			Passive: &PassiveHealthChecks{
+				logger: passiveLogger,
+			},
+		},
+	}
+	if hPassiveLogger.passiveLogger() != passiveLogger {
+		t.Error("expected passiveLogger to return configured passive logger")
+	}
+}
+
+func TestCountFailureWithNilActiveHealthChecks(t *testing.T) {
+	resetDynamicHosts()
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// Handler with passive health checks enabled, but Active checks is nil
+	h := &Handler{
+		ctx: caddyCtx,
+		HealthChecks: &HealthChecks{
+			Active: nil,
+			Passive: &PassiveHealthChecks{
+				MaxFails:     1,
+				FailDuration: caddy.Duration(10 * time.Millisecond),
+			},
+		},
+	}
+
+	u := &Upstream{Dial: "10.4.0.1:80", Host: new(Host)}
+
+	// Failure count should increment without panicking when HealthChecks.Active is nil
+	h.countFailure(u)
+
+	if u.Host.Fails() != 1 {
+		t.Fatalf("expected fail count 1, got %d", u.Host.Fails())
+	}
+
+	// Wait for forgetter goroutine to expire the failure without panic
+	time.Sleep(30 * time.Millisecond)
+
+	if u.Host.Fails() != 0 {
+		t.Errorf("expected fail count to return to 0 after FailDuration, got %d", u.Host.Fails())
 	}
 }
