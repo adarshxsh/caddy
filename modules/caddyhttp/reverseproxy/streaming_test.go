@@ -3,6 +3,7 @@ package reverseproxy
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -80,3 +81,81 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+	mu      sync.Mutex
+}
+
+func (f *flushRecorder) Flush() {
+	f.mu.Lock()
+	f.flushes++
+	f.mu.Unlock()
+	f.ResponseRecorder.Flush()
+}
+
+func (f *flushRecorder) getFlushes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.flushes
+}
+
+func TestCopyResponseNegativeFlushInterval(t *testing.T) {
+	h := Handler{}
+	recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	pr, pw := io.Pipe()
+	go func() {
+		pw.Write([]byte("chunk1"))
+		pw.Write([]byte("chunk2"))
+		pw.Close()
+	}()
+
+	err := h.copyResponse(recorder, pr, -1, caddy.Log())
+	if err != nil {
+		t.Fatalf("copyResponse failed: %v", err)
+	}
+
+	if got := recorder.Body.String(); got != "chunk1chunk2" {
+		t.Fatalf("copied body = %q, want %q", got, "chunk1chunk2")
+	}
+
+	if flushes := recorder.getFlushes(); flushes < 2 {
+		t.Errorf("expected at least 2 flushes for negative flushInterval, got %d", flushes)
+	}
+}
+
+func TestMaxLatencyWriterNegativeInterval(t *testing.T) {
+	recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	mlw := &maxLatencyWriter{
+		dst:     recorder,
+		flush:   http.NewResponseController(recorder).Flush,
+		latency: -1,
+		logger:  caddy.Log(),
+	}
+	defer mlw.stop()
+
+	if mlw.t != nil {
+		t.Errorf("expected nil timer for negative flush interval, got %v", mlw.t)
+	}
+	if mlw.flushPending {
+		t.Errorf("expected flushPending to be false for negative flush interval")
+	}
+
+	n, err := mlw.Write([]byte("test"))
+	if err != nil {
+		t.Fatalf("unexpected Write error: %v", err)
+	}
+	if n != 4 {
+		t.Errorf("wrote %d bytes, want 4", n)
+	}
+
+	if mlw.t != nil {
+		t.Errorf("expected nil timer after Write for negative flush interval, got %v", mlw.t)
+	}
+	if flushes := recorder.getFlushes(); flushes != 1 {
+		t.Errorf("expected 1 flush on Write, got %d", flushes)
+	}
+}
+
