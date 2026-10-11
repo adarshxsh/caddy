@@ -217,6 +217,9 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		timer := time.NewTimer(time.Duration(h.StreamTimeout))
 		defer timer.Stop()
 		timeoutc = timer.C
+		spc.onActivity = func() {
+			timer.Reset(time.Duration(h.StreamTimeout))
+		}
 	}
 
 	// when a stream timeout is encountered, no error will be read from errc
@@ -381,19 +384,29 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 // The caller should call the returned delete() function when the
 // connection is done to remove it from memory.
 func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (del func()) {
+	if h.connectionsMu == nil {
+		return func() {}
+	}
 	h.connectionsMu.Lock()
-	h.connections[conn] = openConnection{conn, gracefulClose}
+	if h.connections != nil {
+		h.connections[conn] = openConnection{conn, gracefulClose}
+	}
 	h.connectionsMu.Unlock()
 	return func() {
+		if h.connectionsMu == nil {
+			return
+		}
 		h.connectionsMu.Lock()
-		delete(h.connections, conn)
-		// if there is no connection left before the connections close timer fires
-		if len(h.connections) == 0 && h.connectionsCloseTimer != nil {
-			// we release the timer that holds the reference to Handler
-			if (*h.connectionsCloseTimer).Stop() {
-				h.logger.Debug("stopped streaming connections close timer - all connections are already closed")
+		if h.connections != nil {
+			delete(h.connections, conn)
+			// if there is no connection left before the connections close timer fires
+			if len(h.connections) == 0 && h.connectionsCloseTimer != nil {
+				// we release the timer that holds the reference to Handler
+				if (*h.connectionsCloseTimer).Stop() {
+					h.logger.Debug("stopped streaming connections close timer - all connections are already closed")
+				}
+				h.connectionsCloseTimer = nil
 			}
-			h.connectionsCloseTimer = nil
 		}
 		h.connectionsMu.Unlock()
 	}
@@ -642,18 +655,57 @@ type switchProtocolCopier struct {
 	user, backend io.ReadWriteCloser
 	wg            *sync.WaitGroup
 	bufferSize    int
+	onActivity    func()
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	var src io.Reader = c.backend
+	var dst io.Writer = c.user
+	if c.onActivity != nil {
+		src = activityReader{r: c.backend, onActivity: c.onActivity}
+		dst = activityWriter{w: c.user, onActivity: c.onActivity}
+	}
+	_, err := io.CopyBuffer(dst, src, c.buffer())
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	var src io.Reader = c.user
+	var dst io.Writer = c.backend
+	if c.onActivity != nil {
+		src = activityReader{r: c.user, onActivity: c.onActivity}
+		dst = activityWriter{w: c.backend, onActivity: c.onActivity}
+	}
+	_, err := io.CopyBuffer(dst, src, c.buffer())
 	errc <- err
 	c.wg.Done()
+}
+
+type activityReader struct {
+	r          io.Reader
+	onActivity func()
+}
+
+func (ar activityReader) Read(p []byte) (int, error) {
+	n, err := ar.r.Read(p)
+	if n > 0 && ar.onActivity != nil {
+		ar.onActivity()
+	}
+	return n, err
+}
+
+type activityWriter struct {
+	w          io.Writer
+	onActivity func()
+}
+
+func (aw activityWriter) Write(p []byte) (int, error) {
+	n, err := aw.w.Write(p)
+	if n > 0 && aw.onActivity != nil {
+		aw.onActivity()
+	}
+	return n, err
 }
 
 func (c switchProtocolCopier) buffer() []byte {
