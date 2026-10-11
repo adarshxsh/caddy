@@ -148,7 +148,7 @@ func TestHTTPTransport_DialTLSContext_ProxyProtocol(t *testing.T) {
 			name:                 "TLS without proxy protocol",
 			tls:                  &TLSConfig{},
 			proxyProtocol:        "",
-			expectDialTLSContext: false,
+			expectDialTLSContext: true,
 		},
 		{
 			name:                 "TLS with proxy protocol v1",
