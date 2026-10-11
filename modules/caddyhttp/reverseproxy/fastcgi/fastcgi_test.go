@@ -1,6 +1,8 @@
 package fastcgi
 
 import (
+	"context"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -8,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -111,7 +114,7 @@ func TestSplitPos(t *testing.T) {
 			name:      "empty split path",
 			path:      "/path/to/script.php",
 			splitPath: []string{},
-			wantPos:   0,
+			wantPos:   -1,
 		},
 		{
 			name:      "multiple split paths first match",
@@ -355,3 +358,58 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
 	}
 }
+
+func TestBuildEnvEmptySplitPath(t *testing.T) {
+	tr := Transport{
+		Root:      "/var/www/html",
+		SplitPath: []string{},
+	}
+
+	req, err := http.NewRequest("GET", "http://localhost/index.php/foo/bar", nil)
+	require.NoError(t, err)
+
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, caddyhttp.OriginalRequestCtxKey, *req)
+	req = req.WithContext(ctx)
+
+	env, err := tr.buildEnv(req)
+	require.NoError(t, err)
+
+	expectedRoot, err := caddy.FastAbs("/var/www/html")
+	require.NoError(t, err)
+	expectedScriptFilename := caddyhttp.SanitizedPathJoin(expectedRoot, "/index.php/foo/bar")
+
+	assert.Equal(t, "/index.php/foo/bar", env["DOCUMENT_URI"])
+	assert.Equal(t, "/index.php/foo/bar", env["SCRIPT_NAME"])
+	assert.Equal(t, expectedScriptFilename, env["SCRIPT_FILENAME"])
+	assert.Equal(t, "", env["PATH_INFO"])
+}
+
+func TestBuildEnvWithSplitPath(t *testing.T) {
+	tr := Transport{
+		Root:      "/var/www/html",
+		SplitPath: []string{".php"},
+	}
+
+	req, err := http.NewRequest("GET", "http://localhost/index.php/foo/bar", nil)
+	require.NoError(t, err)
+
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, caddyhttp.OriginalRequestCtxKey, *req)
+	req = req.WithContext(ctx)
+
+	env, err := tr.buildEnv(req)
+	require.NoError(t, err)
+
+	expectedRoot, err := caddy.FastAbs("/var/www/html")
+	require.NoError(t, err)
+	expectedScriptFilename := caddyhttp.SanitizedPathJoin(expectedRoot, "/index.php")
+
+	assert.Equal(t, "/index.php", env["DOCUMENT_URI"])
+	assert.Equal(t, "/index.php", env["SCRIPT_NAME"])
+	assert.Equal(t, expectedScriptFilename, env["SCRIPT_FILENAME"])
+	assert.Equal(t, "/foo/bar", env["PATH_INFO"])
+}
+

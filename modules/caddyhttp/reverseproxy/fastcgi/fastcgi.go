@@ -436,7 +436,7 @@ func (t Transport) splitPos(path string) int {
 	// 	return strings.Index(path, r.SplitPath)
 	// }
 	if len(t.SplitPath) == 0 {
-		return 0
+		return -1
 	}
 
 	pathLen := len(path)
