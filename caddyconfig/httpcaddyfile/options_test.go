@@ -2,6 +2,8 @@ package httpcaddyfile
 
 import (
 	"encoding/json"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -290,4 +292,89 @@ func TestMergeACMEIssuers(t *testing.T) {
 	if len(base.TrustedRootsPEMFiles) != 1 || base.TrustedRootsPEMFiles[0] != "global.pem" {
 		t.Fatalf("expected base roots to remain unchanged, got %v", base.TrustedRootsPEMFiles)
 	}
+}
+
+func TestParseOptOrderIsolation(t *testing.T) {
+	initialOrder := slices.Clone(directiveOrder)
+
+	caddyfile1 := `{
+		order root first
+	}
+	:80 {
+		root * /var/www
+	}`
+
+	adapter := caddyfile.Adapter{
+		ServerType: ServerType{},
+	}
+
+	_, _, err := adapter.Adapt([]byte(caddyfile1), nil)
+	if err != nil {
+		t.Fatalf("unexpected error adapting caddyfile1: %v", err)
+	}
+
+	if !slices.Equal(directiveOrder, initialOrder) {
+		t.Fatalf("package-level directiveOrder was mutated!\nExpected: %v\nGot: %v", initialOrder, directiveOrder)
+	}
+
+	caddyfile2 := `:80 {
+		root * /var/www
+	}`
+
+	_, _, err = adapter.Adapt([]byte(caddyfile2), nil)
+	if err != nil {
+		t.Fatalf("unexpected error adapting caddyfile2: %v", err)
+	}
+
+	if !slices.Equal(directiveOrder, initialOrder) {
+		t.Fatalf("package-level directiveOrder was mutated after second adaptation!\nExpected: %v\nGot: %v", initialOrder, directiveOrder)
+	}
+}
+
+func TestParseOptOrderConcurrentAdapt(t *testing.T) {
+	var wg sync.WaitGroup
+	const goroutines = 20
+
+	inputs := []string{
+		`{
+			order root first
+		}
+		:80 {
+			root * /var/www/a
+		}`,
+		`{
+			order bind first
+			order root after bind
+		}
+		:80 {
+			bind 127.0.0.1
+			root * /var/www/b
+		}`,
+		`{
+			order root last
+		}
+		:80 {
+			root * /var/www/c
+		}`,
+		`:80 {
+			root * /var/www/d
+		}`,
+	}
+
+	for i := range goroutines {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			input := inputs[idx%len(inputs)]
+			adapter := caddyfile.Adapter{
+				ServerType: ServerType{},
+			}
+			_, _, err := adapter.Adapt([]byte(input), nil)
+			if err != nil {
+				t.Errorf("goroutine %d failed adapting input: %v", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
 }

@@ -347,7 +347,11 @@ func ParseSegmentAsSubroute(h Helper) (caddyhttp.MiddlewareHandler, error) {
 		return nil, err
 	}
 
-	return buildSubroute(allResults, h.groupCounter, true)
+	var customOrder []string
+	if orderOpt, ok := h.options["order"].([]string); ok {
+		customOrder = orderOpt
+	}
+	return buildSubroute(allResults, h.groupCounter, true, customOrder)
 }
 
 // parseSegmentAsConfig parses the segment such that its subdirectives
@@ -443,9 +447,13 @@ type ConfigValue struct {
 	directive string
 }
 
-func sortRoutes(routes []ConfigValue) {
+func sortRoutes(routes []ConfigValue, customOrder ...[]string) {
+	order := directiveOrder
+	if len(customOrder) > 0 && len(customOrder[0]) > 0 {
+		order = customOrder[0]
+	}
 	dirPositions := make(map[string]int)
-	for i, dir := range directiveOrder {
+	for i, dir := range order {
 		dirPositions[dir] = i
 	}
 
