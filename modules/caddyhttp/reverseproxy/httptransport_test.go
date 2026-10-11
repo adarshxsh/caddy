@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -275,6 +276,50 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			t.Cleanup(func() { conn.Close() })
 			if got := conn.RemoteAddr().String(); got != ln.Addr().String() {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_DialTimeoutValidation(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	tests := []struct {
+		name        string
+		dialTimeout caddy.Duration
+		wantErr     bool
+	}{
+		{
+			name:        "default zero duration triggers default 3s timeout",
+			dialTimeout: 0,
+			wantErr:     false,
+		},
+		{
+			name:        "positive duration succeeds",
+			dialTimeout: caddy.Duration(5 * time.Second),
+			wantErr:     false,
+		},
+		{
+			name:        "negative duration returns error",
+			dialTimeout: caddy.Duration(-1 * time.Second),
+			wantErr:     true,
+		},
+		{
+			name:        "negative sub-second duration returns error",
+			dialTimeout: caddy.Duration(-500 * time.Millisecond),
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ht := &HTTPTransport{
+				DialTimeout: tt.dialTimeout,
+			}
+			_, err := ht.NewTransport(ctx)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("NewTransport() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
