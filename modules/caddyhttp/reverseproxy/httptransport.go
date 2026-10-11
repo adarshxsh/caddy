@@ -562,6 +562,9 @@ func resolveUDPAddr(ctx context.Context, network, addr string) (*net.UDPAddr, er
 	if err != nil {
 		return nil, err
 	}
+	if len(ipAddrs) == 0 {
+		return nil, &net.DNSError{Err: "no suitable address found", Name: host}
+	}
 	addrs := addrList(ipAddrs)
 	ip := addrs.forResolve(network, addr)
 	return &net.UDPAddr{IP: ip.IP, Port: port, Zone: ip.Zone}, nil
@@ -603,6 +606,9 @@ func (addrs addrList) forResolve(network, addr string) net.IPAddr {
 // first returns the first address which satisfies strategy, or if
 // none do, then the first address of any kind.
 func (addrs addrList) first(strategy func(net.IPAddr) bool) net.IPAddr {
+	if len(addrs) == 0 {
+		return net.IPAddr{}
+	}
 	for _, addr := range addrs {
 		if strategy(addr) {
 			return addr
