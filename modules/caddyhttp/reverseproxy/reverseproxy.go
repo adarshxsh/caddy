@@ -1021,12 +1021,15 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 				return nil
 			}
 			h := rw.Header()
+			snapshot := h.Clone()
 			copyHeader(h, http.Header(header))
 			rw.WriteHeader(code)
 
 			// Clear headers coming from the backend
 			// (it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses)
+			// and restore outer middleware headers from snapshot
 			clear(h)
+			copyHeader(h, snapshot)
 
 			return nil
 		},
