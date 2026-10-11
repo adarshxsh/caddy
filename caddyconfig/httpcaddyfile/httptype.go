@@ -1600,12 +1600,11 @@ func parseMatcherDefinitions(d *caddyfile.Dispenser, matchers map[string]caddy.M
 			if err != nil {
 				return err
 			}
-			return nil
+		} else {
+			// if it wasn't quoted, then we need to rewind after calling
+			// d.NextArg() so the below properly grabs the matcher name
+			d.Prev()
 		}
-
-		// if it wasn't quoted, then we need to rewind after calling
-		// d.NextArg() so the below properly grabs the matcher name
-		d.Prev()
 	}
 
 	// in case there are multiple instances of the same matcher, concatenate
