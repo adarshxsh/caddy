@@ -334,6 +334,27 @@ EOF
 			},
 		},
 		{
+			input: []byte(`heredoc <<END
+first line wordEND
+second line ENDing
+END
+`),
+			expected: []Token{
+				{Line: 1, Text: `heredoc`},
+				{Line: 1, Text: "first line wordEND\nsecond line ENDing"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<EOF
+line with EOF_marker inside
+EOF
+`),
+			expected: []Token{
+				{Line: 1, Text: `heredoc`},
+				{Line: 1, Text: "line with EOF_marker inside"},
+			},
+		},
+		{
 			input: []byte(`escaped-heredoc \<< >>`),
 			expected: []Token{
 				{Line: 1, Text: `escaped-heredoc`},

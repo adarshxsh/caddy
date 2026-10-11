@@ -186,7 +186,7 @@ func (l *lexer) next() (bool, error) {
 			}
 
 			// check if we're done, i.e. that the last few characters are the marker
-			if len(val) >= len(heredocMarker) && heredocMarker == string(val[len(val)-len(heredocMarker):]) {
+			if isHeredocTerminator(val, heredocMarker) {
 				// set the final value
 				val, err = l.finalizeHeredoc(val, heredocMarker)
 				if err != nil {
@@ -397,4 +397,33 @@ func isNextOnNewLine(t1, t2 Token) bool {
 	// on a line earlier than the next token,
 	// then the second token is on a new line
 	return t1.Line+t1.NumLineBreaks() < t2.Line
+}
+
+// isHeredocTerminator checks if the current rune buffer val ends with marker,
+// and that the candidate closing marker is preceded by a newline (allowing optional
+// leading whitespace padding on the closing marker line).
+func isHeredocTerminator(val []rune, marker string) bool {
+	if len(val) < len(marker) {
+		return false
+	}
+	markerStart := len(val) - len(marker)
+	if string(val[markerStart:]) != marker {
+		return false
+	}
+	// Verify that all characters on the line before the candidate marker are leading whitespace
+	prefix := val[:markerStart]
+	lastNewline := -1
+	for i := len(prefix) - 1; i >= 0; i-- {
+		if prefix[i] == '\n' {
+			lastNewline = i
+			break
+		}
+	}
+	linePadding := prefix[lastNewline+1:]
+	for _, r := range linePadding {
+		if r != ' ' && r != '\t' {
+			return false
+		}
+	}
+	return true
 }
