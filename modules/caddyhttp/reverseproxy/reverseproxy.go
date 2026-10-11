@@ -1021,12 +1021,44 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 				return nil
 			}
 			h := rw.Header()
-			copyHeader(h, http.Header(header))
+
+			// Record pre-existing header values specifically for keys touched by 1xx headers
+			goth := http.Header(header)
+			type restoredHeader struct {
+				value []string
+				exist bool
+			}
+			saved := make(map[string]restoredHeader, len(goth))
+
+			for k := range goth {
+				ck := http.CanonicalHeaderKey(k)
+				if _, seen := saved[ck]; seen {
+					continue
+				}
+				if val, ok := h[ck]; ok {
+					valCopy := make([]string, len(val))
+					copy(valCopy, val)
+					saved[ck] = restoredHeader{value: valCopy, exist: true}
+				} else if val, ok := h[k]; ok {
+					valCopy := make([]string, len(val))
+					copy(valCopy, val)
+					saved[k] = restoredHeader{value: valCopy, exist: true}
+				} else {
+					saved[ck] = restoredHeader{exist: false}
+				}
+			}
+
+			copyHeader(h, goth)
 			rw.WriteHeader(code)
 
-			// Clear headers coming from the backend
-			// (it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses)
-			clear(h)
+			// Restore pre-existing headers or remove headers added specifically by 1xx response
+			for k, res := range saved {
+				if res.exist {
+					h[k] = res.value
+				} else {
+					delete(h, k)
+				}
+			}
 
 			return nil
 		},
