@@ -298,3 +298,64 @@ func TestDefaultSNIWithoutHTTPS(t *testing.T) {
 		t.Errorf("Expected default_sni 'my-sni.com' in TLS connection policies, but it was missing. Generated JSON: %s", string(result))
 	}
 }
+
+func TestQuotedExpressionMatcherWithTrailingMatchers(t *testing.T) {
+	caddyfileStr := `http://localhost {
+		@matcher "header({'X-Test': 'true'})" path /api/*
+		respond @matcher "ok"
+	}`
+
+	adapter := caddyfile.Adapter{
+		ServerType: ServerType{},
+	}
+
+	result, _, err := adapter.Adapt([]byte(caddyfileStr), nil)
+	if err != nil {
+		t.Fatalf("Failed to adapt Caddyfile: %v", err)
+	}
+
+	var config struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					Routes []struct {
+						Match  []map[string]json.RawMessage `json:"match"`
+						Handle []struct {
+							Handler string `json:"handler"`
+							Routes  []struct {
+								Match []map[string]json.RawMessage `json:"match"`
+							} `json:"routes"`
+						} `json:"handle"`
+					} `json:"routes"`
+				} `json:"servers"`
+			} `json:"http"`
+		} `json:"apps"`
+	}
+
+	if err := json.Unmarshal(result, &config); err != nil {
+		t.Fatalf("Failed to unmarshal JSON config: %v", err)
+	}
+
+	server, ok := config.Apps.HTTP.Servers["srv0"]
+	if !ok {
+		t.Fatalf("Expected server 'srv0' to be created")
+	}
+
+	if len(server.Routes) == 0 || len(server.Routes[0].Handle) == 0 || len(server.Routes[0].Handle[0].Routes) == 0 {
+		t.Fatalf("Expected subroute to be generated")
+	}
+
+	subroute := server.Routes[0].Handle[0].Routes[0]
+	if len(subroute.Match) == 0 {
+		t.Fatalf("Expected matchers in subroute, got none")
+	}
+
+	matcher := subroute.Match[0]
+	if _, ok := matcher["expression"]; !ok {
+		t.Errorf("Expected 'expression' matcher in subroute match, but it was missing. Generated JSON: %s", string(result))
+	}
+
+	if _, ok := matcher["path"]; !ok {
+		t.Errorf("Expected 'path' matcher in subroute match, but it was missing. Generated JSON: %s", string(result))
+	}
+}
