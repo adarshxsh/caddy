@@ -393,15 +393,16 @@ func ParseAddress(str string) (Address, error) {
 	// extract host and port
 	hostSplit := strings.SplitN(remaining, "/", 2)
 	if len(hostSplit) > 0 {
-		host, port, err := net.SplitHostPort(hostSplit[0])
+		masked, restore := maskPlaceholders(hostSplit[0])
+		host, port, err := net.SplitHostPort(masked)
 		if err != nil {
-			host, port, err = net.SplitHostPort(hostSplit[0] + ":")
+			host, port, err = net.SplitHostPort(masked + ":")
 			if err != nil {
-				host = hostSplit[0]
+				host = masked
 			}
 		}
-		a.Host = host
-		a.Port = port
+		a.Host = restore(host)
+		a.Port = restore(port)
 	}
 	if len(hostSplit) == 2 {
 		// all that remains is the path
@@ -409,7 +410,7 @@ func ParseAddress(str string) (Address, error) {
 	}
 
 	// make sure port is valid
-	if a.Port != "" {
+	if a.Port != "" && !strings.Contains(a.Port, "{") {
 		if portNum, err := strconv.Atoi(a.Port); err != nil {
 			return Address{}, fmt.Errorf("invalid port '%s': %v", a.Port, err)
 		} else if portNum < 0 || portNum > 65535 {
@@ -418,6 +419,69 @@ func ParseAddress(str string) (Address, error) {
 	}
 
 	return a, nil
+}
+
+// maskPlaceholders replaces non-escaped '{...}' placeholder substrings with
+// neutral placeholder tokens that contain no colons, returning the masked string
+// and a function to restore the original placeholders.
+func maskPlaceholders(s string) (string, func(string) string) {
+	if !strings.Contains(s, "{") {
+		return s, func(res string) string { return res }
+	}
+
+	var placeholders []string
+	var masked strings.Builder
+	var currentPH strings.Builder
+	var escaped, inPlaceholder bool
+
+	for _, ch := range s {
+		if ch == '\\' && !escaped {
+			escaped = true
+			if inPlaceholder {
+				currentPH.WriteRune(ch)
+			} else {
+				masked.WriteRune(ch)
+			}
+			continue
+		}
+
+		if ch == '{' && !escaped && !inPlaceholder {
+			inPlaceholder = true
+			currentPH.Reset()
+			currentPH.WriteRune(ch)
+			escaped = false
+			continue
+		}
+
+		if inPlaceholder {
+			currentPH.WriteRune(ch)
+			if ch == '}' && !escaped {
+				inPlaceholder = false
+				phStr := currentPH.String()
+				phToken := fmt.Sprintf("__CADDY_PH_%d__", len(placeholders))
+				placeholders = append(placeholders, phStr)
+				masked.WriteString(phToken)
+			}
+		} else {
+			masked.WriteRune(ch)
+		}
+
+		escaped = false
+	}
+
+	if inPlaceholder {
+		masked.WriteString(currentPH.String())
+	}
+
+	restore := func(res string) string {
+		for i, phStr := range placeholders {
+			phToken := fmt.Sprintf("__CADDY_PH_%d__", i)
+			res = strings.ReplaceAll(res, phToken, phStr)
+		}
+		return res
+	}
+
+	return masked.String(), restore
 }
 
 // String returns a human-readable form of a. It will
