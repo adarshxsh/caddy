@@ -29,6 +29,11 @@ func TestReplacer(t *testing.T) {
 	}
 
 	rep := testReplacer()
+	rep.Map(rep.fromStatic)
+	rep.Set("http.request.host", "example.com")
+	rep.Set("env.VAR_example.com", "resolved_nested_value")
+	rep.Set("inner_key", "nested_val")
+	rep.Set("nested_val", "final_val")
 
 	// ReplaceAll
 	for i, tc := range []testCase{
@@ -126,7 +131,7 @@ func TestReplacer(t *testing.T) {
 		},
 		{
 			input:  `{"json": "object"\}`,
-			expect: "",
+			expect: `{"json": "object"}`,
 		},
 		{
 			input:  `{unknown}`,
@@ -168,6 +173,22 @@ func TestReplacer(t *testing.T) {
 		{
 			input:  `\\}`,
 			expect: `\}`,
+		},
+		{
+			input:  `{env.VAR_{http.request.host}}`,
+			expect: `resolved_nested_value`,
+		},
+		{
+			input:  `prefix-{env.VAR_{http.request.host}}-suffix`,
+			expect: `prefix-resolved_nested_value-suffix`,
+		},
+		{
+			input:  `{{inner_key}}`,
+			expect: `final_val`,
+		},
+		{
+			input:  `{unknown_{http.request.host}}`,
+			expect: ``,
 		},
 	} {
 		actual := rep.ReplaceAll(tc.input, tc.empty)
