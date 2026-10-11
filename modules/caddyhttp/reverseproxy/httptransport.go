@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	weakrand "math/rand/v2"
 	"net"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -398,11 +400,16 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 		return u, nil
 	}
 
+	respHeaderTimeout := time.Duration(h.ResponseHeaderTimeout)
+	if respHeaderTimeout == 0 && h.ReadTimeout > 0 {
+		respHeaderTimeout = time.Duration(h.ReadTimeout)
+	}
+
 	rt := &http.Transport{
 		Proxy:                  proxyWrapper,
 		DialContext:            dialContext,
 		MaxConnsPerHost:        h.MaxConnsPerHost,
-		ResponseHeaderTimeout:  time.Duration(h.ResponseHeaderTimeout),
+		ResponseHeaderTimeout:  respHeaderTimeout,
 		ExpectContinueTimeout:  time.Duration(h.ExpectContinueTimeout),
 		MaxResponseHeaderBytes: h.MaxResponseHeaderSize,
 		WriteBufferSize:        h.WriteBufferSize,
@@ -642,7 +649,37 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return h.h3Transport.RoundTrip(req)
 	}
 
-	return h.Transport.RoundTrip(req)
+	readTimeout := time.Duration(h.ReadTimeout)
+	writeTimeout := time.Duration(h.WriteTimeout)
+
+	if req.Body != nil && (readTimeout > 0 || writeTimeout > 0) {
+		timeout := readTimeout
+		if timeout == 0 {
+			timeout = writeTimeout
+		}
+		req.Body = &streamTimeoutReader{
+			rc:      req.Body,
+			timeout: timeout,
+		}
+	}
+
+	res, err := h.Transport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if res != nil && res.Body != nil && (readTimeout > 0 || writeTimeout > 0) {
+		timeout := readTimeout
+		if timeout == 0 {
+			timeout = writeTimeout
+		}
+		res.Body = &streamTimeoutReader{
+			rc:      res.Body,
+			timeout: timeout,
+		}
+	}
+
+	return res, nil
 }
 
 // SetScheme ensures that the outbound request req
@@ -921,10 +958,9 @@ type KeepAlive struct {
 	IdleConnTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 }
 
-// tcpRWTimeoutConn enforces read/write timeouts for a TCP connection.
-// If it fails to set deadlines, the error is logged but does not abort
-// the read/write attempt (ignoring the error is consistent with what
-// the standard library does: https://github.com/golang/go/blob/c5da4fb7ac5cb7434b41fc9a1df3bee66c7f1a4d/src/net/http/server.go#L981-L986)
+// tcpRWTimeoutConn enforces write timeouts for a TCP connection.
+// Socket read deadlines are not set unconditionally on socket reads to prevent
+// connection pool eviction during idle intervals and to preserve multiplexed HTTP/2 streams.
 type tcpRWTimeoutConn struct {
 	*net.TCPConn
 	readTimeout, writeTimeout time.Duration
@@ -932,14 +968,7 @@ type tcpRWTimeoutConn struct {
 }
 
 func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
-	if c.readTimeout > 0 {
-		err := c.TCPConn.SetReadDeadline(time.Now().Add(c.readTimeout))
-		if err != nil {
-			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
-				ce.Write(zap.Error(err))
-			}
-		}
-	}
+	_ = c.TCPConn.SetReadDeadline(time.Time{})
 	return c.TCPConn.Read(b)
 }
 
@@ -951,8 +980,58 @@ func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
 				ce.Write(zap.Error(err))
 			}
 		}
+		defer func() {
+			_ = c.TCPConn.SetWriteDeadline(time.Time{})
+		}()
 	}
 	return c.TCPConn.Write(b)
+}
+
+type streamTimeoutReader struct {
+	rc      io.ReadCloser
+	timeout time.Duration
+}
+
+func (r *streamTimeoutReader) Read(p []byte) (int, error) {
+	if r.timeout <= 0 || r.rc == nil {
+		if r.rc == nil {
+			return 0, io.EOF
+		}
+		return r.rc.Read(p)
+	}
+
+	if conn, ok := r.rc.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = conn.SetReadDeadline(time.Now().Add(r.timeout))
+		defer func() {
+			_ = conn.SetReadDeadline(time.Time{})
+		}()
+		return r.rc.Read(p)
+	}
+
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(r.timeout, func() {
+		timedOut.Store(true)
+		_ = r.rc.Close()
+	})
+
+	n, err := r.rc.Read(p)
+	_ = timer.Stop()
+
+	if timedOut.Load() {
+		return n, os.ErrDeadlineExceeded
+	}
+	return n, err
+}
+
+func (r *streamTimeoutReader) Close() error {
+	if r.rc == nil {
+		return nil
+	}
+	return r.rc.Close()
+}
+
+func (r *streamTimeoutReader) WriteTo(w io.Writer) (int64, error) {
+	return io.CopyBuffer(w, struct{ io.Reader }{r}, make([]byte, 32*1024))
 }
 
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
