@@ -490,6 +490,28 @@ import ./conf.d/matcher_not_my_subnet.caddy
 	order appsec after crowdsec
 }`,
 		},
+		{
+			description: "unspaced quote prefixes",
+			input: `site {
+	key="value with spaces"
+	prefix"quoted { string }"
+	header="foo # bar"
+}`,
+			expect: `site {
+	key="value with spaces"
+	prefix"quoted { string }"
+	header="foo # bar"
+}`,
+		},
+		{
+			description: "unspaced quote with escaped quote inside",
+			input: `site {
+	key="val\"ue"
+}`,
+			expect: `site {
+	key="val\"ue"
+}`,
+		},
 	} {
 		// the formatter should output a trailing newline,
 		// even if the tests aren't written to expect that
@@ -502,6 +524,43 @@ import ./conf.d/matcher_not_my_subnet.caddy
 		if string(actual) != tc.expect {
 			t.Errorf("\n[TEST %d: %s]\n====== EXPECTED ======\n%s\n====== ACTUAL ======\n%s^^^^^^^^^^^^^^^^^^^^^",
 				i, tc.description, string(tc.expect), string(actual))
+		}
+	}
+}
+
+func TestFormatterASTSemantics(t *testing.T) {
+	input := []byte(`example.com {
+	key="value with spaces"
+	header="foo # bar"
+	directive=value"quoted string"
+}`)
+	formatted := Format(input)
+	origBlocks, err := Parse("Caddyfile", input)
+	if err != nil {
+		t.Fatalf("Parse original failed: %v", err)
+	}
+	fmtBlocks, err := Parse("Caddyfile", formatted)
+	if err != nil {
+		t.Fatalf("Parse formatted failed: %v", err)
+	}
+	if len(origBlocks) != len(fmtBlocks) {
+		t.Fatalf("ServerBlock count mismatch: got %d, expected %d", len(fmtBlocks), len(origBlocks))
+	}
+	for i := range origBlocks {
+		if len(origBlocks[i].Segments) != len(fmtBlocks[i].Segments) {
+			t.Fatalf("Segment count mismatch in block %d: got %d, expected %d", i, len(fmtBlocks[i].Segments), len(origBlocks[i].Segments))
+		}
+		for s := range origBlocks[i].Segments {
+			origSeg := origBlocks[i].Segments[s]
+			fmtSeg := fmtBlocks[i].Segments[s]
+			if len(origSeg) != len(fmtSeg) {
+				t.Fatalf("Token count mismatch in block %d segment %d: got %d, expected %d", i, s, len(fmtSeg), len(origSeg))
+			}
+			for k := range origSeg {
+				if origSeg[k].Text != fmtSeg[k].Text {
+					t.Errorf("Token text mismatch in block %d segment %d token %d: got %q, expected %q", i, s, k, fmtSeg[k].Text, origSeg[k].Text)
+				}
+			}
 		}
 	}
 }
