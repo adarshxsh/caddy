@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -575,4 +576,132 @@ func TestServer_DetermineTrustedProxy_MatchRightMostUntrustedFirst(t *testing.T)
 
 	assert.True(t, trusted)
 	assert.Equal(t, clientIP, "90.100.110.120")
+}
+
+func TestServer_0RTT_ReplayProtection_UnsafeMethods(t *testing.T) {
+	unsafeMethods := []string{
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodDelete,
+		http.MethodPatch,
+		"CUSTOM_UNSAFE",
+	}
+
+	for _, method := range unsafeMethods {
+		t.Run(method, func(t *testing.T) {
+			var buf bytes.Buffer
+			innerCalled := false
+			log := testLogger(buf.Write)
+			s := &Server{
+				logger:      log,
+				errorLogger: log,
+			}
+			s.primaryHandlerChain = s.wrapPrimaryRoute(HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				innerCalled = true
+				w.WriteHeader(http.StatusOK)
+				return nil
+			}))
+
+			req := httptest.NewRequest(method, "https://example.com/", nil)
+			req.TLS = &tls.ConnectionState{
+				HandshakeComplete: false,
+			}
+			rec := httptest.NewRecorder()
+
+			s.ServeHTTP(rec, req)
+
+			assert.False(t, innerCalled, "inner handler should not be called for unsafe 0-RTT request")
+			assert.Equal(t, http.StatusTooEarly, rec.Code, "status code should be 425 Too Early")
+			assert.Contains(t, buf.String(), `"level":"debug"`)
+			assert.Contains(t, buf.String(), `"msg":"unsafe 0-RTT early data request rejected"`)
+			assert.Contains(t, buf.String(), method)
+		})
+	}
+}
+
+func TestServer_0RTT_ReplayProtection_SafeMethods(t *testing.T) {
+	safeMethods := []string{
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodOptions,
+		http.MethodTrace,
+		"get",
+		"head",
+	}
+
+	for _, method := range safeMethods {
+		t.Run(method, func(t *testing.T) {
+			innerCalled := false
+			s := &Server{
+				logger:      zap.NewNop(),
+				errorLogger: zap.NewNop(),
+			}
+			s.primaryHandlerChain = s.wrapPrimaryRoute(HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				innerCalled = true
+				w.WriteHeader(http.StatusOK)
+				return nil
+			}))
+
+			req := httptest.NewRequest(method, "https://example.com/", nil)
+			req.TLS = &tls.ConnectionState{
+				HandshakeComplete: false,
+			}
+			rec := httptest.NewRecorder()
+
+			s.ServeHTTP(rec, req)
+
+			assert.True(t, innerCalled, "inner handler should be called for safe 0-RTT request")
+			assert.Equal(t, http.StatusOK, rec.Code)
+		})
+	}
+}
+
+func TestServer_0RTT_ReplayProtection_HandshakeCompleted(t *testing.T) {
+	innerCalled := false
+	s := &Server{
+		logger:      zap.NewNop(),
+		errorLogger: zap.NewNop(),
+	}
+	s.primaryHandlerChain = s.wrapPrimaryRoute(HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		innerCalled = true
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/", nil)
+	req.TLS = &tls.ConnectionState{
+		HandshakeComplete: true,
+	}
+	rec := httptest.NewRecorder()
+
+	s.ServeHTTP(rec, req)
+
+	assert.True(t, innerCalled, "inner handler should be called when handshake is complete")
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestServer_0RTT_ReplayProtection_BypassOption(t *testing.T) {
+	trueBool := true
+	innerCalled := false
+	s := &Server{
+		logger:                      zap.NewNop(),
+		errorLogger:                 zap.NewNop(),
+		Disable0RTTReplayProtection: &trueBool,
+	}
+	s.primaryHandlerChain = s.wrapPrimaryRoute(HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		innerCalled = true
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "https://example.com/", nil)
+	req.TLS = &tls.ConnectionState{
+		HandshakeComplete: false,
+	}
+	rec := httptest.NewRecorder()
+
+	s.ServeHTTP(rec, req)
+
+	assert.True(t, innerCalled, "inner handler should be called when 0-RTT replay protection is disabled")
+	assert.Equal(t, http.StatusOK, rec.Code)
 }
