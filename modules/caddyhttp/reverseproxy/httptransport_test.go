@@ -3,11 +3,13 @@ package reverseproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +279,39 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestResolveUDPAddr_EmptyIPList(t *testing.T) {
+	// 1. Verify addrList.first and addrList.forResolve handle empty slice without panicking
+	var emptyAddrs addrList
+	gotIP := emptyAddrs.first(isIPv4)
+	if len(gotIP.IP) != 0 || gotIP.Zone != "" {
+		t.Errorf("addrList.first on empty slice = %v, want zero net.IPAddr", gotIP)
+	}
+
+	gotIPForResolve := emptyAddrs.forResolve("udp", "example.com:8080")
+	if len(gotIPForResolve.IP) != 0 || gotIPForResolve.Zone != "" {
+		t.Errorf("addrList.forResolve on empty slice = %v, want zero net.IPAddr", gotIPForResolve)
+	}
+
+	// 2. Verify resolveUDPAddr returns a *net.DNSError without panicking when host resolution produces zero IP addresses
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	udpAddr, err := resolveUDPAddr(ctx, "udp", "nonexistent.example.com:8080")
+	if udpAddr != nil {
+		t.Errorf("expected nil udpAddr, got %v", udpAddr)
+	}
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) {
+		t.Fatalf("expected *net.DNSError, got %T: %v", err, err)
+	}
+	if dnsErr.Name != "nonexistent.example.com" {
+		t.Errorf("expected Name 'nonexistent.example.com', got %q", dnsErr.Name)
 	}
 }
