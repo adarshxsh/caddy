@@ -16,6 +16,7 @@ package caddy
 
 import (
 	"crypto/tls"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -210,16 +211,14 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 
 	_, cancel := sqs.addState(updatedConfig)
-	sqs.rmu.Lock()
-	sqs.activeTlsConf = updatedConfig
-	sqs.rmu.Unlock()
 
+	expectedAggregatedKeys := append(append([]tls.EncryptedClientHelloKey(nil), updatedKeys...), initialKeys...)
 	keys, err = sqs.getEncryptedClientHelloKeys(hello)
 	if err != nil {
 		t.Fatalf("getting updated ECH keys: %v", err)
 	}
-	if !reflect.DeepEqual(keys, updatedKeys) {
-		t.Fatalf("unexpected updated ECH keys: got %#v, want %#v", keys, updatedKeys)
+	if !reflect.DeepEqual(keys, expectedAggregatedKeys) {
+		t.Fatalf("unexpected aggregated ECH keys: got %#v, want %#v", keys, expectedAggregatedKeys)
 	}
 
 	cancel(nil)
@@ -230,6 +229,109 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(keys, initialKeys) {
 		t.Fatalf("unexpected restored ECH keys: got %#v, want %#v", keys, initialKeys)
+	}
+}
+
+func TestSharedQUICStateGetConfigForClient(t *testing.T) {
+	configAInner := &tls.Config{MinVersion: tls.VersionTLS12}
+	configBInner := &tls.Config{MinVersion: tls.VersionTLS13}
+	configA2Inner := &tls.Config{MaxVersion: tls.VersionTLS13}
+
+	configA := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "siteA.com" {
+				return configAInner, nil
+			}
+			return nil, errors.New("no server TLS configuration available")
+		},
+	}
+
+	configB := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "siteB.com" {
+				return configBInner, nil
+			}
+			return nil, errors.New("no server TLS configuration available")
+		},
+	}
+
+	sqs := newSharedQUICState(configA)
+
+	// Test siteA matching initial config
+	cfg, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "siteA.com"})
+	if err != nil {
+		t.Fatalf("expected success for siteA.com, got: %v", err)
+	}
+	if cfg != configAInner {
+		t.Fatalf("expected configAInner, got %v", cfg)
+	}
+
+	// Test siteB before configB is registered
+	_, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "siteB.com"})
+	if err == nil {
+		t.Fatalf("expected error for unregistered siteB.com, got nil")
+	}
+
+	// Add configB
+	_, cancelB := sqs.addState(configB)
+
+	// Test fallthrough to configA for siteA.com
+	cfg, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "siteA.com"})
+	if err != nil {
+		t.Fatalf("expected success for siteA.com with multi-config, got: %v", err)
+	}
+	if cfg != configAInner {
+		t.Fatalf("expected configAInner, got %v", cfg)
+	}
+
+	// Test matching configB for siteB.com
+	cfg, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "siteB.com"})
+	if err != nil {
+		t.Fatalf("expected success for siteB.com with multi-config, got: %v", err)
+	}
+	if cfg != configBInner {
+		t.Fatalf("expected configBInner, got %v", cfg)
+	}
+
+	// Add configA2 (LIFO order check)
+	configA2 := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "siteA.com" {
+				return configA2Inner, nil
+			}
+			return nil, errors.New("no server TLS configuration available")
+		},
+	}
+	_, cancelA2 := sqs.addState(configA2)
+
+	// LIFO check: newest configA2 should match siteA.com before configA
+	cfg, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "siteA.com"})
+	if err != nil {
+		t.Fatalf("expected success for siteA.com with configA2, got: %v", err)
+	}
+	if cfg != configA2Inner {
+		t.Fatalf("expected configA2Inner due to LIFO order, got %v", cfg)
+	}
+
+	// Cancel configA2
+	cancelA2(nil)
+
+	// Should fall back to configAInner for siteA.com
+	cfg, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "siteA.com"})
+	if err != nil {
+		t.Fatalf("expected success for siteA.com after cancelA2, got: %v", err)
+	}
+	if cfg != configAInner {
+		t.Fatalf("expected fallback to configAInner, got %v", cfg)
+	}
+
+	// Cancel configB
+	cancelB(nil)
+
+	// siteB.com should now fail
+	_, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "siteB.com"})
+	if err == nil {
+		t.Fatalf("expected error for siteB.com after cancelB, got nil")
 	}
 }
 
