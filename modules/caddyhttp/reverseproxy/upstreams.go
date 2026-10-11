@@ -154,12 +154,14 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 		return allNew(cached.upstreams), nil
 	}
 
-	if c := su.logger.Check(zapcore.DebugLevel, "refreshing SRV upstreams"); c != nil {
-		c.Write(
-			zap.String("service", service),
-			zap.String("proto", proto),
-			zap.String("name", name),
-		)
+	if su.logger != nil {
+		if c := su.logger.Check(zapcore.DebugLevel, "refreshing SRV upstreams"); c != nil {
+			c.Write(
+				zap.String("service", service),
+				zap.String("proto", proto),
+				zap.String("name", name),
+			)
+		}
 	}
 
 	_, records, err := su.resolver.LookupSRV(r.Context(), service, proto, name)
@@ -168,30 +170,36 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 		// out and an error will be returned alongside the remaining results, if any." Thus, we
 		// only return an error if no records were also returned.
 		if len(records) == 0 {
-			if su.GracePeriod > 0 {
-				if c := su.logger.Check(zapcore.ErrorLevel, "SRV lookup failed; using previously cached"); c != nil {
-					c.Write(zap.Error(err))
+			if len(cached.upstreams) > 0 && su.GracePeriod > 0 {
+				if su.logger != nil {
+					if c := su.logger.Check(zapcore.ErrorLevel, "SRV lookup failed; using previously cached"); c != nil {
+						c.Write(zap.Error(err))
+					}
 				}
-				cached.freshness = time.Now().Add(time.Duration(su.GracePeriod) - time.Duration(su.Refresh))
+				cached.validUntil = time.Now().Add(time.Duration(su.GracePeriod))
 				srvs[suAddr] = cached
 				return allNew(cached.upstreams), nil
 			}
 			return nil, err
 		}
-		if c := su.logger.Check(zapcore.WarnLevel, "SRV records filtered"); c != nil {
-			c.Write(zap.Error(err))
+		if su.logger != nil {
+			if c := su.logger.Check(zapcore.WarnLevel, "SRV records filtered"); c != nil {
+				c.Write(zap.Error(err))
+			}
 		}
 	}
 
 	upstreams := make([]Upstream, len(records))
 	for i, rec := range records {
-		if c := su.logger.Check(zapcore.DebugLevel, "discovered SRV record"); c != nil {
-			c.Write(
-				zap.String("target", rec.Target),
-				zap.Uint16("port", rec.Port),
-				zap.Uint16("priority", rec.Priority),
-				zap.Uint16("weight", rec.Weight),
-			)
+		if su.logger != nil {
+			if c := su.logger.Check(zapcore.DebugLevel, "discovered SRV record"); c != nil {
+				c.Write(
+					zap.String("target", rec.Target),
+					zap.Uint16("port", rec.Port),
+					zap.Uint16("priority", rec.Priority),
+					zap.Uint16("weight", rec.Weight),
+				)
+			}
 		}
 		addr := net.JoinHostPort(rec.Target, strconv.Itoa(int(rec.Port)))
 		if su.DialNetwork != "" {
@@ -201,7 +209,7 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	}
 
 	// before adding a new one to the cache (as opposed to replacing stale one), make room if cache is full
-	if cached.freshness.IsZero() && len(srvs) >= 100 {
+	if cached.validUntil.IsZero() && len(srvs) >= 100 {
 		for randomKey := range srvs {
 			delete(srvs, randomKey)
 			break
@@ -210,7 +218,7 @@ func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 
 	srvs[suAddr] = srvLookup{
 		srvUpstreams: su,
-		freshness:    time.Now(),
+		validUntil:   time.Now().Add(time.Duration(su.Refresh)),
 		upstreams:    upstreams,
 	}
 
@@ -249,12 +257,12 @@ func (SRVUpstreams) formattedAddr(service, proto, name string) string {
 
 type srvLookup struct {
 	srvUpstreams SRVUpstreams
-	freshness    time.Time
+	validUntil   time.Time
 	upstreams    []Upstream
 }
 
 func (sl srvLookup) isFresh() bool {
-	return time.Since(sl.freshness) < time.Duration(sl.srvUpstreams.Refresh)
+	return time.Now().Before(sl.validUntil)
 }
 
 type IPVersions struct {
