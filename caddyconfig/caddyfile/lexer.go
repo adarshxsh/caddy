@@ -140,7 +140,7 @@ func (l *lexer) next() (bool, error) {
 		if (!quoted && !btQuoted) && (!inHeredoc && !heredocEscaped) &&
 			len(val) > 1 && string(val[:2]) == "<<" {
 			// a space means it's just a regular token and not a heredoc
-			if ch == ' ' {
+			if unicode.IsSpace(ch) && ch != '\r' && ch != '\n' {
 				return makeToken(0), nil
 			}
 

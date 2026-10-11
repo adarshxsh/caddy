@@ -368,11 +368,31 @@ EOF
 			},
 		},
 		{
-			input: []byte(`not-a-heredoc << >>`),
+			input: []byte("not-a-heredoc << >>"),
 			expected: []Token{
 				{Line: 1, Text: `not-a-heredoc`},
 				{Line: 1, Text: `<<`},
 				{Line: 1, Text: `>>`},
+			},
+		},
+		{
+			input: []byte("not-a-heredoc <<\t>>"),
+			expected: []Token{
+				{Line: 1, Text: `not-a-heredoc`},
+				{Line: 1, Text: `<<`},
+				{Line: 1, Text: `>>`},
+			},
+		},
+		{
+			input: []byte("not-a-heredoc <<HERE\tSAME\tLINE\n\tcontent\n\tHERE same-line-arg\n\t"),
+			expected: []Token{
+				{Line: 1, Text: `not-a-heredoc`},
+				{Line: 1, Text: `<<HERE`},
+				{Line: 1, Text: `SAME`},
+				{Line: 1, Text: `LINE`},
+				{Line: 2, Text: `content`},
+				{Line: 3, Text: `HERE`},
+				{Line: 3, Text: `same-line-arg`},
 			},
 		},
 		{
