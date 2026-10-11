@@ -486,7 +486,7 @@ func (s *QueryHashSelection) Provision(ctx caddy.Context) error {
 }
 
 // Select returns an available host, if any.
-func (s QueryHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.ResponseWriter) *Upstream {
+func (s QueryHashSelection) Select(pool UpstreamPool, req *http.Request, rw http.ResponseWriter) *Upstream {
 	// Since the query may have multiple values for the same key,
 	// we'll join them to avoid a problem where the user can control
 	// the upstream that the request goes to by sending multiple values
@@ -496,7 +496,7 @@ func (s QueryHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.
 	// different request, because the order of the values is significant.
 	vals := strings.Join(req.URL.Query()[s.Key], ",")
 	if vals == "" {
-		return s.fallback.Select(pool, req, nil)
+		return s.fallback.Select(pool, req, rw)
 	}
 	return hostByHashing(pool, vals)
 }
@@ -567,7 +567,7 @@ func (s *HeaderHashSelection) Provision(ctx caddy.Context) error {
 }
 
 // Select returns an available host, if any.
-func (s HeaderHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.ResponseWriter) *Upstream {
+func (s HeaderHashSelection) Select(pool UpstreamPool, req *http.Request, rw http.ResponseWriter) *Upstream {
 	// The Host header should be obtained from the req.Host field
 	// since net/http removes it from the header map.
 	if s.Field == "Host" && req.Host != "" {
@@ -576,7 +576,7 @@ func (s HeaderHashSelection) Select(pool UpstreamPool, req *http.Request, _ http
 
 	val := req.Header.Get(s.Field)
 	if val == "" {
-		return s.fallback.Select(pool, req, nil)
+		return s.fallback.Select(pool, req, rw)
 	}
 	return hostByHashing(pool, val)
 }
@@ -683,7 +683,9 @@ func (s CookieHashSelection) Select(pool UpstreamPool, req *http.Request, w http
 		if s.MaxAge > 0 {
 			cookie.MaxAge = int(time.Duration(s.MaxAge).Seconds())
 		}
-		http.SetCookie(w, cookie)
+		if w != nil {
+			http.SetCookie(w, cookie)
+		}
 		return upstream
 	}
 
