@@ -1,13 +1,20 @@
 package fastcgi
 
 import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -354,4 +361,33 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 	for _, p := range payloads {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
 	}
+}
+
+func TestFastCGIDialErrorWrap(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	tr := Transport{
+		DialTimeout: caddy.Duration(100 * time.Millisecond),
+	}
+	err := tr.Provision(caddyCtx)
+	require.NoError(t, err)
+
+	req, err := http.NewRequest("GET", "http://127.0.0.1:1/index.php", nil)
+	require.NoError(t, err)
+
+	reqCtx := context.WithValue(req.Context(), caddyhttp.ServerCtxKey, &caddyhttp.Server{})
+	reqCtx = context.WithValue(reqCtx, caddy.ReplacerCtxKey, caddy.NewReplacer())
+	reqCtx = context.WithValue(reqCtx, caddyhttp.OriginalRequestCtxKey, *req)
+	req = req.WithContext(reqCtx)
+
+	_, err = tr.RoundTrip(req)
+	require.Error(t, err)
+
+	var dialErr reverseproxy.DialError
+	require.True(t, errors.As(err, &dialErr), "FastCGI dial error must be a reverseproxy.DialError")
+	require.ErrorContains(t, err, "dialing backend:")
+
+	var netErr net.Error
+	require.True(t, errors.As(err, &netErr), "FastCGI dial error must wrap underlying net.Error")
 }

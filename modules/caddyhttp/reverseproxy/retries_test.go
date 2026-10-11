@@ -3,6 +3,7 @@ package reverseproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -773,7 +775,6 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	err = goodProxy.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}))
-
 	if err != nil {
 		t.Fatalf("Expected no error from goodProxy.ServeHTTP, got: %v", err)
 	}
@@ -783,5 +784,88 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	expectedBody := "hello world"
 	if rec.Body.String() != expectedBody {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
+	}
+}
+
+func TestDialErrorUnwrap(t *testing.T) {
+	inner := errors.New("connection refused")
+	dialErr := DialError{Err: inner}
+
+	if !errors.Is(dialErr, inner) {
+		t.Errorf("errors.Is(dialErr, inner) = false, want true")
+	}
+
+	unwrapped := errors.Unwrap(dialErr)
+	if unwrapped != inner {
+		t.Errorf("errors.Unwrap(dialErr) = %v, want %v", unwrapped, inner)
+	}
+
+	wrapped := fmt.Errorf("transport dial error: %w", dialErr)
+	var extracted DialError
+	if !errors.As(wrapped, &extracted) {
+		t.Errorf("errors.As(wrapped, &extracted) = false, want true")
+	}
+}
+
+type mockTimeoutError struct{}
+
+func (e mockTimeoutError) Error() string   { return "i/o timeout" }
+func (e mockTimeoutError) Timeout() bool   { return true }
+func (e mockTimeoutError) Temporary() bool { return true }
+
+func TestStatusErrorGatewayTimeout(t *testing.T) {
+	timeoutErr := mockTimeoutError{}
+
+	// Direct timeout error
+	err1 := statusError(timeoutErr)
+	var hErr1 caddyhttp.HandlerError
+	if errors.As(err1, &hErr1) {
+		if hErr1.StatusCode != http.StatusGatewayTimeout {
+			t.Errorf("statusError(timeoutErr) code = %d, want %d", hErr1.StatusCode, http.StatusGatewayTimeout)
+		}
+	} else {
+		t.Errorf("statusError(timeoutErr) did not return caddyhttp.HandlerError")
+	}
+
+	// DialError wrapped timeout error
+	dialTimeoutErr := DialError{Err: timeoutErr}
+	err2 := statusError(dialTimeoutErr)
+	var hErr2 caddyhttp.HandlerError
+	if errors.As(err2, &hErr2) {
+		if hErr2.StatusCode != http.StatusGatewayTimeout {
+			t.Errorf("statusError(DialError{timeoutErr}) code = %d, want %d", hErr2.StatusCode, http.StatusGatewayTimeout)
+		}
+	} else {
+		t.Errorf("statusError(DialError{timeoutErr}) did not return caddyhttp.HandlerError")
+	}
+
+	// fmt.Errorf wrapped DialError timeout error
+	fmtDialTimeoutErr := fmt.Errorf("dial failed: %w", DialError{Err: timeoutErr})
+	err3 := statusError(fmtDialTimeoutErr)
+	var hErr3 caddyhttp.HandlerError
+	if errors.As(err3, &hErr3) {
+		if hErr3.StatusCode != http.StatusGatewayTimeout {
+			t.Errorf("statusError(fmt.Errorf(DialError{timeoutErr})) code = %d, want %d", hErr3.StatusCode, http.StatusGatewayTimeout)
+		}
+	} else {
+		t.Errorf("statusError(fmt.Errorf(DialError{timeoutErr})) did not return caddyhttp.HandlerError")
+	}
+}
+
+func TestTryAgainWrappedDialError(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	lb := &LoadBalancing{Retries: 3}
+	req := httptest.NewRequest("POST", "http://localhost/", nil)
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, caddy.NewReplacer())
+	req = req.WithContext(ctx)
+
+	// Wrapped DialError
+	proxyErr := fmt.Errorf("dialing upstream: %w", DialError{Err: errors.New("connection refused")})
+
+	// tryAgain should return true for POST requests when proxyErr is a wrapped DialError
+	if !lb.tryAgain(caddyCtx, time.Now(), 0, proxyErr, req, zap.NewNop()) {
+		t.Errorf("tryAgain() returned false for POST request with wrapped DialError, want true")
 	}
 }
