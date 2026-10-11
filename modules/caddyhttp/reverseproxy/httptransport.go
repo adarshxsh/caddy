@@ -182,6 +182,9 @@ var (
 // Provision sets up h.Transport with a *http.Transport
 // that is ready to use.
 func (h *HTTPTransport) Provision(ctx caddy.Context) error {
+	if h.DialTimeout < 0 {
+		return fmt.Errorf("dial_timeout cannot be less than 0: %s", h.DialTimeout)
+	}
 	if len(h.Versions) == 0 {
 		h.Versions = []string{"1.1", "2"}
 	}
@@ -221,6 +224,9 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 
 	// Set a relatively short default dial timeout.
 	// This is helpful to make load-balancer retries more speedy.
+	if h.DialTimeout < 0 {
+		return nil, fmt.Errorf("dial_timeout cannot be less than 0: %s", h.DialTimeout)
+	}
 	if h.DialTimeout == 0 {
 		h.DialTimeout = caddy.Duration(3 * time.Second)
 	}
