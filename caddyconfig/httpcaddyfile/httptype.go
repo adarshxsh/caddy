@@ -1718,32 +1718,6 @@ func mapContains[K comparable, V any](m map[K]V, keys []K) bool {
 	return false
 }
 
-// specificity returns len(s) minus any wildcards (*) and
-// placeholders ({...}). Basically, it's a length count
-// that penalizes the use of wildcards and placeholders.
-// This is useful for comparing hostnames and paths.
-// However, wildcards in paths are not a sure answer to
-// the question of specificity. For example,
-// '*.example.com' is clearly less specific than
-// 'a.example.com', but is '/a' more or less specific
-// than '/a*'?
-func specificity(s string) int {
-	l := len(s) - strings.Count(s, "*")
-	for len(s) > 0 {
-		start := strings.Index(s, "{")
-		if start < 0 {
-			return l
-		}
-		end := strings.Index(s[start:], "}") + start + 1
-		if end <= start {
-			return l
-		}
-		l -= end - start
-		s = s[end:]
-	}
-	return l
-}
-
 type counter struct {
 	n *int
 }

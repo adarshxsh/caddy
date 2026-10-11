@@ -1,7 +1,10 @@
 package httpcaddyfile
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func TestParseAddress(t *testing.T) {
@@ -249,5 +252,67 @@ func TestKeyNormalization(t *testing.T) {
 		if actual.Path != tc.expect.Path {
 			t.Errorf("Test %d: Input '%s': Expected Path='%s' but got Path='%s'", i, tc.input, tc.expect.Path, actual.Path)
 		}
+	}
+}
+
+func TestAddressSpecificity(t *testing.T) {
+	for i, tc := range []struct {
+		input  string
+		expect int
+	}{
+		{"", 0},
+		{"*", 0},
+		{"{env.HOST}", 10},
+		{"{placeholder}", 13},
+		{"example.com", 11},
+		{"*.example.com", 12},
+		{"sub.{env.HOST}.com", 18},
+	} {
+		addr, err := ParseAddress(tc.input)
+		if err != nil {
+			t.Fatalf("Test %d (%s): unexpected parse error: %v", i, tc.input, err)
+		}
+		if actual := addr.Specificity(); actual != tc.expect {
+			t.Errorf("Test %d (%s): expected specificity %d, got %d", i, tc.input, tc.expect, actual)
+		}
+	}
+
+	// Verify placeholder hostnames score higher than * wildcards
+	placeholderAddr, _ := ParseAddress("{env.HOST}")
+	wildcardAddr, _ := ParseAddress("*")
+	if placeholderAddr.Specificity() <= wildcardAddr.Specificity() {
+		t.Errorf("Expected placeholder specificity (%d) to be strictly greater than wildcard specificity (%d)",
+			placeholderAddr.Specificity(), wildcardAddr.Specificity())
+	}
+}
+
+func TestPlaceholderSiteBlockSorting(t *testing.T) {
+	input := `
+http://* {
+	respond "catch-all"
+}
+http://{env.HOST} {
+	respond "placeholder"
+}
+`
+	adapter := caddyfile.Adapter{
+		ServerType: ServerType{},
+	}
+	out, warnings, err := adapter.Adapt([]byte(input), nil)
+	if err != nil {
+		t.Fatalf("unexpected adapt error: %v (warnings: %v)", err, warnings)
+	}
+
+	outStr := string(out)
+	placeholderIdx := strings.Index(outStr, "placeholder")
+	catchAllIdx := strings.Index(outStr, "catch-all")
+
+	if placeholderIdx < 0 || catchAllIdx < 0 {
+		t.Fatalf("expected both 'placeholder' and 'catch-all' in adapted config, got: %s", outStr)
+	}
+
+	if placeholderIdx >= catchAllIdx {
+		t.Errorf("expected placeholder site block to sort ahead of catch-all wildcard block (placeholderIdx=%d, catchAllIdx=%d)",
+			placeholderIdx, catchAllIdx)
 	}
 }

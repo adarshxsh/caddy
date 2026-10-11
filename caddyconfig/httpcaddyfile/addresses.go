@@ -499,3 +499,17 @@ func lowerExceptPlaceholders(s string) string {
 	}
 	return sb.String()
 }
+
+// Specificity returns the specificity score of the address host.
+// Placeholder hostnames (e.g. {env.HOST}) receive a non-zero specificity
+// score equivalent to exact domains, scoring them above catch-all wildcards (*).
+func (a Address) Specificity() int {
+	return specificity(a.Host)
+}
+
+// specificity returns len(s) minus any wildcards (*).
+// Placeholders ({...}) are treated as specific domain tokens and retain
+// their length in the specificity score rather than being subtracted.
+func specificity(s string) int {
+	return len(s) - strings.Count(s, "*")
+}
