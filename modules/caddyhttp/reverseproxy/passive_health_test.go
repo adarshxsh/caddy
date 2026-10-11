@@ -19,6 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
 	"github.com/caddyserver/caddy/v2"
 )
 
@@ -387,5 +391,79 @@ func TestDynamicUpstreamMaxRequestsFromUnhealthyRequestCount(t *testing.T) {
 	_ = u.Host.countRequest(1)
 	if !u.Full() {
 		t.Error("upstream should be full at UnhealthyRequestCount concurrent requests")
+	}
+}
+
+// TestPassiveHealthCheckLoggingWithoutActiveChecks verifies that passive
+// health check error logging and panic recovery execute safely without panicking
+// when Active health checks are disabled (Active is nil).
+func TestPassiveHealthCheckLoggingWithoutActiveChecks(t *testing.T) {
+	resetDynamicHosts()
+	core, logs := observer.New(zapcore.ErrorLevel)
+	obsLogger := zap.New(core)
+
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	h := &Handler{
+		ctx: caddyCtx,
+		HealthChecks: &HealthChecks{
+			Passive: &PassiveHealthChecks{
+				MaxFails:     1,
+				FailDuration: caddy.Duration(10 * time.Millisecond),
+				logger:       obsLogger,
+			},
+			Active: nil, // active checks disabled
+		},
+	}
+
+	u := &Upstream{Dial: "10.4.0.1:80", Host: new(Host)}
+
+	// 1. Normal countFailure and expiration without Active health check
+	h.countFailure(u)
+	if u.Host.Fails() != 1 {
+		t.Fatalf("expected 1 fail, got %d", u.Host.Fails())
+	}
+	time.Sleep(30 * time.Millisecond)
+	if u.Host.Fails() != 0 {
+		t.Fatalf("expected 0 fails after expiry, got %d", u.Host.Fails())
+	}
+
+	// 2. Count failure error when countFail returns error
+	uError := &Upstream{Dial: "10.4.0.2:80", Host: new(Host)}
+	// Set fails to -2 so countFail(1) yields -1 < 0 -> error
+	uError.Host.fails.Store(-2)
+	h.countFailure(uError)
+	if logs.FilterMessage("could not count failure").Len() != 1 {
+		t.Errorf("expected 1 'could not count failure' log entry, got %d", logs.FilterMessage("could not count failure").Len())
+	}
+
+	// 3. Forgetter panic recovery when forgetter goroutine panics (e.g. zero-valued caddy.Context)
+	panicHandler := &Handler{
+		ctx: caddy.Context{}, // zero value caddy.Context causes panic on h.ctx.Done() inside forgetter
+		HealthChecks: &HealthChecks{
+			Passive: &PassiveHealthChecks{
+				MaxFails:     1,
+				FailDuration: caddy.Duration(10 * time.Millisecond),
+				logger:       obsLogger,
+			},
+			Active: nil,
+		},
+	}
+	uPanic := &Upstream{Dial: "10.4.0.3:80", Host: new(Host)}
+	panicHandler.countFailure(uPanic)
+	time.Sleep(30 * time.Millisecond)
+	if logs.FilterMessage("passive health check failure forgetter panicked").Len() != 1 {
+		t.Errorf("expected 1 forgetter panic log entry, got %d", logs.FilterMessage("passive health check failure forgetter panicked").Len())
+	}
+
+	// 4. Could not forget failure log when countFail(-1) returns error (e.g. fails is 0 when forgetting)
+	uForgetErr := &Upstream{Dial: "10.4.0.4:80", Host: new(Host)}
+	// count failure increases fails to 1, then we manually reset fails to 0 before timer fires
+	h.countFailure(uForgetErr)
+	uForgetErr.Host.fails.Store(0)
+	time.Sleep(30 * time.Millisecond)
+	if logs.FilterMessage("could not forget failure").Len() != 1 {
+		t.Errorf("expected 1 'could not forget failure' log entry, got %d", logs.FilterMessage("could not forget failure").Len())
 	}
 }
