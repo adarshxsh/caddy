@@ -88,6 +88,23 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 	r.providers = append(r.providers, mapFunc)
 }
 
+// MapProvider adds provider to the list of value providers.
+func (r *Replacer) MapProvider(provider any) {
+	if p, ok := provider.(replacementProvider); ok {
+		r.providers = append(r.providers, p)
+	} else if p, ok := provider.(ProviderWithReplacer); ok {
+		r.providers = append(r.providers, providerWrapper{p})
+	}
+}
+
+type providerWrapper struct {
+	ProviderWithReplacer
+}
+
+func (w providerWrapper) replace(key string) (any, bool) {
+	return w.ReplaceIn(key, nil)
+}
+
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
@@ -95,11 +112,27 @@ func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Unlock()
 }
 
+// GetStatic gets a static variable value directly from static map.
+func (r *Replacer) GetStatic(variable string) (any, bool) {
+	r.mapMutex.RLock()
+	val, ok := r.static[variable]
+	r.mapMutex.RUnlock()
+	return val, ok
+}
+
 // Get gets a value from the replacer. It returns
 // the value and whether the variable was known.
 func (r *Replacer) Get(variable string) (any, bool) {
-	for _, mapFunc := range r.providers {
-		if val, ok := mapFunc.replace(variable); ok {
+	for _, provider := range r.providers {
+		if w, ok := provider.(providerWrapper); ok {
+			if val, ok := w.ReplaceIn(variable, r); ok {
+				return val, true
+			}
+		} else if p, ok := provider.(ProviderWithReplacer); ok {
+			if val, ok := p.ReplaceIn(variable, r); ok {
+				return val, true
+			}
+		} else if val, ok := provider.replace(variable); ok {
 			return val, true
 		}
 	}
@@ -345,6 +378,10 @@ func (f ReplacerFunc) replace(key string) (any, bool) {
 // which type of provider it is.
 type replacementProvider interface {
 	replace(key string) (any, bool)
+}
+
+type ProviderWithReplacer interface {
+	ReplaceIn(key string, r *Replacer) (any, bool)
 }
 
 // fileReplacementProvider handles {file.*} replacements,
