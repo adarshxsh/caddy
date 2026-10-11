@@ -483,6 +483,60 @@ func (p *parser) doImport(nesting int) error {
 		return err
 	}
 
+	// scan imported tokens (skipping nested snippet definitions) for referenced sub-blocks
+	referencedSubBlocks := make(map[string]bool)
+	var (
+		scanMaybeSnippet   bool
+		scanMaybeSnippetId bool
+		scanIndex          int
+		scanNesting        int
+	)
+	for i, token := range importedTokens {
+		if !scanMaybeSnippet && scanNesting == 0 {
+			if i == 0 || isNextOnNewLine(importedTokens[i-1], token) {
+				scanIndex = 0
+			} else {
+				scanIndex++
+			}
+
+			if scanIndex == 0 && len(token.Text) >= 3 && strings.HasPrefix(token.Text, "(") && strings.HasSuffix(token.Text, ")") {
+				scanMaybeSnippetId = true
+			}
+		}
+
+		switch token.Text {
+		case "{":
+			scanNesting++
+			if scanIndex == 1 && scanMaybeSnippetId && scanNesting == 1 {
+				scanMaybeSnippet = true
+				scanMaybeSnippetId = false
+			}
+		case "}":
+			scanNesting--
+			if scanNesting == 0 && scanMaybeSnippet {
+				scanMaybeSnippet = false
+			}
+		}
+
+		if !scanMaybeSnippet && strings.HasPrefix(token.Text, "{blocks.") && strings.HasSuffix(token.Text, "}") {
+			blockKey := strings.TrimPrefix(strings.TrimSuffix(token.Text, "}"), "{blocks.")
+			referencedSubBlocks[blockKey] = true
+		}
+	}
+
+	// build filteredBlockTokens omitting statements belonging to referenced named sub-blocks
+	var filteredBlockTokens []Token
+	if len(blockTokens) > 0 {
+		bd := NewDispenser(blockTokens)
+		for bd.Next() {
+			key := bd.Val()
+			seg := bd.NextSegment()
+			if !referencedSubBlocks[key] {
+				filteredBlockTokens = append(filteredBlockTokens, seg...)
+			}
+		}
+	}
+
 	// copy the tokens so we don't overwrite p.definedSnippets
 	tokensCopy := make([]Token, 0, len(importedTokens))
 
@@ -531,14 +585,14 @@ func (p *parser) doImport(nesting int) error {
 				maybeSnippet = false
 			}
 		}
-		// if it is {block}, we substitute with all tokens in the block
+		// if it is {block}, we substitute with tokens in filteredBlockTokens
 		// if it is {blocks.*}, we substitute with the tokens in the mapping for the *
 		var tokensToAdd []Token
 		foundBlockDirective := false
 		switch {
 		case token.Text == "{block}":
 			foundBlockDirective = true
-			tokensToAdd = blockTokens
+			tokensToAdd = filteredBlockTokens
 		case strings.HasPrefix(token.Text, "{blocks.") && strings.HasSuffix(token.Text, "}"):
 			foundBlockDirective = true
 			// {blocks.foo.bar} will be extracted to key `foo.bar`
