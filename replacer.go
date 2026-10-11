@@ -195,7 +195,7 @@ func (r *Replacer) replace(input, empty string,
 scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
-		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
+		if i > 0 && isEscaped(input, i) && (input[i] == phClose || input[i] == phOpen) {
 			sb.WriteString(input[lastWriteCursor : i-1])
 			lastWriteCursor = i
 			continue
@@ -212,21 +212,59 @@ scan:
 			return "", fmt.Errorf("too many unclosed placeholders")
 		}
 
-		// find the end of the placeholder
-		end := strings.Index(input[i:], string(phClose)) + i
-		if end < i {
+		// find the end of the placeholder corresponding to the outermost opening brace
+		end := -1
+
+		// Fast path: check if the first closing brace after i terminates a simple placeholder
+		closeIdx := strings.IndexByte(input[i+1:], phClose)
+		if closeIdx < 0 {
 			unclosedCount++
 			continue
 		}
+		firstClose := i + 1 + closeIdx
+		sub := input[i+1 : firstClose]
 
-		// if necessary look for the first closing brace that is not escaped
-		for end > 0 && end < len(input)-1 && input[end-1] == phEscape {
-			nextEnd := strings.Index(input[end+1:], string(phClose))
-			if nextEnd < 0 {
-				unclosedCount++
-				continue scan
+		// If sub contains no opening braces '{' or escapes '\\', firstClose is the matching closing brace.
+		if !strings.ContainsRune(sub, phOpen) && !strings.ContainsRune(sub, phEscape) {
+			end = firstClose
+		} else {
+			// Depth-matching scan for nested opening braces / escaped braces
+			var braceDepth int
+			firstUnescapedClose := -1
+			firstCloseAny := -1
+
+			for j := i; j < len(input); j++ {
+				escaped := isEscaped(input, j)
+				if input[j] == phOpen {
+					if !escaped {
+						braceDepth++
+					}
+				} else if input[j] == phClose {
+					if firstCloseAny < 0 {
+						firstCloseAny = j
+					}
+					if !escaped {
+						if firstUnescapedClose < 0 {
+							firstUnescapedClose = j
+						}
+						braceDepth--
+						if braceDepth == 0 {
+							end = j
+							break
+						}
+					}
+				}
 			}
-			end += nextEnd + 1
+
+			if end < i {
+				// If braceDepth never reached 0, fall back to first unescaped close brace if available.
+				if firstUnescapedClose >= i {
+					end = firstUnescapedClose
+				} else {
+					unclosedCount++
+					continue scan
+				}
+			}
 		}
 
 		// write the substring from the last cursor to this point
@@ -234,6 +272,15 @@ scan:
 
 		// trim opening bracket
 		key := input[i+1 : end]
+
+		// recursively evaluate inner placeholders if present in key
+		if hasUnescapedRune(key, phOpen) {
+			var err error
+			key, err = r.replace(key, empty, treatUnknownAsEmpty, errOnEmpty, errOnUnknown, f)
+			if err != nil {
+				return "", err
+			}
+		}
 
 		// try to get a value for this key, handle empty values accordingly
 		val, found := r.Get(key)
@@ -328,6 +375,19 @@ func ToString(val any) string {
 	default:
 		return fmt.Sprintf("%+v", v)
 	}
+}
+
+func isEscaped(s string, idx int) bool {
+	return idx > 0 && s[idx-1] == phEscape
+}
+
+func hasUnescapedRune(s string, target byte) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == target && !isEscaped(s, i) {
+			return true
+		}
+	}
+	return false
 }
 
 // ReplacerFunc is a function that returns a replacement for the
