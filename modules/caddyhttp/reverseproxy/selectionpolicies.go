@@ -121,6 +121,7 @@ func (r *WeightedRoundRobinSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser)
 
 // Provision sets up r.
 func (r *WeightedRoundRobinSelection) Provision(ctx caddy.Context) error {
+	r.totalWeight = 0
 	for _, weight := range r.Weights {
 		r.totalWeight += weight
 	}
@@ -132,40 +133,64 @@ func (r *WeightedRoundRobinSelection) Select(pool UpstreamPool, _ *http.Request,
 	if len(pool) == 0 {
 		return nil
 	}
-	if len(r.Weights) < 2 {
-		return pool[0]
-	}
-	var index, totalWeight int
-	var weights []int
 
-	for _, w := range r.Weights {
-		if w > 0 {
-			weights = append(weights, w)
+	weights := make([]int, len(pool))
+	sumWeights := 0
+
+	for i := range pool {
+		w := 1
+		if i < len(r.Weights) {
+			w = r.Weights[i]
 		}
-	}
-	currentWeight := int(r.index.Add(1)) % r.totalWeight
-	for i, weight := range weights {
-		totalWeight += weight
-		if currentWeight < totalWeight {
-			index = i
-			break
+		if w < 0 {
+			w = 0
 		}
+		weights[i] = w
+		sumWeights += w
 	}
 
-	upstreams := make([]*Upstream, 0, len(weights))
-	for i, upstream := range pool {
-		if !upstream.Available() || r.Weights[i] == 0 {
-			continue
+	idx := int(r.index.Add(1))
+
+	if sumWeights > 0 {
+		currentWeight := idx % sumWeights
+		var targetIndex int
+		var cumWeight int
+		for i, w := range weights {
+			cumWeight += w
+			if currentWeight < cumWeight {
+				targetIndex = i
+				break
+			}
 		}
-		upstreams = append(upstreams, upstream)
-		if len(upstreams) == cap(upstreams) {
-			break
+
+		for i := range len(pool) {
+			checkIdx := (targetIndex + i) % len(pool)
+			upstream := pool[checkIdx]
+			if upstream.Available() && weights[checkIdx] > 0 {
+				return upstream
+			}
 		}
-	}
-	if len(upstreams) == 0 {
+
+		for i := range len(pool) {
+			checkIdx := (targetIndex + i) % len(pool)
+			upstream := pool[checkIdx]
+			if upstream.Available() {
+				return upstream
+			}
+		}
+
 		return nil
 	}
-	return upstreams[index%len(upstreams)]
+
+	for i := range len(pool) {
+		checkIdx := (idx + i) % len(pool)
+		upstream := pool[checkIdx]
+		if upstream.Available() {
+			return upstream
+		}
+	}
+
+	return nil
 }
 
 // RandomChoiceSelection is a policy that selects

@@ -183,6 +183,93 @@ func TestWeightedRoundRobinPolicyWithZeroWeight(t *testing.T) {
 	}
 }
 
+func TestWeightedRoundRobinPolicyZeroWeights(t *testing.T) {
+	pool := testPool()
+	wrrPolicy := &WeightedRoundRobinSelection{
+		Weights: []int{0, 0, 0},
+	}
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	h1 := wrrPolicy.Select(pool, req, nil)
+	h2 := wrrPolicy.Select(pool, req, nil)
+	h3 := wrrPolicy.Select(pool, req, nil)
+
+	if h1 == nil || h2 == nil || h3 == nil {
+		t.Fatal("Expected non-nil upstream selection when weights sum to zero")
+	}
+	if h1 == h2 && h2 == h3 {
+		t.Error("Expected unweighted round-robin rotation when weights sum to zero")
+	}
+
+	pool[1].setHealthy(false)
+	for range 5 {
+		h := wrrPolicy.Select(pool, req, nil)
+		if h == pool[1] {
+			t.Error("Expected to skip down host when weights sum to zero")
+		}
+	}
+}
+
+func TestWeightedRoundRobinPolicyPoolSizeMismatch(t *testing.T) {
+	pool := testPool()
+	wrrPolicy := &WeightedRoundRobinSelection{
+		Weights: []int{3},
+	}
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	counts := make(map[*Upstream]int)
+	for range 5 {
+		h := wrrPolicy.Select(pool, req, nil)
+		if h == nil {
+			t.Fatal("Expected non-nil upstream selection")
+		}
+		counts[h]++
+	}
+
+	if counts[pool[0]] != 3 {
+		t.Errorf("Expected pool[0] to be selected 3 times, got %d", counts[pool[0]])
+	}
+	if counts[pool[1]] != 1 {
+		t.Errorf("Expected pool[1] to be selected 1 time, got %d", counts[pool[1]])
+	}
+	if counts[pool[2]] != 1 {
+		t.Errorf("Expected pool[2] to be selected 1 time, got %d", counts[pool[2]])
+	}
+}
+
+func TestWeightedRoundRobinPolicySmallWeightListAvailability(t *testing.T) {
+	pool := testPool()
+	wrrPolicy := &WeightedRoundRobinSelection{
+		Weights: []int{5},
+	}
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	pool[0].setHealthy(false)
+
+	for range 3 {
+		h := wrrPolicy.Select(pool, req, nil)
+		if h == pool[0] {
+			t.Error("Expected to skip unhealthy pool[0] when len(Weights) < 2")
+		}
+		if h == nil {
+			t.Error("Expected an available host to be selected")
+		}
+	}
+}
+
+func TestWeightedRoundRobinPolicyUnprovisionedStruct(t *testing.T) {
+	pool := testPool()
+	wrrPolicy := &WeightedRoundRobinSelection{
+		Weights: []int{3, 2, 1},
+	}
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	h := wrrPolicy.Select(pool, req, nil)
+	if h != pool[0] {
+		t.Errorf("Expected first host pool[0], got %v", h)
+	}
+}
+
 func TestLeastConnPolicy(t *testing.T) {
 	pool := testPool()
 	lcPolicy := LeastConnSelection{}
