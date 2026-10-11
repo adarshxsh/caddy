@@ -37,6 +37,34 @@ func TestHandlerCopyResponse(t *testing.T) {
 	}
 }
 
+func TestHandlerCopyResponseNegativeFlushInterval(t *testing.T) {
+	h := Handler{}
+	testdata := []string{
+		"",
+		"hello world",
+		strings.Repeat("a", defaultBufferSize),
+	}
+
+	for _, d := range testdata {
+		dst := bytes.NewBuffer(nil)
+		recorder := httptest.NewRecorder()
+		recorder.Body = dst
+
+		src := bytes.NewBuffer([]byte(d))
+		err := h.copyResponse(recorder, src, -1, caddy.Log())
+		if err != nil {
+			t.Fatalf("copyResponse with negative flushInterval failed: %v", err)
+		}
+		out := dst.String()
+		if out != d {
+			t.Fatalf("bad read: got %q, want %q", out, d)
+		}
+		if len(d) > 0 && !recorder.Flushed {
+			t.Errorf("expected recorder to be flushed for non-empty write with negative flushInterval")
+		}
+	}
+}
+
 func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 	var wg sync.WaitGroup
 	var errc = make(chan error, 1)
