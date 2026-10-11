@@ -535,6 +535,10 @@ type UpstreamResolver struct {
 // ParseAddresses parses all the configured network addresses
 // and ensures they're ready to be used.
 func (u *UpstreamResolver) ParseAddresses() error {
+	u.netAddrs = nil
+	if len(u.Addresses) == 0 {
+		return fmt.Errorf("no resolver addresses specified")
+	}
 	for _, v := range u.Addresses {
 		addr, err := caddy.ParseNetworkAddressWithDefaults(v, "udp", 53)
 		if err != nil {
