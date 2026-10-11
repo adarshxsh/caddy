@@ -49,10 +49,11 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 		bufferSize: 7,
 	}
 
-	buf := copier.buffer()
+	buf, cleanup := copier.buffer()
 	if got := len(buf); got != 7 {
 		t.Fatalf("buffer len = %d, want 7", got)
 	}
+	cleanup()
 
 	wg.Add(1)
 	go copier.copyToBackend(errc)
@@ -67,10 +68,48 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 }
 
 func TestSwitchProtocolCopierDefaultBufferSize(t *testing.T) {
-	copier := switchProtocolCopier{}
-	buf := copier.buffer()
-	if got := len(buf); got != defaultBufferSize {
-		t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
+	for _, tc := range []struct {
+		name       string
+		bufferSize int
+	}{
+		{name: "zero default", bufferSize: 0},
+		{name: "negative default", bufferSize: -1},
+		{name: "explicit default", bufferSize: defaultBufferSize},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			copier := switchProtocolCopier{bufferSize: tc.bufferSize}
+			buf, cleanup := copier.buffer()
+			if got := len(buf); got != defaultBufferSize {
+				t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
+			}
+			if cleanup == nil {
+				t.Fatalf("expected non-nil cleanup function")
+			}
+			cleanup()
+		})
+	}
+}
+
+func TestSwitchProtocolCopierCopyFromBackend(t *testing.T) {
+	var wg sync.WaitGroup
+	errc := make(chan error, 1)
+	var dst bytes.Buffer
+
+	copier := switchProtocolCopier{
+		user:    nopReadWriteCloser{Writer: &dst},
+		backend: nopReadWriteCloser{Reader: strings.NewReader("world")},
+		wg:      &wg,
+	}
+
+	wg.Add(1)
+	go copier.copyFromBackend(errc)
+	wg.Wait()
+
+	if err := <-errc; err != nil {
+		t.Fatalf("copyFromBackend() error = %v", err)
+	}
+	if got := dst.String(); got != "world" {
+		t.Fatalf("copied data = %q, want %q", got, "world")
 	}
 }
 
@@ -80,3 +119,14 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func BenchmarkSwitchProtocolCopierBuffer(b *testing.B) {
+	copier := switchProtocolCopier{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf, cleanup := copier.buffer()
+		_ = buf
+		cleanup()
+	}
+}
