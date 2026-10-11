@@ -29,6 +29,7 @@ import (
 	"net/netip"
 	"net/textproto"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -876,6 +877,41 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 	return req, nil
 }
 
+// canonicalizeForwardedHeaders merges non-canonical X-Forwarded-* map entries
+// into canonical keys and deletes non-canonical entries from h.
+func canonicalizeForwardedHeaders(h http.Header) {
+	if h == nil {
+		return
+	}
+
+	var nonCanonicalKeys []string
+	for k := range h {
+		canonicalKey := http.CanonicalHeaderKey(k)
+		switch canonicalKey {
+		case "X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host":
+			if k != canonicalKey {
+				nonCanonicalKeys = append(nonCanonicalKeys, k)
+			}
+		}
+	}
+
+	if len(nonCanonicalKeys) == 0 {
+		return
+	}
+
+	slices.Sort(nonCanonicalKeys)
+
+	for _, k := range nonCanonicalKeys {
+		canonicalKey := http.CanonicalHeaderKey(k)
+		if vals, ok := h[canonicalKey]; ok && vals == nil {
+			delete(h, k)
+			continue
+		}
+		h[canonicalKey] = append(h[canonicalKey], h[k]...)
+		delete(h, k)
+	}
+}
+
 // addForwardedHeaders adds the de-facto standard X-Forwarded-*
 // headers to the request before it is sent upstream.
 //
@@ -886,6 +922,8 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 // the headers at all, then they will be added with the values
 // that we can glean from the request.
 func (h Handler) addForwardedHeaders(req *http.Request) error {
+	canonicalizeForwardedHeaders(req.Header)
+
 	// Check if the client is a trusted proxy
 	trusted := caddyhttp.GetVar(req.Context(), caddyhttp.TrustedProxyVarKey).(bool)
 
