@@ -298,3 +298,41 @@ func TestDefaultSNIWithoutHTTPS(t *testing.T) {
 		t.Errorf("Expected default_sni 'my-sni.com' in TLS connection policies, but it was missing. Generated JSON: %s", string(result))
 	}
 }
+
+func TestSetupNilOptions(t *testing.T) {
+	st := ServerType{}
+	input := `{
+		http_port 8080
+		email test@example.com
+	}
+	localhost {
+		respond "OK"
+	}`
+
+	sb, err := caddyfile.Parse("Caddyfile", []byte(input))
+	if err != nil {
+		t.Fatalf("Failed to parse Caddyfile: %v", err)
+	}
+
+	cfg, warnings, err := st.Setup(sb, nil)
+	if err != nil {
+		t.Fatalf("Expected no error when options is nil, got: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("Expected non-nil config when options is nil")
+	}
+	_ = warnings
+
+	// Also verify non-nil options map is mutated in-place
+	opts := make(map[string]any)
+	cfg2, _, err := st.Setup(sb, opts)
+	if err != nil {
+		t.Fatalf("Expected no error with non-nil options, got: %v", err)
+	}
+	if cfg2 == nil {
+		t.Fatal("Expected non-nil config with non-nil options")
+	}
+	if len(opts) == 0 {
+		t.Errorf("Expected options map to be populated in-place, got empty options map")
+	}
+}
