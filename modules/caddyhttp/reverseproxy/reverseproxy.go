@@ -457,6 +457,11 @@ type bodyNopCloserIfNotRead struct {
 	read int // tracks the number of bytes read, -1 when first Read returns 0, io.EOF
 }
 
+// BodyConsumed returns true if any bytes have been read from the request body.
+func (b *bodyNopCloserIfNotRead) BodyConsumed() bool {
+	return b.read > 0
+}
+
 func (b *bodyNopCloserIfNotRead) Read(p []byte) (int, error) {
 	if b.read == -1 {
 		return 0, io.EOF
@@ -1354,6 +1359,11 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 		// because its retry decision was already made in reverseProxy()
 		// when the response matchers were evaluated
 		if !isDialError && !isRetryableResponse && (!isHandlerError || !errors.Is(herr, errNoUpstream)) {
+			// unbuffered requests with consumed body bytes cannot be retried
+			if inspector, ok := req.Body.(interface{ BodyConsumed() bool }); ok && inspector.BodyConsumed() {
+				return false
+			}
+
 			if lb.RetryMatch == nil && req.Method != "GET" {
 				// by default, don't retry requests if they aren't GET
 				return false
