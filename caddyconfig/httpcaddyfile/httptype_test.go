@@ -298,3 +298,84 @@ func TestDefaultSNIWithoutHTTPS(t *testing.T) {
 		t.Errorf("Expected default_sni 'my-sni.com' in TLS connection policies, but it was missing. Generated JSON: %s", string(result))
 	}
 }
+
+func TestListenerProtocolMapRetention(t *testing.T) {
+	caddyfileStr := `example.com {
+		bind 127.0.0.1 {
+			protocols h1 h2
+		}
+		bind 127.0.0.1 {
+			protocols h3
+		}
+	}`
+
+	adapter := caddyfile.Adapter{
+		ServerType: ServerType{},
+	}
+
+	result, _, err := adapter.Adapt([]byte(caddyfileStr), nil)
+	if err != nil {
+		t.Fatalf("Failed to adapt Caddyfile: %v", err)
+	}
+
+	var config struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]*caddyhttp.Server `json:"servers"`
+			} `json:"http"`
+		} `json:"apps"`
+	}
+
+	if err := json.Unmarshal(result, &config); err != nil {
+		t.Fatalf("Failed to unmarshal JSON config: %v", err)
+	}
+
+	server, ok := config.Apps.HTTP.Servers["srv0"]
+	if !ok {
+		t.Fatalf("Expected server 'srv0' to be created")
+	}
+
+	if len(server.ListenProtocols) == 0 {
+		t.Fatalf("Expected ListenProtocols to be populated, got empty")
+	}
+
+	protocols := server.ListenProtocols[0]
+	hasH1 := false
+	hasH2 := false
+	hasH3 := false
+	for _, p := range protocols {
+		if p == "h1" {
+			hasH1 = true
+		}
+		if p == "h2" {
+			hasH2 = true
+		}
+		if p == "h3" {
+			hasH3 = true
+		}
+	}
+
+	if !hasH1 || !hasH2 || !hasH3 {
+		t.Errorf("Expected ListenProtocols to retain all registered protocols (h1, h2, h3), got: %v", protocols)
+	}
+}
+
+func TestNormalizeAddress(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"127.0.0.1:443", "127.0.0.1:443"},
+		{"tcp/127.0.0.1:443", "127.0.0.1:443"},
+		{"[::1]:80", "[::1]:80"},
+		{":80", ":80"},
+	}
+
+	for _, tc := range tests {
+		actual := normalizeAddress(tc.input)
+		if actual != tc.expected {
+			t.Errorf("normalizeAddress(%q) = %q; expected %q", tc.input, actual, tc.expected)
+		}
+	}
+}
+

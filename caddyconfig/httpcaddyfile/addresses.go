@@ -338,11 +338,12 @@ func (st *ServerType) listenersForServerBlockAddress(sblock serverBlock, addr Ad
 			if err != nil {
 				return nil, fmt.Errorf("parsing network address: %v", err)
 			}
-			if _, ok := listeners[addr.String()]; !ok {
-				listeners[networkAddr.String()] = map[string]struct{}{}
+			key := normalizeAddress(networkAddr.String())
+			if _, ok := listeners[key]; !ok {
+				listeners[key] = map[string]struct{}{}
 			}
 			for _, protocol := range lnCfgVal.protocols {
-				listeners[networkAddr.String()][protocol] = struct{}{}
+				listeners[key][protocol] = struct{}{}
 			}
 		}
 	}

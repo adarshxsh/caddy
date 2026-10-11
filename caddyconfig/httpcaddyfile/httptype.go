@@ -1781,5 +1781,14 @@ const (
 	namedRouteKey = "named_route"
 )
 
+// normalizeAddress normalizes a listener address string for listener protocol map key lookups.
+func normalizeAddress(addr string) string {
+	netAddr, err := caddy.ParseNetworkAddress(addr)
+	if err != nil {
+		return addr
+	}
+	return netAddr.String()
+}
+
 // Interface guard
 var _ caddyfile.ServerType = (*ServerType)(nil)
