@@ -279,3 +279,24 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPTransport_Provision_Resolver(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// Empty resolver should fail provisioning
+	htEmpty := &HTTPTransport{
+		Resolver: &UpstreamResolver{Addresses: []string{}},
+	}
+	if err := htEmpty.Provision(ctx); err == nil {
+		t.Errorf("HTTPTransport.Provision() expected error for empty resolver addresses, got nil")
+	}
+
+	// Valid resolver should succeed provisioning
+	htValid := &HTTPTransport{
+		Resolver: &UpstreamResolver{Addresses: []string{"1.1.1.1:53"}},
+	}
+	if err := htValid.Provision(ctx); err != nil {
+		t.Errorf("HTTPTransport.Provision() unexpected error = %v", err)
+	}
+}
