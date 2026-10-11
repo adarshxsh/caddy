@@ -2,8 +2,11 @@ package reverseproxy
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"golang.org/x/net/http/httpguts"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -123,5 +126,103 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestDelHeaderIgnoreCase(t *testing.T) {
+	h := http.Header{
+		"connection": []string{"close"},
+		"Connection": []string{"keep-alive"},
+		"Keep-Alive": []string{"timeout=5"},
+		"X-Custom":   []string{"foo"},
+	}
+
+	delHeaderIgnoreCase(h, "CONNECTION")
+
+	if len(getHeaderValuesIgnoreCase(h, "Connection")) != 0 {
+		t.Errorf("expected Connection header to be fully deleted, got: %v", h)
+	}
+	if got := h.Get("X-Custom"); got != "foo" {
+		t.Errorf("expected X-Custom to remain 'foo', got: %q", got)
+	}
+}
+
+func TestGetHeaderValuesIgnoreCase(t *testing.T) {
+	h := http.Header{
+		"connection": []string{"close"},
+		"Connection": []string{"upgrade"},
+	}
+
+	vals := getHeaderValuesIgnoreCase(h, "CONNECTION")
+	if len(vals) != 2 {
+		t.Fatalf("expected 2 values, got %d: %v", len(vals), vals)
+	}
+}
+
+func TestRemoveConnectionHeaders_CaseInsensitive(t *testing.T) {
+	h := http.Header{
+		"connection":    []string{"custom-header, keep-alive"},
+		"custom-header": []string{"value1"},
+		"Keep-Alive":    []string{"timeout=5"},
+		"X-Keep":        []string{"value2"},
+	}
+
+	removeConnectionHeaders(h)
+
+	if len(getHeaderValuesIgnoreCase(h, "custom-header")) != 0 {
+		t.Errorf("custom-header should have been deleted, still present: %v", h)
+	}
+	if len(getHeaderValuesIgnoreCase(h, "keep-alive")) != 0 {
+		t.Errorf("Keep-Alive should have been deleted, still present: %v", h)
+	}
+	if got := h.Get("X-Keep"); got != "value2" {
+		t.Errorf("X-Keep should remain, got %q", got)
+	}
+}
+
+func TestUpgradeType_CaseInsensitive(t *testing.T) {
+	h := http.Header{
+		"connection": []string{"upgrade"},
+		"upgrade":    []string{"websocket"},
+	}
+
+	got := upgradeType(h)
+	if got != "websocket" {
+		t.Errorf("expected upgradeType to be 'websocket', got %q", got)
+	}
+}
+
+func TestCopyHeader_NoForwardNonCanonicalHeaders(t *testing.T) {
+	reqHeader := http.Header{
+		"connection": []string{"close"},
+		"keep-alive": []string{"timeout=5"},
+		"te":         []string{"trailers"},
+		"x-custom":   []string{"ok"},
+	}
+
+	removeConnectionHeaders(reqHeader)
+	for _, h := range hopHeaders {
+		if h == "Te" && httpguts.HeaderValuesContainsToken(getHeaderValuesIgnoreCase(reqHeader, "Te"), "trailers") {
+			delHeaderIgnoreCase(reqHeader, "Te")
+			reqHeader.Set("Te", "trailers")
+			continue
+		}
+		delHeaderIgnoreCase(reqHeader, h)
+	}
+
+	dst := make(http.Header)
+	copyHeader(dst, reqHeader)
+
+	if got := dst.Get("Connection"); got != "" {
+		t.Errorf("Connection header forwarded: %q", got)
+	}
+	if got := dst.Get("Keep-Alive"); got != "" {
+		t.Errorf("Keep-Alive header forwarded: %q", got)
+	}
+	if got := dst.Get("Te"); got != "trailers" {
+		t.Errorf("Te header expected 'trailers', got %q", got)
+	}
+	if got := dst.Get("X-Custom"); got != "ok" {
+		t.Errorf("X-Custom header expected 'ok', got %q", got)
 	}
 }
