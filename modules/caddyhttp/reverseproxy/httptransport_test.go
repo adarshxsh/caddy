@@ -2,6 +2,7 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -277,5 +278,102 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestHTTPTransport_DialTLSContext_ReplacerFallback(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	t.Setenv("TEST_SNI_HOST", "backend.internal")
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// 1. Dial without replacer in context -> should not panic and use fallback replacer (evaluating env var)
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			ServerName: "{env.TEST_SNI_HOST}",
+		},
+	}
+
+	rt, err := ht.NewTransport(ctx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	if rt.DialTLSContext == nil {
+		t.Fatal("expected DialTLSContext to be non-nil when ServerName has placeholder")
+	}
+
+	// Should execute without panic
+	_, _ = rt.DialTLSContext(context.Background(), "tcp", ln.Addr().String())
+
+	// 2. Dial with custom replacer in context -> should use custom replacer
+	repl := caddy.NewReplacer()
+	repl.Set("custom_host", "custom.internal")
+	htCustom := &HTTPTransport{
+		TLS: &TLSConfig{
+			ServerName: "{custom_host}",
+		},
+	}
+	rtCustom, err := htCustom.NewTransport(ctx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	reqCtx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+	_, _ = rtCustom.DialTLSContext(reqCtx, "tcp", ln.Addr().String())
+}
+
+func TestHTTPTransport_H3Dial_ReplacerFallback(t *testing.T) {
+	t.Setenv("TEST_H3_HOST", "h3.internal")
+
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{env.TEST_H3_HOST}",
+		},
+	}
+
+	_, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	if ht.h3Transport == nil || ht.h3Transport.Dial == nil {
+		t.Fatal("expected h3Transport.Dial to be non-nil")
+	}
+
+	// 1. Call Dial with context lacking replacer
+	tlsCfg := &tls.Config{ServerName: ht.TLS.ServerName}
+	_, _ = ht.h3Transport.Dial(context.Background(), "127.0.0.1:12345", tlsCfg, nil)
+	if tlsCfg.ServerName != "h3.internal" {
+		t.Errorf("expected ServerName 'h3.internal', got '%s'", tlsCfg.ServerName)
+	}
+
+	// 2. Call Dial with context containing custom replacer
+	repl := caddy.NewReplacer()
+	repl.Set("h3_custom", "custom-h3.internal")
+	tlsCfgCustom := &tls.Config{ServerName: "{h3_custom}"}
+	reqCtx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+	_, _ = ht.h3Transport.Dial(reqCtx, "127.0.0.1:12345", tlsCfgCustom, nil)
+	if tlsCfgCustom.ServerName != "custom-h3.internal" {
+		t.Errorf("expected ServerName 'custom-h3.internal', got '%s'", tlsCfgCustom.ServerName)
 	}
 }
