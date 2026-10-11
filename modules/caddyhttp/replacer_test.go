@@ -296,3 +296,74 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkHTTPVarReplacement(b *testing.B) {
+	createBenchReq := func() *http.Request {
+		req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		req.Header.Set("X-Test-Header", "test-value")
+		req.AddCookie(&http.Cookie{Name: "session", Value: "xyz123"})
+		req.Host = "example.com:80"
+		req.RemoteAddr = "192.168.159.32:1234"
+		req.TLS = &tls.ConnectionState{
+			Version:           tls.VersionTLS13,
+			HandshakeComplete: true,
+			ServerName:        "example.com",
+			CipherSuite:       tls.TLS_AES_256_GCM_SHA384,
+		}
+		return req
+	}
+
+	b.Run("NewTestReplacer setup", func(b *testing.B) {
+		req := createBenchReq()
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = NewTestReplacer(req)
+		}
+	})
+
+	b.Run("header lookup", func(b *testing.B) {
+		req := createBenchReq()
+		repl := NewTestReplacer(req)
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.header.X-Test-Header")
+		}
+	})
+
+	b.Run("query parsing", func(b *testing.B) {
+		req := createBenchReq()
+		repl := NewTestReplacer(req)
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.uri.query.a")
+		}
+	})
+
+	b.Run("cookie resolution", func(b *testing.B) {
+		req := createBenchReq()
+		repl := NewTestReplacer(req)
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.cookie.session")
+		}
+	})
+
+	b.Run("TLS variable evaluation", func(b *testing.B) {
+		req := createBenchReq()
+		repl := NewTestReplacer(req)
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.tls.cipher_suite")
+		}
+	})
+
+	b.Run("full replacement", func(b *testing.B) {
+		req := createBenchReq()
+		repl := NewTestReplacer(req)
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = repl.ReplaceAll("{http.request.method} {http.request.uri.path} header={http.request.header.X-Test-Header}", "")
+		}
+	})
+}
