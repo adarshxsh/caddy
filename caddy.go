@@ -867,6 +867,11 @@ var (
 // valid units are `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`, and `d`.
 type Duration time.Duration
 
+// String returns the string representation of the duration.
+func (d Duration) String() string {
+	return time.Duration(d).String()
+}
+
 // UnmarshalJSON satisfies json.Unmarshaler.
 func (d *Duration) UnmarshalJSON(b []byte) error {
 	if len(b) == 0 {

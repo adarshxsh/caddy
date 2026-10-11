@@ -7,7 +7,9 @@ import (
 	"net"
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -275,6 +277,66 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			t.Cleanup(func() { conn.Close() })
 			if got := conn.RemoteAddr().String(); got != ln.Addr().String() {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_DialTimeout_Validation(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	tests := []struct {
+		name        string
+		dialTimeout caddy.Duration
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:        "negative dial timeout returns error",
+			dialTimeout: caddy.Duration(-1 * time.Second),
+			wantErr:     true,
+			errContains: "dial_timeout cannot be less than 0: -1s",
+		},
+		{
+			name:        "negative fractional dial timeout returns error",
+			dialTimeout: caddy.Duration(-500 * time.Millisecond),
+			wantErr:     true,
+			errContains: "dial_timeout cannot be less than 0: -500ms",
+		},
+		{
+			name:        "zero dial timeout defaults to 3s",
+			dialTimeout: 0,
+			wantErr:     false,
+		},
+		{
+			name:        "positive dial timeout succeeds",
+			dialTimeout: caddy.Duration(5 * time.Second),
+			wantErr:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ht := &HTTPTransport{
+				DialTimeout: tt.dialTimeout,
+			}
+
+			err := ht.Provision(ctx)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errContains)
+				}
+				if !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("error = %q, want error containing %q", err.Error(), tt.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error during Provision: %v", err)
+				}
+				if tt.dialTimeout == 0 && ht.DialTimeout != caddy.Duration(3*time.Second) {
+					t.Errorf("DialTimeout = %v, want default 3s", ht.DialTimeout)
+				}
 			}
 		})
 	}
