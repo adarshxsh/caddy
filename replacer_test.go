@@ -239,7 +239,6 @@ func TestReplacerSet(t *testing.T) {
 
 func TestReplacerReplaceKnown(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		providers: []replacementProvider{
 			// split our possible vars to two functions (to test if both functions are called)
 			ReplacerFunc(func(key string) (val any, ok bool) {
@@ -312,7 +311,6 @@ func TestReplacerReplaceKnown(t *testing.T) {
 
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		static: map[string]any{
 			"key1": "val1",
 			"key2": "val2",
@@ -523,10 +521,98 @@ func BenchmarkReplacer(b *testing.B) {
 	}
 }
 
-func testReplacer() Replacer {
-	return Replacer{
-		providers: make([]replacementProvider, 0),
-		static:    make(map[string]any),
-		mapMutex:  &sync.RWMutex{},
+func testReplacer() *Replacer {
+	return &Replacer{}
+}
+
+func TestReplacerAllocations(t *testing.T) {
+	allocsNew := testing.AllocsPerRun(1000, func() {
+		_ = NewReplacer()
+	})
+	if allocsNew > 1 {
+		t.Errorf("Expected <= 1 alloc for NewReplacer(), got %f", allocsNew)
+	}
+
+	allocsEmpty := testing.AllocsPerRun(1000, func() {
+		_ = NewEmptyReplacer()
+	})
+	if allocsEmpty > 1 {
+		t.Errorf("Expected <= 1 alloc for NewEmptyReplacer(), got %f", allocsEmpty)
+	}
+
+	rep := NewReplacer()
+	allocsWithoutFile := testing.AllocsPerRun(1000, func() {
+		_ = rep.WithoutFile()
+	})
+	if allocsWithoutFile > 1 {
+		t.Errorf("Expected <= 1 alloc for WithoutFile(), got %f", allocsWithoutFile)
+	}
+}
+
+func TestReplacerWithoutFileConcurrentSet(t *testing.T) {
+	r := NewReplacer()
+	rep := r.WithoutFile()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			r.Set(fmt.Sprintf("key_r_%d", i), i)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			rep.Set(fmt.Sprintf("key_rep_%d", i), i)
+		}
+	}()
+
+	wg.Wait()
+
+	if val, ok := r.Get("key_r_50"); !ok || val != 50 {
+		t.Errorf("Expected key_r_50=50 on r, got %v (found=%v)", val, ok)
+	}
+	if val, ok := rep.Get("key_rep_50"); !ok || val != 50 {
+		t.Errorf("Expected key_rep_50=50 on rep, got %v (found=%v)", val, ok)
+	}
+}
+
+func TestReplacerWithoutFileWithStaticMap(t *testing.T) {
+	r := NewReplacer()
+	r.Set("initial", "value")
+
+	rep := r.WithoutFile()
+
+	if val, ok := rep.Get("initial"); !ok || val != "value" {
+		t.Errorf("Expected initial=value on rep, got %v (found=%v)", val, ok)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			r.Set(fmt.Sprintf("key_r_%d", i), i)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			rep.Set(fmt.Sprintf("key_rep_%d", i), i)
+		}
+	}()
+
+	wg.Wait()
+
+	if val, ok := r.Get("key_r_50"); !ok || val != 50 {
+		t.Errorf("Expected key_r_50=50 on r, got %v (found=%v)", val, ok)
+	}
+	if val, ok := rep.Get("key_rep_50"); !ok || val != 50 {
+		t.Errorf("Expected key_rep_50=50 on rep, got %v (found=%v)", val, ok)
 	}
 }

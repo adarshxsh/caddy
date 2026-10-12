@@ -32,38 +32,46 @@ import (
 
 // NewReplacer returns a new Replacer.
 func NewReplacer() *Replacer {
-	rep := &Replacer{
-		static:   make(map[string]any),
-		mapMutex: &sync.RWMutex{},
-	}
-	rep.providers = []replacementProvider{
-		globalDefaultReplacementProvider{},
-		fileReplacementProvider{},
-		ReplacerFunc(rep.fromStatic),
-	}
+	rep := &Replacer{}
+	rep.providers = append(rep.providerBuf[:0],
+		globalDefaultProvider,
+		fileProvider,
+		staticProvider{rep: rep},
+	)
 	return rep
 }
 
 // NewEmptyReplacer returns a new Replacer,
 // without the global default replacements.
 func NewEmptyReplacer() *Replacer {
-	rep := &Replacer{
-		static:   make(map[string]any),
-		mapMutex: &sync.RWMutex{},
-	}
-	rep.providers = []replacementProvider{
-		ReplacerFunc(rep.fromStatic),
-	}
+	rep := &Replacer{}
+	rep.providers = append(rep.providerBuf[:0],
+		staticProvider{rep: rep},
+	)
 	return rep
+}
+
+var (
+	globalDefaultProvider globalDefaultReplacementProvider
+	fileProvider          fileReplacementProvider
+)
+
+type staticProvider struct {
+	rep *Replacer
+}
+
+func (sp staticProvider) replace(key string) (any, bool) {
+	return sp.rep.fromStatic(key)
 }
 
 // Replacer can replace values in strings.
 // A default/empty Replacer is not valid;
 // use NewReplacer to make one.
 type Replacer struct {
-	providers []replacementProvider
-	static    map[string]any
-	mapMutex  *sync.RWMutex
+	providers   []replacementProvider
+	providerBuf [4]replacementProvider
+	static      map[string]any
+	mapMutex    sync.RWMutex
 }
 
 // WithoutFile returns a copy of the current Replacer
@@ -72,9 +80,26 @@ type Replacer struct {
 //
 // EXPERIMENTAL: Subject to change or removal.
 func (r *Replacer) WithoutFile() *Replacer {
-	rep := &Replacer{static: r.static}
+	r.mapMutex.RLock()
+	var staticCopy map[string]any
+	if r.static != nil {
+		staticCopy = make(map[string]any, len(r.static))
+		for k, v := range r.static {
+			staticCopy[k] = v
+		}
+	}
+	r.mapMutex.RUnlock()
+
+	rep := &Replacer{
+		static: staticCopy,
+	}
+	rep.providers = rep.providerBuf[:0]
 	for _, v := range r.providers {
 		if _, ok := v.(fileReplacementProvider); ok {
+			continue
+		}
+		if _, ok := v.(staticProvider); ok {
+			rep.providers = append(rep.providers, staticProvider{rep: rep})
 			continue
 		}
 		rep.providers = append(rep.providers, v)
@@ -91,6 +116,9 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
+	if r.static == nil {
+		r.static = make(map[string]any)
+	}
 	r.static[variable] = value
 	r.mapMutex.Unlock()
 }
@@ -117,7 +145,9 @@ func (r *Replacer) GetString(variable string) (string, bool) {
 // that was created using Set.
 func (r *Replacer) Delete(variable string) {
 	r.mapMutex.Lock()
-	delete(r.static, variable)
+	if r.static != nil {
+		delete(r.static, variable)
+	}
 	r.mapMutex.Unlock()
 }
 
@@ -125,9 +155,11 @@ func (r *Replacer) Delete(variable string) {
 // keys starting with the given prefix
 func (r *Replacer) DeleteByPrefix(prefix string) {
 	r.mapMutex.Lock()
-	for key := range r.static {
-		if strings.HasPrefix(key, prefix) {
-			delete(r.static, key)
+	if r.static != nil {
+		for key := range r.static {
+			if strings.HasPrefix(key, prefix) {
+				delete(r.static, key)
+			}
 		}
 	}
 	r.mapMutex.Unlock()
@@ -137,6 +169,9 @@ func (r *Replacer) DeleteByPrefix(prefix string) {
 func (r *Replacer) fromStatic(key string) (any, bool) {
 	r.mapMutex.RLock()
 	defer r.mapMutex.RUnlock()
+	if r.static == nil {
+		return nil, false
+	}
 	val, ok := r.static[key]
 	return val, ok
 }
