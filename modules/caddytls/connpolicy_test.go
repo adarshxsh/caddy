@@ -15,11 +15,13 @@
 package caddytls
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -360,4 +362,219 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetEncryptedClientHelloKeys(t *testing.T) {
+	t.Run("empty and nil edge cases", func(t *testing.T) {
+		ech := &ECH{
+			configsMu: new(sync.RWMutex),
+		}
+		tlsApp := &TLS{
+			EncryptedClientHello: ech,
+		}
+
+		// Test callback directly when stdlibReady is empty
+		getKeysFunc := func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+			if tlsApp == nil || tlsApp.EncryptedClientHello == nil {
+				return nil, nil
+			}
+			tlsApp.EncryptedClientHello.configsMu.RLock()
+			defer tlsApp.EncryptedClientHello.configsMu.RUnlock()
+			if len(tlsApp.EncryptedClientHello.stdlibReady) == 0 {
+				return nil, nil
+			}
+			keys := make([]tls.EncryptedClientHelloKey, len(tlsApp.EncryptedClientHello.stdlibReady))
+			for i, key := range tlsApp.EncryptedClientHello.stdlibReady {
+				keys[i] = tls.EncryptedClientHelloKey{
+					Config:      bytes.Clone(key.Config),
+					PrivateKey:  bytes.Clone(key.PrivateKey),
+					SendAsRetry: key.SendAsRetry,
+				}
+			}
+			return keys, nil
+		}
+
+		keys, err := getKeysFunc(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if keys != nil {
+			t.Fatalf("expected nil keys for empty stdlibReady, got %v", keys)
+		}
+
+		// Test callback when tlsApp or EncryptedClientHello is nil
+		tlsAppNil := &TLS{}
+		getKeysFuncNil := func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+			if tlsAppNil == nil || tlsAppNil.EncryptedClientHello == nil {
+				return nil, nil
+			}
+			tlsAppNil.EncryptedClientHello.configsMu.RLock()
+			defer tlsAppNil.EncryptedClientHello.configsMu.RUnlock()
+			if len(tlsAppNil.EncryptedClientHello.stdlibReady) == 0 {
+				return nil, nil
+			}
+			keys := make([]tls.EncryptedClientHelloKey, len(tlsAppNil.EncryptedClientHello.stdlibReady))
+			for i, key := range tlsAppNil.EncryptedClientHello.stdlibReady {
+				keys[i] = tls.EncryptedClientHelloKey{
+					Config:      bytes.Clone(key.Config),
+					PrivateKey:  bytes.Clone(key.PrivateKey),
+					SendAsRetry: key.SendAsRetry,
+				}
+			}
+			return keys, nil
+		}
+		keysNil, err := getKeysFuncNil(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if keysNil != nil {
+			t.Fatalf("expected nil keys for nil EncryptedClientHello, got %v", keysNil)
+		}
+	})
+
+	t.Run("isolated slice copy", func(t *testing.T) {
+		ech := &ECH{
+			configsMu: new(sync.RWMutex),
+			configs: map[string][]echConfig{
+				"example.com": {
+					{
+						configBin:  []byte("config1"),
+						privKeyBin: []byte("key1"),
+					},
+				},
+			},
+		}
+		ech.configsMu.Lock()
+		ech.updateKeyList()
+		ech.configsMu.Unlock()
+
+		tlsApp := &TLS{
+			EncryptedClientHello: ech,
+		}
+
+		getKeysFunc := func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+			if tlsApp == nil || tlsApp.EncryptedClientHello == nil {
+				return nil, nil
+			}
+			tlsApp.EncryptedClientHello.configsMu.RLock()
+			defer tlsApp.EncryptedClientHello.configsMu.RUnlock()
+			if len(tlsApp.EncryptedClientHello.stdlibReady) == 0 {
+				return nil, nil
+			}
+			keys := make([]tls.EncryptedClientHelloKey, len(tlsApp.EncryptedClientHello.stdlibReady))
+			for i, key := range tlsApp.EncryptedClientHello.stdlibReady {
+				keys[i] = tls.EncryptedClientHelloKey{
+					Config:      bytes.Clone(key.Config),
+					PrivateKey:  bytes.Clone(key.PrivateKey),
+					SendAsRetry: key.SendAsRetry,
+				}
+			}
+			return keys, nil
+		}
+
+		keys, err := getKeysFunc(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(keys) != 1 {
+			t.Fatalf("expected 1 key, got %d", len(keys))
+		}
+
+		// Mutate returned slice element
+		keys[0].Config[0] = 'X'
+
+		// Verify internal stdlibReady was not mutated
+		ech.configsMu.RLock()
+		defer ech.configsMu.RUnlock()
+		if ech.stdlibReady[0].Config[0] == 'X' {
+			t.Fatalf("internal stdlibReady was mutated when returned slice was modified")
+		}
+	})
+
+	t.Run("concurrent reads and key rotation", func(t *testing.T) {
+		ech := &ECH{
+			configsMu: new(sync.RWMutex),
+			configs: map[string][]echConfig{
+				"example.com": {
+					{
+						configBin:  []byte("config1"),
+						privKeyBin: []byte("key1"),
+					},
+				},
+			},
+		}
+		ech.configsMu.Lock()
+		ech.updateKeyList()
+		ech.configsMu.Unlock()
+
+		tlsApp := &TLS{
+			EncryptedClientHello: ech,
+		}
+
+		getKeysFunc := func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+			if tlsApp == nil || tlsApp.EncryptedClientHello == nil {
+				return nil, nil
+			}
+			tlsApp.EncryptedClientHello.configsMu.RLock()
+			defer tlsApp.EncryptedClientHello.configsMu.RUnlock()
+			if len(tlsApp.EncryptedClientHello.stdlibReady) == 0 {
+				return nil, nil
+			}
+			keys := make([]tls.EncryptedClientHelloKey, len(tlsApp.EncryptedClientHello.stdlibReady))
+			for i, key := range tlsApp.EncryptedClientHello.stdlibReady {
+				keys[i] = tls.EncryptedClientHelloKey{
+					Config:      bytes.Clone(key.Config),
+					PrivateKey:  bytes.Clone(key.PrivateKey),
+					SendAsRetry: key.SendAsRetry,
+				}
+			}
+			return keys, nil
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+
+		// Goroutines reading keys via callback and reading slice elements
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for j := 0; j < 100; j++ {
+					keys, err := getKeysFunc(nil)
+					if err != nil {
+						t.Errorf("unexpected error: %v", err)
+						return
+					}
+					for _, k := range keys {
+						_ = len(k.Config)
+						_ = len(k.PrivateKey)
+					}
+				}
+			}()
+		}
+
+		// Goroutines rotating keys / updating key list
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				<-start
+				for j := 0; j < 50; j++ {
+					ech.configsMu.Lock()
+					ech.configs["example.com"] = []echConfig{
+						{
+							configBin:  []byte(fmt.Sprintf("config-%d-%d", id, j)),
+							privKeyBin: []byte(fmt.Sprintf("key-%d-%d", id, j)),
+						},
+					}
+					ech.updateKeyList()
+					ech.configsMu.Unlock()
+				}
+			}(i)
+		}
+
+		close(start)
+		wg.Wait()
+	})
 }

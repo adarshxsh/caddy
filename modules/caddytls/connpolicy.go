@@ -15,6 +15,7 @@
 package caddytls
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -170,9 +171,23 @@ func (cp ConnectionPolicies) TLSConfig(ctx caddy.Context) *tls.Config {
 			}
 
 			tlsCfg.GetEncryptedClientHelloKeys = func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+				if tlsApp == nil || tlsApp.EncryptedClientHello == nil {
+					return nil, nil
+				}
 				tlsApp.EncryptedClientHello.configsMu.RLock()
 				defer tlsApp.EncryptedClientHello.configsMu.RUnlock()
-				return tlsApp.EncryptedClientHello.stdlibReady, nil
+				if len(tlsApp.EncryptedClientHello.stdlibReady) == 0 {
+					return nil, nil
+				}
+				keys := make([]tls.EncryptedClientHelloKey, len(tlsApp.EncryptedClientHello.stdlibReady))
+				for i, key := range tlsApp.EncryptedClientHello.stdlibReady {
+					keys[i] = tls.EncryptedClientHelloKey{
+						Config:      bytes.Clone(key.Config),
+						PrivateKey:  bytes.Clone(key.PrivateKey),
+						SendAsRetry: key.SendAsRetry,
+					}
+				}
+				return keys, nil
 			}
 		}
 	}
