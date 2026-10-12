@@ -530,3 +530,104 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestReplacerZeroAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("exact", "{exact}")
+
+	cases := []struct {
+		name string
+		fn   func()
+	}{
+		{
+			name: "unclosed brace",
+			fn: func() {
+				_ = rep.ReplaceKnown("foo{bar", "")
+			},
+		},
+		{
+			name: "single open brace",
+			fn: func() {
+				_ = rep.ReplaceKnown("{", "")
+			},
+		},
+		{
+			name: "single close brace",
+			fn: func() {
+				_ = rep.ReplaceKnown("}", "")
+			},
+		},
+		{
+			name: "closing brace before text",
+			fn: func() {
+				_ = rep.ReplaceKnown("foo}bar", "")
+			},
+		},
+		{
+			name: "unknown placeholder ReplaceKnown",
+			fn: func() {
+				_ = rep.ReplaceKnown("hello {unknown} world", "")
+			},
+		},
+		{
+			name: "json payload string ReplaceKnown",
+			fn: func() {
+				_ = rep.ReplaceKnown(`{"json": "payload", "key": "value"}`, "")
+			},
+		},
+		{
+			name: "known placeholder evaluating to identical text",
+			fn: func() {
+				_ = rep.ReplaceKnown("{exact}", "")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			tc.fn()
+			allocs := testing.AllocsPerRun(100, tc.fn)
+			if allocs > 0 {
+				t.Errorf("expected 0 allocations for non-modifying input, got %f", allocs)
+			}
+		})
+	}
+}
+
+func TestReplacerBufferPoolingAndEdgeCases(t *testing.T) {
+	rep := NewReplacer()
+	rep.Set("var1", "hello")
+	rep.Set("var2", "world")
+	rep.Set("emptyVar", "")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				res := rep.ReplaceAll("{var1} {var2}!", "")
+				if res != "hello world!" {
+					t.Errorf("goroutine %d: expected 'hello world!', got '%s'", id, res)
+				}
+
+				nonMod := rep.ReplaceKnown(`{"key": "{unknown}"}`, "")
+				if nonMod != `{"key": "{unknown}"}` {
+					t.Errorf("goroutine %d: expected '{\"key\": \"{unknown}\"}', got '%s'", id, nonMod)
+				}
+
+				emptyRes := rep.ReplaceAll("{emptyVar}", "default")
+				if emptyRes != "default" {
+					t.Errorf("goroutine %d: expected 'default', got '%s'", id, emptyRes)
+				}
+
+				unescaped := rep.ReplaceAll(`\{hello\} \{world\}`, "")
+				if unescaped != "{hello} {world}" {
+					t.Errorf("goroutine %d: expected '{hello} {world}', got '%s'", id, unescaped)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+}

@@ -180,11 +180,13 @@ func (r *Replacer) replace(input, empty string,
 		return input, nil
 	}
 
-	var sb strings.Builder
-
-	// it is reasonable to assume that the output
-	// will be approximately as long as the input
-	sb.Grow(len(input))
+	var buf *bytes.Buffer
+	defer func() {
+		if buf != nil {
+			buf.Reset()
+			replacerBufPool.Put(buf)
+		}
+	}()
 
 	// iterate the input to find each placeholder
 	var lastWriteCursor int
@@ -196,7 +198,14 @@ scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
-			sb.WriteString(input[lastWriteCursor : i-1])
+			if buf == nil {
+				buf = replacerBufPool.Get().(*bytes.Buffer)
+				buf.Reset()
+				buf.Grow(len(input))
+				buf.WriteString(input[:i-1])
+			} else {
+				buf.WriteString(input[lastWriteCursor : i-1])
+			}
 			lastWriteCursor = i
 			continue
 		}
@@ -229,9 +238,6 @@ scan:
 			end += nextEnd + 1
 		}
 
-		// write the substring from the last cursor to this point
-		sb.WriteString(input[lastWriteCursor:i])
-
 		// trim opening bracket
 		key := input[i+1 : end]
 
@@ -245,7 +251,6 @@ scan:
 			} else if !treatUnknownAsEmpty {
 				// if treatUnknownAsEmpty is true, we'll handle an empty
 				// val later; so only continue otherwise
-				lastWriteCursor = i
 				continue
 			}
 		}
@@ -262,17 +267,34 @@ scan:
 		// convert val to a string as efficiently as possible
 		valStr := ToString(val)
 
-		// write the value; if it's empty, either return
-		// an error or write a default value
+		var replacement string
 		if valStr == "" {
 			if errOnEmpty {
 				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
 					string(phOpen), key, string(phClose))
-			} else if empty != "" {
-				sb.WriteString(empty)
 			}
+			replacement = empty
 		} else {
-			sb.WriteString(valStr)
+			replacement = valStr
+		}
+
+		// check if this replacement actually changes the input string
+		if buf == nil && replacement == input[i:end+1] {
+			i = end
+			continue
+		}
+
+		if buf == nil {
+			buf = replacerBufPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			buf.Grow(len(input))
+			buf.WriteString(input[0:i])
+		} else {
+			buf.WriteString(input[lastWriteCursor:i])
+		}
+
+		if replacement != "" {
+			buf.WriteString(replacement)
 		}
 
 		// advance cursor to end of placeholder
@@ -280,10 +302,20 @@ scan:
 		lastWriteCursor = i + 1
 	}
 
-	// flush any unwritten remainder
-	sb.WriteString(input[lastWriteCursor:])
+	if buf == nil {
+		return input, nil
+	}
 
-	return sb.String(), nil
+	buf.WriteString(input[lastWriteCursor:])
+
+	res := buf.String()
+	return res, nil
+}
+
+var replacerBufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
 }
 
 // ToString returns val as a string, as efficiently as possible.
