@@ -296,3 +296,41 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkHTTPReplacer(b *testing.B) {
+	req, err := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	if err != nil {
+		b.Fatalf("failed to create request: %v", err)
+	}
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+	req.Header.Set("User-Agent", "CaddyBench/1.0")
+	req.Header.Set("Accept", "text/html")
+
+	b.Run("NewTestReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			reqCopy := *req
+			_ = NewTestReplacer(&reqCopy)
+		}
+	})
+
+	b.Run("addHTTPVarsToReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		repl := caddy.NewReplacer()
+		for b.Loop() {
+			reqCopy := *req
+			addHTTPVarsToReplacer(repl, &reqCopy, nil)
+		}
+	})
+
+	b.Run("VariableResolution", func(b *testing.B) {
+		reqCopy := *req
+		repl := NewTestReplacer(&reqCopy)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_ = repl.ReplaceAll("Method: {http.request.method}, Path: {http.request.uri.path}, Host: {http.request.host}, UA: {http.request.header.User-Agent}", "")
+		}
+	})
+}
