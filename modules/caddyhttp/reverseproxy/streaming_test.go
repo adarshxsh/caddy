@@ -49,7 +49,8 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 		bufferSize: 7,
 	}
 
-	buf := copier.buffer()
+	buf, put := copier.buffer()
+	defer put()
 	if got := len(buf); got != 7 {
 		t.Fatalf("buffer len = %d, want 7", got)
 	}
@@ -67,10 +68,23 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 }
 
 func TestSwitchProtocolCopierDefaultBufferSize(t *testing.T) {
-	copier := switchProtocolCopier{}
-	buf := copier.buffer()
-	if got := len(buf); got != defaultBufferSize {
-		t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
+	testCases := []struct {
+		name       string
+		bufferSize int
+	}{
+		{name: "unspecified buffer size", bufferSize: 0},
+		{name: "explicit default buffer size", bufferSize: defaultBufferSize},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			copier := switchProtocolCopier{bufferSize: tc.bufferSize}
+			buf, put := copier.buffer()
+			if got := len(buf); got != defaultBufferSize {
+				t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
+			}
+			put()
+		})
 	}
 }
 
