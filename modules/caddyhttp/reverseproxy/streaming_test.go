@@ -7,8 +7,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
 )
 
 func TestHandlerCopyResponse(t *testing.T) {
@@ -80,3 +82,124 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+type testFlushWriter struct {
+	bytes.Buffer
+	flushCount int
+	mu         sync.Mutex
+}
+
+func (w *testFlushWriter) Flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.flushCount++
+	return nil
+}
+
+func (w *testFlushWriter) getFlushCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.flushCount
+}
+
+func TestMaxLatencyWriterInitialHeaderFlush(t *testing.T) {
+	var tw testFlushWriter
+	mlw := &maxLatencyWriter{
+		dst:     &tw,
+		flush:   tw.Flush,
+		latency: 50 * time.Millisecond,
+		logger:  zap.NewNop(),
+	}
+	defer mlw.stop()
+
+	mlw.startHeaderTimer()
+
+	// Wait long enough for the initial header flush timer to fire
+	time.Sleep(100 * time.Millisecond)
+
+	if got := tw.getFlushCount(); got != 1 {
+		t.Errorf("expected 1 initial header flush, got %d", got)
+	}
+}
+
+func TestMaxLatencyWriterFirstWriteCancelsHeaderTimer(t *testing.T) {
+	var tw testFlushWriter
+	mlw := &maxLatencyWriter{
+		dst:     &tw,
+		flush:   tw.Flush,
+		latency: 100 * time.Millisecond,
+		logger:  zap.NewNop(),
+	}
+	defer mlw.stop()
+
+	mlw.startHeaderTimer()
+
+	// Write payload after 10ms (well before the 100ms header timer)
+	time.Sleep(10 * time.Millisecond)
+	n, err := mlw.Write([]byte("chunk1"))
+	if err != nil || n != 6 {
+		t.Fatalf("Write error = %v, n = %d", err, n)
+	}
+
+	// At 50ms from start (40ms after Write), header timer should have been canceled,
+	// and payload timer (100ms duration) has not fired yet.
+	time.Sleep(40 * time.Millisecond)
+	if got := tw.getFlushCount(); got != 0 {
+		t.Errorf("expected 0 flushes at 50ms, got %d", got)
+	}
+
+	// Wait until payload flush timer fires (total ~150ms from start)
+	time.Sleep(80 * time.Millisecond)
+	if got := tw.getFlushCount(); got != 1 {
+		t.Errorf("expected 1 payload flush at 130ms+, got %d", got)
+	}
+}
+
+func TestMaxLatencyWriterImmediateFlush(t *testing.T) {
+	var tw testFlushWriter
+	mlw := &maxLatencyWriter{
+		dst:     &tw,
+		flush:   tw.Flush,
+		latency: -1,
+		logger:  zap.NewNop(),
+	}
+	defer mlw.stop()
+
+	mlw.Write([]byte("fast"))
+	if got := tw.getFlushCount(); got != 1 {
+		t.Errorf("expected 1 immediate flush, got %d", got)
+	}
+}
+
+func TestMaxLatencyWriterConcurrency(t *testing.T) {
+	var tw testFlushWriter
+	mlw := &maxLatencyWriter{
+		dst:     &tw,
+		flush:   tw.Flush,
+		latency: 5 * time.Millisecond,
+		logger:  zap.NewNop(),
+	}
+
+	mlw.startHeaderTimer()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				mlw.Write([]byte("data"))
+				time.Sleep(1 * time.Millisecond)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(10 * time.Millisecond)
+		mlw.stop()
+	}()
+
+	wg.Wait()
+}

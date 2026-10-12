@@ -300,8 +300,7 @@ func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInter
 		defer mlw.stop()
 
 		// set up initial timer so headers get flushed even if body writes are delayed
-		mlw.flushPending = true
-		mlw.t = time.AfterFunc(flushInterval, mlw.delayedFlush)
+		mlw.startHeaderTimer()
 
 		w = mlw
 	}
@@ -579,10 +578,22 @@ type maxLatencyWriter struct {
 	flush   func() error
 	latency time.Duration // non-zero; negative means to flush immediately
 
-	mu           sync.Mutex // protects t, flushPending, and dst.Flush
-	t            *time.Timer
-	flushPending bool
-	logger       *zap.Logger
+	mu                 sync.Mutex // protects t, headerTimer, flushPending, headerFlushPending, and dst.Flush
+	t                  *time.Timer
+	headerTimer        *time.Timer
+	flushPending       bool
+	headerFlushPending bool
+	logger             *zap.Logger
+}
+
+func (m *maxLatencyWriter) startHeaderTimer() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.latency <= 0 {
+		return
+	}
+	m.headerFlushPending = true
+	m.headerTimer = time.AfterFunc(m.latency, m.delayedHeaderFlush)
 }
 
 func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
@@ -591,6 +602,13 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 	n, err = m.dst.Write(p)
 	if c := m.logger.Check(zapcore.DebugLevel, "wrote bytes"); c != nil {
 		c.Write(zap.Int("n", n), zap.Error(err))
+	}
+	if m.headerFlushPending {
+		m.headerFlushPending = false
+		if m.headerTimer != nil {
+			m.headerTimer.Stop()
+			m.headerTimer = nil
+		}
 	}
 	if m.latency < 0 {
 		m.logger.Debug("flushing immediately")
@@ -614,6 +632,20 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
+func (m *maxLatencyWriter) delayedHeaderFlush() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.headerFlushPending {
+		m.logger.Debug("delayed header flush is not pending")
+		return
+	}
+	m.logger.Debug("delayed header flush")
+	//nolint:errcheck
+	m.flush()
+	m.headerFlushPending = false
+	m.headerTimer = nil
+}
+
 func (m *maxLatencyWriter) delayedFlush() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -631,6 +663,10 @@ func (m *maxLatencyWriter) stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.flushPending = false
+	m.headerFlushPending = false
+	if m.headerTimer != nil {
+		m.headerTimer.Stop()
+	}
 	if m.t != nil {
 		m.t.Stop()
 	}
