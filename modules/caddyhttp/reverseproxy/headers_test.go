@@ -2,9 +2,11 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -123,5 +125,82 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestEarlyDataHeaderSanitization(t *testing.T) {
+	h := Handler{}
+
+	tests := []struct {
+		name          string
+		tlsState      *tls.ConnectionState
+		inputHeaders  map[string]string
+		wantEarlyData string
+		wantExists    bool
+	}{
+		{
+			name:         "HTTP request with spoofed Early-Data header",
+			tlsState:     nil,
+			inputHeaders: map[string]string{"Early-Data": "1"},
+			wantExists:   false,
+		},
+		{
+			name:         "Completed TLS request with spoofed Early-Data header",
+			tlsState:     &tls.ConnectionState{HandshakeComplete: true},
+			inputHeaders: map[string]string{"Early-Data": "1"},
+			wantExists:   false,
+		},
+		{
+			name:          "TLS early data request (HandshakeComplete false) without prior Early-Data header",
+			tlsState:      &tls.ConnectionState{HandshakeComplete: false},
+			inputHeaders:  map[string]string{},
+			wantEarlyData: "1",
+			wantExists:    true,
+		},
+		{
+			name:          "TLS early data request (HandshakeComplete false) with prior Early-Data header",
+			tlsState:      &tls.ConnectionState{HandshakeComplete: false},
+			inputHeaders:  map[string]string{"Early-Data": "1"},
+			wantEarlyData: "1",
+			wantExists:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com/", nil)
+			req.TLS = tt.tlsState
+			for k, v := range tt.inputHeaders {
+				req.Header.Set(k, v)
+			}
+
+			vars := map[string]any{
+				caddyhttp.TrustedProxyVarKey: false,
+				caddyhttp.ClientIPVarKey:     "127.0.0.1",
+			}
+			ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+			req = req.WithContext(ctx)
+
+			outReq, err := h.prepareRequest(req, caddy.NewReplacer())
+			if err != nil {
+				t.Fatalf("prepareRequest unexpected error: %v", err)
+			}
+
+			gotVal := outReq.Header.Get("Early-Data")
+			_, gotExists := outReq.Header["Early-Data"]
+
+			if tt.wantExists {
+				if !gotExists {
+					t.Errorf("expected Early-Data header to exist, but it was missing")
+				}
+				if gotVal != tt.wantEarlyData {
+					t.Errorf("Early-Data header = %q, want %q", gotVal, tt.wantEarlyData)
+				}
+			} else {
+				if gotExists {
+					t.Errorf("expected Early-Data header to be deleted, but found = %q", gotVal)
+				}
+			}
+		})
 	}
 }
