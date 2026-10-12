@@ -263,6 +263,11 @@ type Server struct {
 	// don't perform a retry, so disabling 0-RTT can smooth it out.
 	Allow0RTT *bool `json:"allow_0rtt,omitempty"`
 
+	// If true, allows unsafe HTTP methods (such as POST, PUT, DELETE) in
+	// 0-RTT early data. By default (false), unsafe early data requests are
+	// rejected with HTTP status 425 (Too Early) and Retry-After: 0 per RFC 8470.
+	AllowUnsafeEarlyData bool `json:"allow_unsafe_early_data,omitempty"`
+
 	// If set, metrics observations will be enabled.
 	// This setting is EXPERIMENTAL and subject to change.
 	// DEPRECATED: Use the app-level `metrics` field.
@@ -301,6 +306,16 @@ type Server struct {
 }
 
 var defaultProtocols = []string{"h1", "h2", "h3"}
+
+// isSafeMethod returns true if method is considered a safe HTTP method per RFC 9110 Section 9.2.1.
+func isSafeMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
 
 var (
 	ServerHeader = "Caddy"
@@ -354,7 +369,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Request:              r.Clone(r.Context()),
 		ShouldLogCredentials: shouldLogCredentials,
 	})
-	errLog := s.errorLogger.WithLazy(loggableReq)
+	errLogger := s.errorLogger
+	if errLogger == nil {
+		errLogger = zap.NewNop()
+	}
+	errLog := errLogger.WithLazy(loggableReq)
 
 	var duration time.Duration
 
@@ -385,6 +404,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.tlsApp.HandleHTTPChallenge(w, r) {
 		duration = time.Since(start)
 		return
+	}
+
+	// 0-RTT early data request guard (RFC 8470)
+	if r.TLS != nil && !r.TLS.HandshakeComplete {
+		r.Header.Set("Early-Data", "1")
+		if !s.AllowUnsafeEarlyData && !isSafeMethod(r.Method) {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooEarly)
+			duration = time.Since(start)
+			return
+		}
+	} else {
+		r.Header.Del("Early-Data")
 	}
 
 	err := s.serveHTTP(w, r)

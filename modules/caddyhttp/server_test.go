@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -576,3 +577,117 @@ func TestServer_DetermineTrustedProxy_MatchRightMostUntrustedFirst(t *testing.T)
 	assert.True(t, trusted)
 	assert.Equal(t, clientIP, "90.100.110.120")
 }
+
+func TestServer_EarlyData_UnsafeMethodBlocked(t *testing.T) {
+	s := &Server{
+		errorLogger: zap.NewNop(),
+		primaryHandlerChain: HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			w.WriteHeader(http.StatusOK)
+			return nil
+		}),
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch, "CUSTOM"} {
+		t.Run(method, func(t *testing.T) {
+			req := httptest.NewRequest(method, "/", nil)
+			req.TLS = &tls.ConnectionState{HandshakeComplete: false}
+
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusTooEarly, rec.Code)
+			assert.Equal(t, "0", rec.Header().Get("Retry-After"))
+		})
+	}
+}
+
+func TestServer_EarlyData_SafeMethodAllowed(t *testing.T) {
+	var handlerExecuted bool
+	var earlyDataHeader string
+
+	s := &Server{
+		errorLogger: zap.NewNop(),
+		primaryHandlerChain: HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			handlerExecuted = true
+			earlyDataHeader = r.Header.Get("Early-Data")
+			w.WriteHeader(http.StatusOK)
+			return nil
+		}),
+	}
+
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace} {
+		t.Run(method, func(t *testing.T) {
+			handlerExecuted = false
+			earlyDataHeader = ""
+
+			req := httptest.NewRequest(method, "/", nil)
+			req.TLS = &tls.ConnectionState{HandshakeComplete: false}
+
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, req)
+
+			assert.True(t, handlerExecuted)
+			assert.Equal(t, "1", earlyDataHeader)
+			assert.Equal(t, http.StatusOK, rec.Code)
+		})
+	}
+}
+
+func TestServer_EarlyData_AllowUnsafeEarlyData(t *testing.T) {
+	var handlerExecuted bool
+	var earlyDataHeader string
+
+	s := &Server{
+		errorLogger:          zap.NewNop(),
+		AllowUnsafeEarlyData: true,
+		primaryHandlerChain: HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			handlerExecuted = true
+			earlyDataHeader = r.Header.Get("Early-Data")
+			w.WriteHeader(http.StatusOK)
+			return nil
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.TLS = &tls.ConnectionState{HandshakeComplete: false}
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	assert.True(t, handlerExecuted)
+	assert.Equal(t, "1", earlyDataHeader)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestServer_NonEarlyData_StripsEarlyDataHeader(t *testing.T) {
+	var earlyDataHeader string
+
+	s := &Server{
+		errorLogger: zap.NewNop(),
+		primaryHandlerChain: HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			earlyDataHeader = r.Header.Get("Early-Data")
+			w.WriteHeader(http.StatusOK)
+			return nil
+		}),
+	}
+
+	// Case 1: TLS handshake complete (1-RTT)
+	req1 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req1.TLS = &tls.ConnectionState{HandshakeComplete: true}
+	req1.Header.Set("Early-Data", "1")
+
+	rec1 := httptest.NewRecorder()
+	s.ServeHTTP(rec1, req1)
+
+	assert.Equal(t, "", earlyDataHeader)
+
+	// Case 2: Plain HTTP (no TLS)
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.Header.Set("Early-Data", "1")
+
+	rec2 := httptest.NewRecorder()
+	s.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, "", earlyDataHeader)
+}
+

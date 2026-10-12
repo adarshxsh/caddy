@@ -60,6 +60,9 @@ type serverOptions struct {
 	// If set, overrides whether QUIC listeners allow 0-RTT (early data).
 	// If nil, the default behavior is used (currently allowed).
 	Allow0RTT *bool
+
+	// If true, allows unsafe HTTP methods in 0-RTT early data.
+	AllowUnsafeEarlyData bool
 }
 
 func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
@@ -323,6 +326,12 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
 			boolVal := false
 			serverOpts.Allow0RTT = &boolVal
 
+		case "allow_unsafe_early_data":
+			if d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			serverOpts.AllowUnsafeEarlyData = true
+
 		default:
 			return nil, d.Errf("unrecognized servers option '%s'", d.Val())
 		}
@@ -388,6 +397,7 @@ func applyServerOptions(
 		server.TrustedProxiesUnix = opts.TrustedProxiesUnix
 		server.Metrics = opts.Metrics
 		server.Allow0RTT = opts.Allow0RTT
+		server.AllowUnsafeEarlyData = opts.AllowUnsafeEarlyData
 		if opts.ShouldLogCredentials {
 			if server.Logs == nil {
 				server.Logs = new(caddyhttp.ServerLogConfig)

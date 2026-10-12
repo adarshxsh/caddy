@@ -291,3 +291,47 @@ func TestMergeACMEIssuers(t *testing.T) {
 		t.Fatalf("expected base roots to remain unchanged, got %v", base.TrustedRootsPEMFiles)
 	}
 }
+
+func TestServerOptionsAllowUnsafeEarlyData(t *testing.T) {
+	input := `{
+		servers {
+			allow_unsafe_early_data
+		}
+	}
+	example.com {
+		respond "OK"
+	}`
+
+	adapter := caddyfile.Adapter{
+		ServerType: ServerType{},
+	}
+
+	out, _, err := adapter.Adapt([]byte(input), nil)
+	if err != nil {
+		t.Fatalf("unexpected adaptation error: %v", err)
+	}
+
+	var config struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					AllowUnsafeEarlyData bool `json:"allow_unsafe_early_data"`
+				} `json:"servers"`
+			} `json:"http"`
+		} `json:"apps"`
+	}
+
+	if err := json.Unmarshal(out, &config); err != nil {
+		t.Fatalf("failed to unmarshal adapted JSON: %v", err)
+	}
+
+	srv, ok := config.Apps.HTTP.Servers["srv0"]
+	if !ok {
+		t.Fatalf("expected server 'srv0' in adapted config, got: %s", out)
+	}
+
+	if !srv.AllowUnsafeEarlyData {
+		t.Fatalf("expected allow_unsafe_early_data to be true, got false")
+	}
+}
+
