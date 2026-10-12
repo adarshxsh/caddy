@@ -550,6 +550,9 @@ var ErrNotConfigured = fmt.Errorf("module not configured")
 
 // Storage returns the configured Caddy storage implementation.
 func (ctx Context) Storage() certmagic.Storage {
+	if ctx.cfg == nil {
+		return certmagic.Default.Storage
+	}
 	return ctx.cfg.storage
 }
 
