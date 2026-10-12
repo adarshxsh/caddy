@@ -521,18 +521,19 @@ type contextAndCancelFunc struct {
 // sharedQUICState manages GetConfigForClient
 // see issue: https://github.com/caddyserver/caddy/pull/4849
 type sharedQUICState struct {
-	rmu           sync.RWMutex
-	tlsConfs      map[*tls.Config]contextAndCancelFunc
-	activeTlsConf *tls.Config
+	rmu         sync.RWMutex
+	tlsConfs    map[*tls.Config]contextAndCancelFunc
+	tlsConfList []*tls.Config
 }
 
 // newSharedQUICState creates a new sharedQUICState
 func newSharedQUICState(tlsConfig *tls.Config) *sharedQUICState {
 	sqtc := &sharedQUICState{
-		tlsConfs:      make(map[*tls.Config]contextAndCancelFunc),
-		activeTlsConf: tlsConfig,
+		tlsConfs: make(map[*tls.Config]contextAndCancelFunc),
 	}
-	sqtc.addState(tlsConfig)
+	if tlsConfig != nil {
+		sqtc.addState(tlsConfig)
+	}
 	return sqtc
 }
 
@@ -540,17 +541,39 @@ func newSharedQUICState(tlsConfig *tls.Config) *sharedQUICState {
 func (sqs *sharedQUICState) getConfigForClient(ch *tls.ClientHelloInfo) (*tls.Config, error) {
 	sqs.rmu.RLock()
 	defer sqs.rmu.RUnlock()
-	return sqs.activeTlsConf.GetConfigForClient(ch)
+
+	for _, tc := range sqs.tlsConfList {
+		if tc == nil || tc.GetConfigForClient == nil {
+			continue
+		}
+		cfg, err := tc.GetConfigForClient(ch)
+		if err != nil {
+			return nil, err
+		}
+		if cfg != nil {
+			return cfg, nil
+		}
+	}
+	return nil, nil
 }
 
 // getEncryptedClientHelloKeys is used as tls.Config's GetEncryptedClientHelloKeys field.
 func (sqs *sharedQUICState) getEncryptedClientHelloKeys(ch *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
 	sqs.rmu.RLock()
 	defer sqs.rmu.RUnlock()
-	if sqs.activeTlsConf.GetEncryptedClientHelloKeys == nil {
-		return nil, nil
+
+	var allKeys []tls.EncryptedClientHelloKey
+	for _, tc := range sqs.tlsConfList {
+		if tc == nil || tc.GetEncryptedClientHelloKeys == nil {
+			continue
+		}
+		keys, err := tc.GetEncryptedClientHelloKeys(ch)
+		if err != nil {
+			return nil, err
+		}
+		allKeys = append(allKeys, keys...)
 	}
-	return sqs.activeTlsConf.GetEncryptedClientHelloKeys(ch)
+	return allKeys, nil
 }
 
 // addState adds tls.Config and activeRequests to the map if not present and returns the corresponding context and its cancelFunc
@@ -570,20 +593,23 @@ func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, co
 		sqs.rmu.Lock()
 		defer sqs.rmu.Unlock()
 
+		if _, ok := sqs.tlsConfs[tlsConfig]; !ok {
+			return
+		}
 		delete(sqs.tlsConfs, tlsConfig)
-		if sqs.activeTlsConf == tlsConfig {
-			// select another tls.Config, if there is none,
-			// related sharedQuicListener will be destroyed anyway
-			for tc := range sqs.tlsConfs {
-				sqs.activeTlsConf = tc
+		for i, tc := range sqs.tlsConfList {
+			if tc == tlsConfig {
+				sqs.tlsConfList = append(sqs.tlsConfList[:i], sqs.tlsConfList[i+1:]...)
 				break
 			}
 		}
 	}
 	sqs.tlsConfs[tlsConfig] = contextAndCancelFunc{ctx, wrappedCancel}
+	sqs.tlsConfList = append(sqs.tlsConfList, tlsConfig)
+
 	// there should be at most 2 tls.Configs
-	if len(sqs.tlsConfs) > 2 {
-		Log().Warn("quic listener tls configs are more than 2", zap.Int("number of configs", len(sqs.tlsConfs)))
+	if len(sqs.tlsConfList) > 2 {
+		Log().Warn("quic listener tls configs are more than 2", zap.Int("number of configs", len(sqs.tlsConfList)))
 	}
 	return ctx, wrappedCancel
 }
