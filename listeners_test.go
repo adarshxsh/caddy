@@ -15,9 +15,13 @@
 package caddy
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 	"reflect"
 	"testing"
+
+	"github.com/quic-go/quic-go"
 
 	"github.com/caddyserver/caddy/v2/internal"
 )
@@ -190,7 +194,7 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 		},
 	}
 
-	sqs := newSharedQUICState(initialConfig)
+	sqs := newSharedQUICState(initialConfig, nil)
 
 	keys, err := sqs.getEncryptedClientHelloKeys(hello)
 	if err != nil {
@@ -209,7 +213,7 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 		},
 	}
 
-	_, cancel := sqs.addState(updatedConfig)
+	_, cancel := sqs.addState(updatedConfig, nil)
 	sqs.rmu.Lock()
 	sqs.activeTlsConf = updatedConfig
 	sqs.rmu.Unlock()
@@ -230,6 +234,139 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(keys, initialKeys) {
 		t.Fatalf("unexpected restored ECH keys: got %#v, want %#v", keys, initialKeys)
+	}
+}
+
+func TestSharedQUICState0RTT(t *testing.T) {
+	allowTrue := true
+	allowFalse := false
+
+	t.Run("default allow 0rtt", func(t *testing.T) {
+		cfg1 := &tls.Config{}
+		sqs := newSharedQUICState(cfg1, nil)
+		qcfg, err := sqs.getQUICConfigForClient(&quic.ClientInfo{})
+		if err != nil {
+			t.Fatalf("getQUICConfigForClient error: %v", err)
+		}
+		if !qcfg.Allow0RTT {
+			t.Errorf("expected Allow0RTT to be true by default, got false")
+		}
+	})
+
+	t.Run("explicitly disable 0rtt", func(t *testing.T) {
+		cfg1 := &tls.Config{}
+		sqs := newSharedQUICState(cfg1, &allowFalse)
+		qcfg, err := sqs.getQUICConfigForClient(&quic.ClientInfo{})
+		if err != nil {
+			t.Fatalf("getQUICConfigForClient error: %v", err)
+		}
+		if qcfg.Allow0RTT {
+			t.Errorf("expected Allow0RTT to be false, got true")
+		}
+	})
+
+	t.Run("multi-server strictness precedence and cancellation", func(t *testing.T) {
+		cfg1 := &tls.Config{}
+		cfg2 := &tls.Config{}
+		sqs := newSharedQUICState(cfg1, &allowTrue)
+
+		qcfg, _ := sqs.getQUICConfigForClient(&quic.ClientInfo{})
+		if !qcfg.Allow0RTT {
+			t.Fatalf("expected initial Allow0RTT to be true")
+		}
+
+		// Add second server with 0-RTT disabled
+		_, cancel2 := sqs.addState(cfg2, &allowFalse)
+		qcfg, _ = sqs.getQUICConfigForClient(&quic.ClientInfo{})
+		if qcfg.Allow0RTT {
+			t.Errorf("expected Allow0RTT to be false when any active server disables it")
+		}
+
+		// Cancel second server (shutdown)
+		cancel2(nil)
+		qcfg, _ = sqs.getQUICConfigForClient(&quic.ClientInfo{})
+		if !qcfg.Allow0RTT {
+			t.Errorf("expected Allow0RTT to return to true after disabling server cancels")
+		}
+	})
+
+	t.Run("in-place config reload updating 0rtt preference", func(t *testing.T) {
+		cfg1 := &tls.Config{}
+		sqs := newSharedQUICState(cfg1, &allowTrue)
+
+		qcfg, _ := sqs.getQUICConfigForClient(&quic.ClientInfo{})
+		if !qcfg.Allow0RTT {
+			t.Fatalf("expected initial Allow0RTT to be true")
+		}
+
+		// Reload same tls.Config with 0-RTT disabled
+		sqs.addState(cfg1, &allowFalse)
+		qcfg, _ = sqs.getQUICConfigForClient(&quic.ClientInfo{})
+		if qcfg.Allow0RTT {
+			t.Errorf("expected Allow0RTT to be false after in-place reload")
+		}
+	})
+}
+
+func TestListenQUICSharedSocket0RTT(t *testing.T) {
+	allowTrue := true
+	allowFalse := false
+
+	addr, err := ParseNetworkAddress("udp/127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to parse address: %v", err)
+	}
+
+	ctx := context.Background()
+	tlsConf1 := &tls.Config{}
+
+	// First server listens on address with 0-RTT enabled
+	l1, err := addr.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf1, nil, &allowTrue)
+	if err != nil {
+		t.Fatalf("ListenQUIC l1 failed: %v", err)
+	}
+	defer l1.Close()
+
+	sql1, ok := l1.(*fakeCloseQuicListener)
+	if !ok {
+		t.Fatalf("expected fakeCloseQuicListener, got %T", l1)
+	}
+
+	// Verify initial QUIC config
+	qcfg1, err := sql1.sharedQuicListener.sqs.getQUICConfigForClient(&quic.ClientInfo{})
+	if err != nil {
+		t.Fatalf("getQUICConfigForClient error: %v", err)
+	}
+	if !qcfg1.Allow0RTT {
+		t.Errorf("expected l1 Allow0RTT to be true")
+	}
+
+	// Second server listens on same address with 0-RTT disabled
+	tlsConf2 := &tls.Config{}
+	l2, err := addr.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf2, nil, &allowFalse)
+	if err != nil {
+		t.Fatalf("ListenQUIC l2 failed: %v", err)
+	}
+	defer l2.Close()
+
+	// Both listeners share the same underlying sqs
+	qcfg2, err := sql1.sharedQuicListener.sqs.getQUICConfigForClient(&quic.ClientInfo{})
+	if err != nil {
+		t.Fatalf("getQUICConfigForClient error: %v", err)
+	}
+	if qcfg2.Allow0RTT {
+		t.Errorf("expected shared Allow0RTT to be false after l2 attaches with Allow0RTT=false")
+	}
+
+	// Close l2 (simulating server 2 shutdown)
+	l2.Close()
+
+	qcfg3, err := sql1.sharedQuicListener.sqs.getQUICConfigForClient(&quic.ClientInfo{})
+	if err != nil {
+		t.Fatalf("getQUICConfigForClient error: %v", err)
+	}
+	if !qcfg3.Allow0RTT {
+		t.Errorf("expected shared Allow0RTT to return to true after l2 closes")
 	}
 }
 
