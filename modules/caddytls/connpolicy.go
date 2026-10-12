@@ -308,10 +308,11 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 			// to modify the context before passing it into CertMagic's GetCertificate
 			ctx := hello.Context()
 			if p.handshakeContext != nil {
-				ctx, err = p.handshakeContext.HandshakeContext(hello)
+				hcCtx, err := p.handshakeContext.HandshakeContext(hello)
 				if err != nil {
 					return nil, fmt.Errorf("handshake context: %v", err)
 				}
+				ctx = hcCtx
 			}
 
 			return cfg.GetCertificateWithContext(ctx, hello)
