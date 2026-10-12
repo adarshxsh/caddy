@@ -785,3 +785,213 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
 	}
 }
+
+// TestUnbufferedBodyTransportErrorNoRetry verifies that when an unbuffered
+// request body has been partially or fully read by an upstream, a subsequent
+// mid-stream non-dial transport error does NOT trigger a retry attempt.
+func TestUnbufferedBodyTransportErrorNoRetry(t *testing.T) {
+	var secondUpstreamCalls atomic.Int32
+
+	// First upstream: reads a few bytes from the request body then forcibly resets connection
+	resetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 5)
+		_, _ = io.ReadFull(r.Body, buf)
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		_ = conn.Close() // abrupt mid-stream reset
+	}))
+	t.Cleanup(resetServer.Close)
+
+	// Second upstream: should NOT be called
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondUpstreamCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("good"))
+	}))
+	t.Cleanup(goodServer.Close)
+
+	// RoundRobin picks index 1 first, then index 0.
+	// Put resetServer at index 1 and goodServer at index 0 so attempt 1 goes to resetServer.
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: resetServer.Listener.Addr().String()},
+	}
+
+	retryMatch := caddyhttp.MatcherSets{
+		caddyhttp.MatcherSet{
+			newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true"),
+		},
+	}
+
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+
+	bodyReader := newCloseOnCloseReader("hello world")
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+	req.Body = bodyReader
+	req.ContentLength = int64(len("hello world"))
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	if err == nil {
+		t.Fatalf("expected error from ServeHTTP due to transport reset, got nil")
+	}
+
+	if calls := secondUpstreamCalls.Load(); calls != 0 {
+		t.Errorf("second upstream called %d times; want 0 (retry should be blocked when body is partially read)", calls)
+	}
+}
+
+// TestUnbufferedBodyTransportErrorWithNoReadCanRetry verifies that if a non-dial
+// transport error occurs before any body bytes were consumed (b.read == 0, e.g. for a bodyless request),
+// configured retries are allowed to proceed.
+func TestUnbufferedBodyTransportErrorWithNoReadCanRetry(t *testing.T) {
+	var secondUpstreamCalls atomic.Int32
+
+	// First upstream: resets connection immediately
+	resetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(resetServer.Close)
+
+	// Second upstream: returns 200 OK
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondUpstreamCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(goodServer.Close)
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: resetServer.Listener.Addr().String()},
+	}
+
+	retryMatch := caddyhttp.MatcherSets{
+		caddyhttp.MatcherSet{
+			newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true"),
+		},
+	}
+
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	if err != nil {
+		t.Fatalf("expected no error from ServeHTTP, got: %v", err)
+	}
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	if rec.Body.String() != "ok" {
+		t.Errorf("body: got %q, want %q", rec.Body.String(), "ok")
+	}
+
+	if calls := secondUpstreamCalls.Load(); calls != 1 {
+		t.Errorf("second upstream called %d times; want 1", calls)
+	}
+}
+
+// TestBufferedBodyTransportErrorCanRetry verifies that fully buffered requests
+// (configured via RequestBuffers) continue to support retries across non-dial
+// transport errors even after the first upstream consumed body bytes.
+func TestBufferedBodyTransportErrorCanRetry(t *testing.T) {
+	var secondUpstreamCalls atomic.Int32
+
+	// First upstream: reads body bytes and then resets connection
+	resetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 5)
+		_, _ = io.ReadFull(r.Body, buf)
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(resetServer.Close)
+
+	// Second upstream: reads full body and returns 200 OK
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondUpstreamCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(goodServer.Close)
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: resetServer.Listener.Addr().String()},
+	}
+
+	retryMatch := caddyhttp.MatcherSets{
+		caddyhttp.MatcherSet{
+			newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true"),
+		},
+	}
+
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+	h.RequestBuffers = 1024
+
+	bodyReader := newCloseOnCloseReader("hello world")
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+	req.Body = bodyReader
+	req.ContentLength = int64(len("hello world"))
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	if err != nil {
+		t.Fatalf("expected no error from ServeHTTP, got: %v", err)
+	}
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	if rec.Body.String() != "hello world" {
+		t.Errorf("body: got %q, want %q", rec.Body.String(), "hello world")
+	}
+
+	if calls := secondUpstreamCalls.Load(); calls != 1 {
+		t.Errorf("second upstream called %d times; want 1", calls)
+	}
+}
