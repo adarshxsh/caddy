@@ -16,6 +16,7 @@ package caddy
 
 import (
 	"crypto/tls"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -210,16 +211,14 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 
 	_, cancel := sqs.addState(updatedConfig)
-	sqs.rmu.Lock()
-	sqs.activeTlsConf = updatedConfig
-	sqs.rmu.Unlock()
 
+	expectedAggregated := append(append([]tls.EncryptedClientHelloKey{}, initialKeys...), updatedKeys...)
 	keys, err = sqs.getEncryptedClientHelloKeys(hello)
 	if err != nil {
-		t.Fatalf("getting updated ECH keys: %v", err)
+		t.Fatalf("getting aggregated ECH keys: %v", err)
 	}
-	if !reflect.DeepEqual(keys, updatedKeys) {
-		t.Fatalf("unexpected updated ECH keys: got %#v, want %#v", keys, updatedKeys)
+	if !reflect.DeepEqual(keys, expectedAggregated) {
+		t.Fatalf("unexpected aggregated ECH keys: got %#v, want %#v", keys, expectedAggregated)
 	}
 
 	cancel(nil)
@@ -230,6 +229,95 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(keys, initialKeys) {
 		t.Fatalf("unexpected restored ECH keys: got %#v, want %#v", keys, initialKeys)
+	}
+}
+
+func TestSharedQUICStateGetConfigForClient(t *testing.T) {
+	matchedCfg1 := &tls.Config{ServerName: "domain1.com"}
+	matchedCfg2 := &tls.Config{ServerName: "domain2.com"}
+
+	cfg1 := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "domain1.com" {
+				return matchedCfg1, nil
+			}
+			return nil, nil
+		},
+	}
+
+	cfg2 := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "domain2.com" {
+				return matchedCfg2, nil
+			}
+			return nil, nil
+		},
+	}
+
+	sqs := newSharedQUICState(cfg1)
+	_, cancel2 := sqs.addState(cfg2)
+
+	// Test SNI matching for primary server
+	res1, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domain1.com"})
+	if err != nil {
+		t.Fatalf("unexpected error for domain1.com: %v", err)
+	}
+	if res1 != matchedCfg1 {
+		t.Fatalf("expected matchedCfg1, got %#v", res1)
+	}
+
+	// Test SNI matching for secondary server on shared socket
+	res2, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domain2.com"})
+	if err != nil {
+		t.Fatalf("unexpected error for domain2.com: %v", err)
+	}
+	if res2 != matchedCfg2 {
+		t.Fatalf("expected matchedCfg2, got %#v", res2)
+	}
+
+	// Test unmatched domain returns nil, nil
+	res3, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domain3.com"})
+	if err != nil {
+		t.Fatalf("unexpected error for domain3.com: %v", err)
+	}
+	if res3 != nil {
+		t.Fatalf("expected nil for domain3.com, got %#v", res3)
+	}
+
+	// Test error propagation stopping iteration
+	errRefused := errors.New("connection refused")
+	cfgErr := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "error.com" {
+				return nil, errRefused
+			}
+			return nil, nil
+		},
+	}
+	sqs.addState(cfgErr)
+
+	_, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "error.com"})
+	if !errors.Is(err, errRefused) {
+		t.Fatalf("expected error %v, got %v", errRefused, err)
+	}
+
+	// Test context cancellation unregisters configuration
+	cancel2(nil)
+	res2AfterCancel, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domain2.com"})
+	if err != nil {
+		t.Fatalf("unexpected error for domain2.com after cancel: %v", err)
+	}
+	if res2AfterCancel != nil {
+		t.Fatalf("expected nil for domain2.com after cancel, got %#v", res2AfterCancel)
+	}
+
+	// Verify primary server configuration still works
+	res1AfterCancel, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domain1.com"})
+	if err != nil {
+		t.Fatalf("unexpected error for domain1.com after cancel: %v", err)
+	}
+	if res1AfterCancel != matchedCfg1 {
+		t.Fatalf("expected matchedCfg1 after cancel, got %#v", res1AfterCancel)
 	}
 }
 
