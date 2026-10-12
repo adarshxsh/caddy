@@ -3,10 +3,12 @@ package reverseproxy
 import (
 	"bytes"
 	"io"
+	"net"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -74,9 +76,115 @@ func TestSwitchProtocolCopierDefaultBufferSize(t *testing.T) {
 	}
 }
 
+func TestSwitchProtocolCopierWriteDeadline(t *testing.T) {
+	clientRead, clientWrite := net.Pipe()
+	backendRead, backendWrite := net.Pipe()
+	defer clientRead.Close()
+	defer clientWrite.Close()
+	defer backendRead.Close()
+	defer backendWrite.Close()
+
+	var wg sync.WaitGroup
+	errc := make(chan error, 2)
+
+	copier := switchProtocolCopier{
+		user:         clientWrite,
+		backend:      backendRead,
+		wg:           &wg,
+		writeTimeout: 30 * time.Millisecond,
+	}
+
+	wg.Add(1)
+	go copier.copyFromBackend(errc)
+
+	// Backend sends data
+	go func() {
+		_, _ = backendWrite.Write([]byte("backend payload"))
+	}()
+
+	// Downstream client does NOT read from clientRead, causing write stall.
+	// The write deadline should kick in after 30ms.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("expected write deadline error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for write deadline error")
+	}
+
+	select {
+	case <-done:
+		// wg.Wait() completed promptly
+	case <-time.After(2 * time.Second):
+		t.Fatal("wg.Wait() hung during write stall")
+	}
+}
+
+func TestSwitchProtocolCopierAsymmetricBackpressure(t *testing.T) {
+	clientRead, clientWrite := net.Pipe()
+	backendRead, backendWrite := net.Pipe()
+	defer clientRead.Close()
+	defer clientWrite.Close()
+	defer backendRead.Close()
+	defer backendWrite.Close()
+
+	var wg sync.WaitGroup
+	errc := make(chan error, 2)
+
+	copier := switchProtocolCopier{
+		user:         clientWrite,
+		backend:      backendRead,
+		wg:           &wg,
+		writeTimeout: 30 * time.Millisecond,
+	}
+
+	wg.Add(2)
+	go copier.copyToBackend(errc)
+	go copier.copyFromBackend(errc)
+
+	// Backend continually sends data
+	go func() {
+		_, _ = backendWrite.Write([]byte("frame 1"))
+	}()
+
+	// Client does NOT read from clientRead (stalled client)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("expected error from copier during stall")
+		}
+		// Close connections on first error (simulating handleUpgradeResponse teardown)
+		_ = clientWrite.Close()
+		_ = backendRead.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for copier error during backpressure")
+	}
+
+	select {
+	case <-done:
+		// All goroutines cleaned up cleanly
+	case <-time.After(2 * time.Second):
+		t.Fatal("wg.Wait() hung, goroutine leak detected")
+	}
+}
+
 type nopReadWriteCloser struct {
 	io.Reader
 	io.Writer
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
