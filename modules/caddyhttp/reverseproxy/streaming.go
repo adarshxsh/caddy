@@ -211,29 +211,58 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		bufferSize: h.StreamBufferSize,
 	}
 
-	// setup the timeout if requested
-	var timeoutc <-chan time.Time
-	if h.StreamTimeout > 0 {
-		timer := time.NewTimer(time.Duration(h.StreamTimeout))
-		defer timer.Stop()
-		timeoutc = timer.C
-	}
-
 	// when a stream timeout is encountered, no error will be read from errc
 	// a buffer size of 2 will allow both the read and write goroutines to send the error and exit
 	// see: https://github.com/caddyserver/caddy/issues/7418
 	errc := make(chan error, 2)
+
+	var activityChan chan struct{}
+	if h.StreamTimeout > 0 {
+		activityChan = make(chan struct{}, 1)
+		onActivity := func() {
+			select {
+			case activityChan <- struct{}{}:
+			default:
+			}
+		}
+		spc.user = &activityRWC{ReadWriteCloser: conn, onActivity: onActivity}
+		spc.backend = &activityRWC{ReadWriteCloser: backConn, onActivity: onActivity}
+	}
+
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
+
+	if h.StreamTimeout > 0 {
+		timer := time.NewTimer(time.Duration(h.StreamTimeout))
+		defer timer.Stop()
+
+		for {
+			select {
+			case err := <-errc:
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				return
+			case <-activityChan:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(time.Duration(h.StreamTimeout))
+			case t := <-timer.C:
+				if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+					c.Write(zap.Time("timeout", t))
+				}
+				return
+			}
+		}
+	} else {
+		err := <-errc
 		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
 			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
 		}
 	}
 }
@@ -381,7 +410,13 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 // The caller should call the returned delete() function when the
 // connection is done to remove it from memory.
 func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (del func()) {
+	if h.connectionsMu == nil {
+		return func() {}
+	}
 	h.connectionsMu.Lock()
+	if h.connections == nil {
+		h.connections = make(map[io.ReadWriteCloser]openConnection)
+	}
 	h.connections[conn] = openConnection{conn, gracefulClose}
 	h.connectionsMu.Unlock()
 	return func() {
@@ -634,6 +669,27 @@ func (m *maxLatencyWriter) stop() {
 	if m.t != nil {
 		m.t.Stop()
 	}
+}
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	onActivity func()
+}
+
+func (a *activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
+}
+
+func (a *activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
 }
 
 // switchProtocolCopier exists so goroutines proxying data back and
