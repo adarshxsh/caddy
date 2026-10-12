@@ -296,3 +296,61 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLazyUUIDAllocation(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	repl := caddy.NewReplacer()
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, VarsCtxKey, vars)
+	ctx = context.WithValue(ctx, ExtraLogFieldsCtxKey, new(ExtraLogFields))
+	req = req.WithContext(ctx)
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Verify that "uuid" is NOT present in vars map prior to explicit access
+	if _, exists := vars["uuid"]; exists {
+		t.Fatalf("expected 'uuid' not to be set in vars map prior to explicit access")
+	}
+
+	// Access "uuid" via GetVar
+	val1 := GetVar(req.Context(), "uuid")
+	if val1 == nil {
+		t.Fatalf("expected GetVar to return non-nil requestID")
+	}
+	id1, ok := val1.(*requestID)
+	if !ok {
+		t.Fatalf("expected GetVar to return *requestID, got %T", val1)
+	}
+
+	// Verify it is now cached in vars map
+	val2, exists := vars["uuid"]
+	if !exists || val2 != id1 {
+		t.Fatalf("expected 'uuid' to be cached in vars map")
+	}
+
+	// Access "uuid" via placeholder evaluation
+	gotUUID, ok := repl.GetString("http.request.uuid")
+	if !ok || gotUUID == "" {
+		t.Fatalf("expected repl.GetString('http.request.uuid') to return valid UUID string")
+	}
+
+	if gotUUID != id1.String() {
+		t.Fatalf("expected placeholder UUID %q to match id1 %q", gotUUID, id1.String())
+	}
+}
+
+func BenchmarkAddHTTPVarsToReplacer(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+	}
+}
