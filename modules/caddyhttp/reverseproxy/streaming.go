@@ -57,6 +57,10 @@ func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+func (rwc h2ReadWriteCloser) SetWriteDeadline(t time.Time) error {
+	return http.NewResponseController(rwc.ResponseWriter).SetWriteDeadline(t)
+}
+
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
@@ -204,12 +208,19 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
-	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         wg,
-		bufferSize: h.StreamBufferSize,
+	writeTimeout := time.Duration(h.StreamTimeout)
+	if writeTimeout <= 0 {
+		writeTimeout = defaultWriteDeadline
 	}
+
+	spc := switchProtocolCopier{
+		user:         conn,
+		backend:      backConn,
+		wg:           wg,
+		bufferSize:   h.StreamBufferSize,
+		writeTimeout: writeTimeout,
+	}
+
 
 	// setup the timeout if requested
 	var timeoutc <-chan time.Time
@@ -636,24 +647,80 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+type writeDeadliner interface {
+	SetWriteDeadline(t time.Time) error
+}
+
+type responseWriterDeadliner struct {
+	rw http.ResponseWriter
+}
+
+func (r responseWriterDeadliner) SetWriteDeadline(t time.Time) error {
+	return http.NewResponseController(r.rw).SetWriteDeadline(t)
+}
+
+func getWriteDeadliner(w io.Writer) writeDeadliner {
+	if d, ok := w.(writeDeadliner); ok {
+		return d
+	}
+	if rw, ok := w.(http.ResponseWriter); ok {
+		return responseWriterDeadliner{rw}
+	}
+	return nil
+}
+
+type writeDeadlineWriter struct {
+	w       io.Writer
+	timeout time.Duration
+	dl      writeDeadliner
+}
+
+func (w writeDeadlineWriter) Write(p []byte) (n int, err error) {
+	if w.timeout > 0 && w.dl != nil {
+		_ = w.dl.SetWriteDeadline(time.Now().Add(w.timeout))
+	}
+	return w.w.Write(p)
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
 	user, backend io.ReadWriteCloser
 	wg            *sync.WaitGroup
 	bufferSize    int
+	writeTimeout  time.Duration
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	_, err := io.CopyBuffer(c.wrapWriter(c.user), c.backend, c.buffer())
 	errc <- err
-	c.wg.Done()
+	if c.wg != nil {
+		c.wg.Done()
+	}
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	_, err := io.CopyBuffer(c.wrapWriter(c.backend), c.user, c.buffer())
 	errc <- err
-	c.wg.Done()
+	if c.wg != nil {
+		c.wg.Done()
+	}
+}
+
+func (c switchProtocolCopier) wrapWriter(w io.Writer) io.Writer {
+	timeout := c.writeTimeout
+	if timeout <= 0 {
+		timeout = defaultWriteDeadline
+	}
+	dl := getWriteDeadliner(w)
+	if dl == nil {
+		return w
+	}
+	return writeDeadlineWriter{
+		w:       w,
+		timeout: timeout,
+		dl:      dl,
+	}
 }
 
 func (c switchProtocolCopier) buffer() []byte {
@@ -676,6 +743,7 @@ var streamingBufPool = sync.Pool{
 }
 
 const (
-	defaultBufferSize = 32 * 1024
-	wordSize          = int(unsafe.Sizeof(uintptr(0)))
+	defaultBufferSize    = 32 * 1024
+	defaultWriteDeadline = 10 * time.Second
+	wordSize             = int(unsafe.Sizeof(uintptr(0)))
 )
