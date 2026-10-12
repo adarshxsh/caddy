@@ -19,7 +19,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -360,4 +362,74 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+type mockHandshakeContext struct{}
+
+func (m mockHandshakeContext) HandshakeContext(hello *tls.ClientHelloInfo) (context.Context, error) {
+	ctx := hello.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, "testKey", "testVal"), nil
+}
+
+type dummyConn struct {
+	net.Conn
+}
+
+func (dummyConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345}
+}
+
+func (dummyConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443}
+}
+
+func TestGetCertificateHandshakeContextDataRace(t *testing.T) {
+	var cfg caddy.Config
+	caddyCtx, err := caddy.ProvisionContext(&cfg)
+	if err != nil {
+		t.Fatalf("ProvisionContext error: %v", err)
+	}
+
+	tlsAppIface, err := caddyCtx.App("tls")
+	if err != nil {
+		t.Fatalf("App tls error: %v", err)
+	}
+	tlsApp := tlsAppIface.(*TLS)
+	if err := tlsApp.Provision(caddyCtx); err != nil {
+		t.Fatalf("tlsApp.Provision error: %v", err)
+	}
+	defer tlsApp.Cleanup()
+
+	pol := &ConnectionPolicy{
+		handshakeContext: mockHandshakeContext{},
+	}
+
+	err = pol.buildStandardTLSConfig(caddyCtx)
+	if err != nil {
+		t.Fatalf("buildStandardTLSConfig error: %v", err)
+	}
+
+	if pol.TLSConfig == nil || pol.TLSConfig.GetCertificate == nil {
+		t.Fatal("expected non-nil TLSConfig and GetCertificate")
+	}
+
+	var wg sync.WaitGroup
+	const goroutines = 20
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			hello := &tls.ClientHelloInfo{
+				ServerName: fmt.Sprintf("example-%d.com", id),
+				Conn:       dummyConn{},
+			}
+			_, _ = pol.TLSConfig.GetCertificate(hello)
+		}(i)
+	}
+
+	wg.Wait()
 }
