@@ -484,6 +484,42 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123)
+	rep.Set("v1", "val1")
+	rep.Set("v2", "val2")
+	rep.Set("v3", "val3")
+	rep.Set("v4", "val4")
+	rep.Set("v5", "val5")
+
+	// 1. Inputs with no placeholders must be 0 allocs/op
+	noPlaceholderInput := "simple string without any placeholders"
+	allocsNoPH := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll(noPlaceholderInput, "")
+	})
+	if allocsNoPH != 0 {
+		t.Errorf("Expected 0 allocs/op for input with no placeholders, got %f", allocsNoPH)
+	}
+
+	// 2. Single-variable replacement allocation bounds
+	allocsSingle := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("str={str}", "")
+	})
+	if allocsSingle > 2 {
+		t.Errorf("Expected single-variable ReplaceAll allocs <= 2, got %f", allocsSingle)
+	}
+
+	// 3. Multi-variable replacement allocation bounds
+	allocsMulti := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("v1={v1} v2={v2} v3={v3} v4={v4} v5={v5}", "")
+	})
+	if allocsMulti > 5 {
+		t.Errorf("Expected multi-variable ReplaceAll allocs <= 5, got %f", allocsMulti)
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
@@ -492,35 +528,90 @@ func BenchmarkReplacer(b *testing.B) {
 	rep := testReplacer()
 	rep.Set("str", "a string")
 	rep.Set("int", 123.456)
+	rep.Set("key1", "val1")
+	rep.Set("key2", "val2")
+	rep.Set("key3", "val3")
+	rep.Set("key4", "val4")
+	rep.Set("key5", "val5")
+	rep.Set("key6", "val6")
+	rep.Set("key7", "val7")
+	rep.Set("key8", "val8")
 
 	for _, bm := range []testCase{
 		{
-			name:  "no placeholder",
+			name:  "NoPlaceholder",
 			input: `simple string`,
 		},
 		{
-			name:  "string replacement",
+			name:  "StringReplacement",
 			input: `str={str}`,
 		},
 		{
-			name:  "int replacement",
+			name:  "IntReplacement",
 			input: `int={int}`,
 		},
 		{
-			name:  "placeholder",
+			name:  "Placeholder",
 			input: `{"json": "object"}`,
 		},
 		{
-			name:  "escaped placeholder",
+			name:  "EscapedPlaceholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
+		},
+		{
+			name:  "MultiPlaceholder",
+			input: `key1={key1} key2={key2} key3={key3} key4={key4} key5={key5} key6={key6} key7={key7} key8={key8}`,
 		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
 	}
+
+	b.Run("Lifecycle/NewReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = NewReplacer()
+		}
+	})
+
+	b.Run("Lifecycle/NewEmptyReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = NewEmptyReplacer()
+		}
+	})
+
+	b.Run("Lifecycle/WithoutFile", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = NewReplacer().WithoutFile()
+		}
+	})
+
+	b.Run("Parallel/ConcurrentAccess", func(b *testing.B) {
+		b.ReportAllocs()
+		pRep := testReplacer()
+		pRep.Set("str", "a string")
+		pRep.Set("int", 123.456)
+		pRep.Set("host", "example.com")
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				if i%10 == 0 {
+					pRep.Set("dynamic", i)
+				} else if i%5 == 0 {
+					_, _ = pRep.Get("host")
+				} else {
+					_ = pRep.ReplaceAll("host={host} str={str} int={int}", "")
+				}
+				i++
+			}
+		})
+	})
 }
 
 func testReplacer() Replacer {
