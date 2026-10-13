@@ -490,6 +490,22 @@ import ./conf.d/matcher_not_my_subnet.caddy
 	order appsec after crowdsec
 }`,
 		},
+		{
+			description: "unspaced double quotes with braces",
+			input:       `key="foo { bar }"`,
+			expect:      `key="foo { bar }"`,
+		},
+		{
+			description: "unspaced double quotes in block directives",
+			input: `site.com {
+	header_up Host"{host}"
+	key="foo { bar }"
+}`,
+			expect: `site.com {
+	header_up Host"{host}"
+	key="foo { bar }"
+}`,
+		},
 	} {
 		// the formatter should output a trailing newline,
 		// even if the tests aren't written to expect that
