@@ -376,6 +376,14 @@ EOF
 			},
 		},
 		{
+			input: []byte("not-a-heredoc\t<<\t>>"),
+			expected: []Token{
+				{Line: 1, Text: `not-a-heredoc`},
+				{Line: 1, Text: `<<`},
+				{Line: 1, Text: `>>`},
+			},
+		},
+		{
 			input: []byte(`not-a-heredoc <<HERE SAME LINE
 	content
 	HERE same-line-arg
