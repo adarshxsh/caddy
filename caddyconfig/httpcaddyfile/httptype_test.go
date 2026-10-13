@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -297,4 +298,85 @@ func TestDefaultSNIWithoutHTTPS(t *testing.T) {
 	if !found {
 		t.Errorf("Expected default_sni 'my-sni.com' in TLS connection policies, but it was missing. Generated JSON: %s", string(result))
 	}
+}
+
+func TestNilOptionsMapHandling(t *testing.T) {
+	st := ServerType{}
+
+	t.Run("ServerType.Setup with nil options", func(t *testing.T) {
+		caddyfileInput := `{
+			email test@example.com
+		}
+		&(my_route) {
+			respond "hello"
+		}
+		localhost:8080 {
+			invoke my_route
+		}`
+		serverBlocks, err := caddyfile.Parse("Caddyfile", []byte(caddyfileInput))
+		if err != nil {
+			t.Fatalf("unexpected parse error: %v", err)
+		}
+
+		cfg, warnings, err := st.Setup(serverBlocks, nil)
+		if err != nil {
+			t.Fatalf("unexpected Setup error with nil options: %v", err)
+		}
+		if cfg == nil {
+			t.Fatalf("expected non-nil config")
+		}
+		_ = warnings
+	})
+
+	t.Run("evaluateGlobalOptionsBlock with nil options", func(t *testing.T) {
+		caddyfileInput := `{
+			email test@example.com
+			admin off
+		}
+		localhost:8080`
+		serverBlocks, err := caddyfile.Parse("Caddyfile", []byte(caddyfileInput))
+		if err != nil {
+			t.Fatalf("unexpected parse error: %v", err)
+		}
+
+		sb := make([]serverBlock, len(serverBlocks))
+		for i, s := range serverBlocks {
+			sb[i] = serverBlock{block: s, pile: make(map[string][]ConfigValue)}
+		}
+
+		remaining, err := st.evaluateGlobalOptionsBlock(sb, nil)
+		if err != nil {
+			t.Fatalf("unexpected evaluateGlobalOptionsBlock error with nil options: %v", err)
+		}
+		if len(remaining) != 1 {
+			t.Errorf("expected 1 remaining server block, got %d", len(remaining))
+		}
+	})
+
+	t.Run("extractNamedRoutes with nil options", func(t *testing.T) {
+		caddyfileInput := `&(my_route) {
+			respond "hello"
+		}
+		localhost:8080`
+		serverBlocks, err := caddyfile.Parse("Caddyfile", []byte(caddyfileInput))
+		if err != nil {
+			t.Fatalf("unexpected parse error: %v", err)
+		}
+
+		sb := make([]serverBlock, len(serverBlocks))
+		for i, s := range serverBlocks {
+			sb[i] = serverBlock{block: s, pile: make(map[string][]ConfigValue)}
+		}
+
+		var warnings []caddyconfig.Warning
+		replacer := NewShorthandReplacer()
+
+		remaining, err := st.extractNamedRoutes(sb, nil, &warnings, replacer)
+		if err != nil {
+			t.Fatalf("unexpected extractNamedRoutes error with nil options: %v", err)
+		}
+		if len(remaining) != 1 {
+			t.Errorf("expected 1 remaining server block, got %d", len(remaining))
+		}
+	})
 }
