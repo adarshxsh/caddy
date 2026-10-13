@@ -261,21 +261,33 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return or.RequestURI, true
 			case "http.request.orig_uri.path":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if or.URL == nil {
+					return "", true
+				}
 				return or.URL.Path, true
 			case "http.request.orig_uri.path.file":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if or.URL == nil {
+					return "", true
+				}
 				_, file := path.Split(or.URL.Path)
 				return file, true
 			case "http.request.orig_uri.path.dir":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if or.URL == nil {
+					return "", true
+				}
 				dir, _ := path.Split(or.URL.Path)
 				return dir, true
 			case "http.request.orig_uri.query":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if or.URL == nil {
+					return "", true
+				}
 				return or.URL.RawQuery, true
 			case "http.request.orig_uri.prefixed_query":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				if or.URL.RawQuery == "" {
+				if or.URL == nil || or.URL.RawQuery == "" {
 					return "", true
 				}
 				return "?" + or.URL.RawQuery, true
@@ -358,6 +370,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 					return "", false
 				}
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if or.URL == nil {
+					return "", true
+				}
 				pathParts := strings.Split(or.URL.Path, "/")
 				if len(pathParts) > 0 && pathParts[0] == "" {
 					pathParts = pathParts[1:]

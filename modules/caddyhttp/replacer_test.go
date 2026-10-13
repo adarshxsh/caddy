@@ -255,6 +255,38 @@ eqp31wM9il1n+guTNyxJd+FzVAH+hCZE5K+tCgVDdVFUlDEHHbS/wqb2PSIoouLV
 			get:    "http.request.tls.client.certificate_pem",
 			expect: string(clientCert) + "\n", // returned value comes with a newline appended to it
 		},
+		{
+			get:    "http.request.orig_method",
+			expect: "",
+		},
+		{
+			get:    "http.request.orig_uri",
+			expect: "",
+		},
+		{
+			get:    "http.request.orig_uri.path",
+			expect: "",
+		},
+		{
+			get:    "http.request.orig_uri.path.file",
+			expect: "",
+		},
+		{
+			get:    "http.request.orig_uri.path.dir",
+			expect: "",
+		},
+		{
+			get:    "http.request.orig_uri.query",
+			expect: "",
+		},
+		{
+			get:    "http.request.orig_uri.prefixed_query",
+			expect: "",
+		},
+		{
+			get:    "http.request.orig_uri.path.0",
+			expect: "",
+		},
 	} {
 		actual, got := repl.GetString(tc.get)
 		if !got {
