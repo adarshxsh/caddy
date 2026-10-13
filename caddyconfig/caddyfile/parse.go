@@ -563,11 +563,13 @@ func (p *parser) doImport(nesting int) error {
 			continue
 		}
 
-		foundVariadic, startIndex, endIndex := parseVariadic(token, len(args))
-		if foundVariadic {
-			for _, arg := range args[startIndex:endIndex] {
-				token.Text = arg
-				tokensCopy = append(tokensCopy, token)
+		isVariadic, valid, startIndex, endIndex := parseVariadic(token, len(args))
+		if isVariadic {
+			if valid {
+				for _, arg := range args[startIndex:endIndex] {
+					token.Text = arg
+					tokensCopy = append(tokensCopy, token)
+				}
 			}
 		} else {
 			token.Text = repl.ReplaceKnown(token.Text, "")
