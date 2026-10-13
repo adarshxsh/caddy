@@ -74,26 +74,49 @@ func replaceEnvVars(input []byte) []byte {
 			break
 		}
 		begin += offset // make beginning relative to input, not offset
-		end := bytes.Index(input[begin+len(spanOpen):], spanClose)
-		if end < 0 {
-			break
+
+		depth := 1
+		end := -1
+		for i := begin + len(spanOpen); i < len(input); i++ {
+			switch input[i] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+			if end >= 0 {
+				break
+			}
 		}
-		end += begin + len(spanOpen) // make end relative to input, not begin
+
+		if end < 0 {
+			offset = begin + len(spanOpen)
+			continue
+		}
 
 		// get the name; if there is no name, skip it
-		envString := input[begin+len(spanOpen) : end]
-		if len(envString) == 0 {
+		rawContent := input[begin+len(spanOpen) : end]
+		if len(rawContent) == 0 {
 			offset = end + len(spanClose)
 			continue
 		}
 
-		// split the string into a key and an optional default
-		envParts := strings.SplitN(string(envString), envVarDefaultDelimiter, 2)
+		// expand any nested {$...} placeholders inside rawContent first
+		if bytes.Index(rawContent, spanOpen) >= 0 {
+			rawContent = replaceEnvVars(rawContent)
+		}
+
+		// split rawContent into a key and an optional default
+		key, defaultValue, hasDefault := splitEnvDefault(rawContent)
 
 		// do a lookup for the env var, replace with the default if not found
-		envVarValue, found := os.LookupEnv(envParts[0])
-		if !found && len(envParts) == 2 {
-			envVarValue = envParts[1]
+		envVarValue, found := os.LookupEnv(key)
+		if !found && hasDefault {
+			envVarValue = defaultValue
 		}
 
 		// get the value of the environment variable
@@ -108,6 +131,23 @@ func replaceEnvVars(input []byte) []byte {
 		offset = begin + len(envVarBytes)
 	}
 	return input
+}
+
+func splitEnvDefault(content []byte) (key string, defaultValue string, hasDefault bool) {
+	var depth int
+	for i := 0; i < len(content); i++ {
+		switch content[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+		case ':':
+			if depth == 0 {
+				return string(content[:i]), string(content[i+1:]), true
+			}
+		}
+	}
+	return string(content), "", false
 }
 
 type parser struct {
