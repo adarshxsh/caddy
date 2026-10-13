@@ -1645,13 +1645,14 @@ func encodeMatcherSet(matchers map[string]caddyhttp.RequestMatcherWithError) (ca
 // predefined shorthands.
 func WasReplacedPlaceholderShorthand(token string) string {
 	prev := ""
+	tokenNoDefault := strings.Split(strings.Trim(token, "{}"), ":")[0]
 	for i, item := range placeholderShorthands() {
 		// only look at every 2nd item, which is the replacement
 		if i%2 == 0 {
 			prev = item
 			continue
 		}
-		if strings.Trim(token, "{}") == strings.Trim(item, "{}") {
+		if tokenNoDefault == strings.Trim(item, "{}") {
 			// we return the original shorthand so it
 			// can be used for an error message
 			return prev

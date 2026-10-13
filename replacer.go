@@ -103,7 +103,27 @@ func (r *Replacer) Get(variable string) (any, bool) {
 			return val, true
 		}
 	}
+	if idx := strings.Index(variable, ":"); idx != -1 {
+		lookupKey := variable[:idx]
+		if isValidPlaceholderKey(lookupKey) {
+			defaultVal := variable[idx+1:]
+			if val, found := r.Get(lookupKey); found && ToString(val) != "" {
+				return val, true
+			}
+			if strings.Contains(defaultVal, string(phOpen)) {
+				return r.ReplaceAll(defaultVal, ""), true
+			}
+			return defaultVal, true
+		}
+	}
 	return nil, false
+}
+
+func isValidPlaceholderKey(key string) bool {
+	if len(key) == 0 {
+		return false
+	}
+	return !strings.ContainsAny(key, `"'{}`)
 }
 
 // GetString is the same as Get, but coerces the value to a
@@ -229,11 +249,33 @@ scan:
 			end += nextEnd + 1
 		}
 
+		// if key contains open brace, find matching closing brace to balance braces
+		if strings.Contains(input[i+1:end], string(phOpen)) {
+			depth := 0
+			for j := i; j < len(input); j++ {
+				if j > 0 && input[j-1] == phEscape {
+					continue
+				}
+				if input[j] == phOpen {
+					depth++
+				} else if input[j] == phClose {
+					depth--
+					if depth == 0 {
+						end = j
+						break
+					}
+				}
+			}
+		}
+
 		// write the substring from the last cursor to this point
 		sb.WriteString(input[lastWriteCursor:i])
 
 		// trim opening bracket
 		key := input[i+1 : end]
+		if strings.Contains(key, string(phOpen)) {
+			key = r.ReplaceAll(key, "")
+		}
 
 		// try to get a value for this key, handle empty values accordingly
 		val, found := r.Get(key)
