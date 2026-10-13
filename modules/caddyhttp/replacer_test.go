@@ -296,3 +296,27 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPVarReplacementMissingLocalAddr(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/foo", nil)
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	for _, ph := range []string{
+		"http.request.local",
+		"http.request.local.host",
+		"http.request.local.port",
+	} {
+		val, recognized := repl.GetString(ph)
+		if !recognized {
+			t.Errorf("Expected placeholder %q to be recognized", ph)
+		}
+		if val != "" {
+			t.Errorf("Expected placeholder %q to evaluate to empty string, got %q", ph, val)
+		}
+	}
+}
+
