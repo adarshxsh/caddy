@@ -26,6 +26,7 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -57,6 +58,52 @@ func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+type lockedReadWriteCloser struct {
+	io.ReadWriteCloser
+	mu sync.Mutex
+}
+
+func (l *lockedReadWriteCloser) Write(p []byte) (n int, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ReadWriteCloser.Write(p)
+}
+
+func (l *lockedReadWriteCloser) Unwrap() io.ReadWriteCloser {
+	return l.ReadWriteCloser
+}
+
+type lockedConn struct {
+	net.Conn
+	mu sync.Mutex
+}
+
+func (l *lockedConn) Write(p []byte) (n int, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.Conn.Write(p)
+}
+
+func (l *lockedConn) Unwrap() io.ReadWriteCloser {
+	return l.Conn
+}
+
+func newLockedReadWriteCloser(rwc io.ReadWriteCloser) io.ReadWriteCloser {
+	if rwc == nil {
+		return nil
+	}
+	if _, ok := rwc.(*lockedReadWriteCloser); ok {
+		return rwc
+	}
+	if _, ok := rwc.(*lockedConn); ok {
+		return rwc
+	}
+	if nc, ok := rwc.(net.Conn); ok {
+		return &lockedConn{Conn: nc}
+	}
+	return &lockedReadWriteCloser{ReadWriteCloser: rwc}
+}
+
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
@@ -84,6 +131,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		logger.Error("internal error: 101 switching protocols response with non-writable body")
 		return
 	}
+	backConn = newLockedReadWriteCloser(backConn)
 
 	// write header first, response headers should not be counted in size
 	// like the rest of handler chain.
@@ -115,7 +163,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			}
 			return
 		}
-		conn = h2ReadWriteCloser{req.Body, rw}
+		conn = newLockedReadWriteCloser(h2ReadWriteCloser{req.Body, rw})
 		// bufio is not needed, use minimal buffer
 		brw = bufio.NewReadWriter(bufio.NewReaderSize(conn, 1), bufio.NewWriterSize(conn, 1))
 	} else {
@@ -141,6 +189,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			}
 			return
 		}
+		conn = newLockedReadWriteCloser(conn)
 	}
 
 	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
