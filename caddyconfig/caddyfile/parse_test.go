@@ -636,6 +636,9 @@ func TestParseAll(t *testing.T) {
 func TestEnvironmentReplacement(t *testing.T) {
 	os.Setenv("FOOBAR", "foobar")
 	os.Setenv("CHAINED", "$FOOBAR")
+	os.Setenv("NAME", "FOO")
+	os.Setenv("PREFIX_FOO", "bar")
+	os.Setenv("MY_HOST_SET", "example.com")
 
 	for i, test := range []struct {
 		input  string
@@ -720,6 +723,38 @@ func TestEnvironmentReplacement(t *testing.T) {
 		{
 			input:  "}{$",
 			expect: "}{$",
+		},
+		{
+			input:  "{$MY_HOST:{header.Host}}",
+			expect: "{header.Host}",
+		},
+		{
+			input:  "{$MY_HOST_SET:{header.Host}}",
+			expect: "example.com",
+		},
+		{
+			input:  "{$PREFIX_{$NAME}}",
+			expect: "bar",
+		},
+		{
+			input:  "{$PREFIX_{$NAME}:default}",
+			expect: "bar",
+		},
+		{
+			input:  `{$CONFIG:{"a":{"b":1}}}`,
+			expect: `{"a":{"b":1}}`,
+		},
+		{
+			input:  "{$PREFIX_{$UNMATCHED}",
+			expect: "{$PREFIX_",
+		},
+		{
+			input:  "{$PREFIX_{$UNMATCHED",
+			expect: "{$PREFIX_{$UNMATCHED",
+		},
+		{
+			input:  "{$HOST:{$DEFAULT_HOST:localhost}}",
+			expect: "localhost",
 		},
 	} {
 		actual := replaceEnvVars([]byte(test.input))
