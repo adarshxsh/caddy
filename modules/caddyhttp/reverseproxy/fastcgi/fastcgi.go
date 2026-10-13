@@ -411,6 +411,9 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	for field, val := range r.Header {
 		header := strings.ToUpper(field)
 		header = headerNameReplacer.Replace(header)
+		if header == "PROXY" {
+			continue
+		}
 		env["HTTP_"+header] = strings.Join(val, ", ")
 	}
 	return env, nil

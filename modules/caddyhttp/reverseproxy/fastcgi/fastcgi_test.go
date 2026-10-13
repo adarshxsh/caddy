@@ -1,6 +1,8 @@
 package fastcgi
 
 import (
+	"context"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -8,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -353,5 +356,100 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 
 	for _, p := range payloads {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
+	}
+}
+
+func TestBuildEnvProxyHeader(t *testing.T) {
+	tests := []struct {
+		name         string
+		reqHeaders   http.Header
+		envVars      map[string]string
+		wantProxyEnv string
+		wantProxySet bool
+		wantOtherEnv string
+		wantOtherSet bool
+	}{
+		{
+			name: "proxy header filtered out",
+			reqHeaders: http.Header{
+				"Proxy":         []string{"http://evil.com"},
+				"X-Test-Header": []string{"hello"},
+			},
+			wantProxySet: false,
+			wantOtherSet: true,
+			wantOtherEnv: "hello",
+		},
+		{
+			name: "lowercase proxy header filtered out",
+			reqHeaders: http.Header{
+				"proxy":         []string{"http://evil.com"},
+				"X-Test-Header": []string{"hello"},
+			},
+			wantProxySet: false,
+			wantOtherSet: true,
+			wantOtherEnv: "hello",
+		},
+		{
+			name: "uppercase PROXY header filtered out",
+			reqHeaders: http.Header{
+				"PROXY":         []string{"http://evil.com"},
+				"X-Test-Header": []string{"hello"},
+			},
+			wantProxySet: false,
+			wantOtherSet: true,
+			wantOtherEnv: "hello",
+		},
+		{
+			name: "configured env vars HTTP_PROXY preserved",
+			reqHeaders: http.Header{
+				"Proxy":         []string{"http://evil.com"},
+				"X-Test-Header": []string{"hello"},
+			},
+			envVars: map[string]string{
+				"HTTP_PROXY": "http://internal-proxy:8080",
+			},
+			wantProxySet: true,
+			wantProxyEnv: "http://internal-proxy:8080",
+			wantOtherSet: true,
+			wantOtherEnv: "hello",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr := Transport{
+				Root:    "/var/www/html",
+				EnvVars: tt.envVars,
+			}
+
+			req, err := http.NewRequest("GET", "http://localhost/index.php", nil)
+			require.NoError(t, err)
+
+			for k, v := range tt.reqHeaders {
+				for _, val := range v {
+					req.Header.Add(k, val)
+				}
+			}
+
+			ctx := req.Context()
+			ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, caddy.NewReplacer())
+			ctx = context.WithValue(ctx, caddyhttp.OriginalRequestCtxKey, *req)
+			req = req.WithContext(ctx)
+
+			env, err := tr.buildEnv(req)
+			require.NoError(t, err)
+
+			val, exists := env["HTTP_PROXY"]
+			assert.Equal(t, tt.wantProxySet, exists, "HTTP_PROXY existence")
+			if tt.wantProxySet {
+				assert.Equal(t, tt.wantProxyEnv, val, "HTTP_PROXY value")
+			}
+
+			otherVal, otherExists := env["HTTP_X_TEST_HEADER"]
+			assert.Equal(t, tt.wantOtherSet, otherExists, "HTTP_X_TEST_HEADER existence")
+			if tt.wantOtherSet {
+				assert.Equal(t, tt.wantOtherEnv, otherVal, "HTTP_X_TEST_HEADER value")
+			}
+		})
 	}
 }
