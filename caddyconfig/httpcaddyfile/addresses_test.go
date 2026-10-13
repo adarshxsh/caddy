@@ -171,6 +171,25 @@ func TestKeyNormalization(t *testing.T) {
 			},
 		},
 		{
+			input: "{env.MY_VAR_{http.request.host}_HEADER}",
+			expect: Address{
+				Host: "{env.MY_VAR_{http.request.host}_HEADER}",
+			},
+		},
+		{
+			input: "SUB.{env.MY_VAR_{http.request.host}_HEADER}.COM",
+			expect: Address{
+				Host: "sub.{env.MY_VAR_{http.request.host}_HEADER}.com",
+			},
+		},
+		{
+			input: "HTTP://{env.MY_VAR_{http.request.host}_HEADER}",
+			expect: Address{
+				Scheme: "http",
+				Host:   "{env.MY_VAR_{http.request.host}_HEADER}",
+			},
+		},
+		{
 			input: ":80",
 			expect: Address{
 				Port: "80",
