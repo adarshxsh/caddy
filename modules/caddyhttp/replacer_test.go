@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -293,6 +294,97 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		gotName, okName := repl.GetString("http.request.proto_name")
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
+		}
+	}
+}
+
+func TestOriginalRequestFallback(t *testing.T) {
+	// Test 1: Request without OriginalRequestCtxKey initialized (fallback to current request)
+	req1, _ := http.NewRequest(http.MethodGet, "/foo/bar?a=1&b=2", nil)
+	repl1 := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl1, req1, nil)
+
+	for _, tc := range []struct {
+		get    string
+		expect string
+	}{
+		{get: "http.request.orig_method", expect: http.MethodGet},
+		{get: "http.request.orig_uri", expect: "/foo/bar?a=1&b=2"},
+		{get: "http.request.orig_uri.path", expect: "/foo/bar"},
+		{get: "http.request.orig_uri.path.file", expect: "bar"},
+		{get: "http.request.orig_uri.path.dir", expect: "/foo/"},
+		{get: "http.request.orig_uri.query", expect: "a=1&b=2"},
+		{get: "http.request.orig_uri.prefixed_query", expect: "?a=1&b=2"},
+		{get: "http.request.orig_uri.path.0", expect: "foo"},
+		{get: "http.request.orig_uri.path.1", expect: "bar"},
+	} {
+		actual, got := repl1.GetString(tc.get)
+		if !got {
+			t.Errorf("Fallback Test: Expected to recognize placeholder %s", tc.get)
+		}
+		if actual != tc.expect {
+			t.Errorf("Fallback Test: Expected %s to be %q, got %q", tc.get, tc.expect, actual)
+		}
+	}
+
+	// Test 2: Request WITH OriginalRequestCtxKey initialized (returns original request)
+	req2, _ := http.NewRequest(http.MethodPost, "/rewritten/path?new=1", nil)
+	origURL, _ := url.Parse("/original/path?orig=1")
+	origReq := http.Request{
+		Method:     http.MethodGet,
+		RequestURI: "/original/path?orig=1",
+		URL:        origURL,
+	}
+	ctx2 := context.WithValue(req2.Context(), OriginalRequestCtxKey, origReq)
+	req2 = req2.WithContext(ctx2)
+
+	repl2 := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl2, req2, nil)
+
+	for _, tc := range []struct {
+		get    string
+		expect string
+	}{
+		{get: "http.request.orig_method", expect: http.MethodGet},
+		{get: "http.request.orig_uri", expect: "/original/path?orig=1"},
+		{get: "http.request.orig_uri.path", expect: "/original/path"},
+		{get: "http.request.orig_uri.path.file", expect: "path"},
+		{get: "http.request.orig_uri.path.dir", expect: "/original/"},
+		{get: "http.request.orig_uri.query", expect: "orig=1"},
+		{get: "http.request.orig_uri.prefixed_query", expect: "?orig=1"},
+		{get: "http.request.orig_uri.path.0", expect: "original"},
+		{get: "http.request.orig_uri.path.1", expect: "path"},
+	} {
+		actual, got := repl2.GetString(tc.get)
+		if !got {
+			t.Errorf("Initialized Context Test: Expected to recognize placeholder %s", tc.get)
+		}
+		if actual != tc.expect {
+			t.Errorf("Initialized Context Test: Expected %s to be %q, got %q", tc.get, tc.expect, actual)
+		}
+	}
+
+	// Test 3: Edge case where req.URL is nil and OriginalRequestCtxKey is uninitialized
+	req3 := &http.Request{}
+	repl3 := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl3, req3, nil)
+
+	for _, key := range []string{
+		"http.request.orig_method",
+		"http.request.orig_uri",
+		"http.request.orig_uri.path",
+		"http.request.orig_uri.path.file",
+		"http.request.orig_uri.path.dir",
+		"http.request.orig_uri.query",
+		"http.request.orig_uri.prefixed_query",
+		"http.request.orig_uri.path.0",
+	} {
+		actual, got := repl3.GetString(key)
+		if !got {
+			t.Errorf("Nil URL Test: Expected to recognize placeholder %s", key)
+		}
+		if actual != "" {
+			t.Errorf("Nil URL Test: Expected %s to be empty, got %q", key, actual)
 		}
 	}
 }
