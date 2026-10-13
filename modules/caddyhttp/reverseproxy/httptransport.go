@@ -20,6 +20,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	weakrand "math/rand/v2"
 	"net"
@@ -456,7 +457,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				err = tlsConn.HandshakeContext(ctx)
 				if err != nil {
 					_ = tlsConn.Close()
-					return nil, err
+					return nil, DialError{err}
 				}
 				return tlsConn, nil
 			}
@@ -637,12 +638,48 @@ func (h *HTTPTransport) RequestHeaderOps() *headers.HeaderOps {
 func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	h.SetScheme(req)
 
-	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
+	var res *http.Response
+	var err error
 	if h.h3Transport != nil {
-		return h.h3Transport.RoundTrip(req)
+		res, err = h.h3Transport.RoundTrip(req)
+	} else {
+		res, err = h.Transport.RoundTrip(req)
 	}
 
-	return h.Transport.RoundTrip(req)
+	if err != nil {
+		var dialErr DialError
+		if !errors.As(err, &dialErr) && isTLSHandshakeError(err) {
+			err = DialError{err}
+		}
+	}
+
+	return res, err
+}
+
+func isTLSHandshakeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var (
+		recErr  *tls.RecordHeaderError
+		certErr *tls.CertificateVerificationError
+		unkErr  *x509.UnknownAuthorityError
+		hostErr *x509.HostnameError
+		invErr  *x509.CertificateInvalidError
+		conErr  *x509.ConstraintViolationError
+	)
+	if errors.As(err, &recErr) ||
+		errors.As(err, &certErr) ||
+		errors.As(err, &unkErr) ||
+		errors.As(err, &hostErr) ||
+		errors.As(err, &invErr) ||
+		errors.As(err, &conErr) {
+		return true
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "TLS handshake") ||
+		strings.Contains(errStr, "tls:") ||
+		strings.Contains(errStr, "handshake failure")
 }
 
 // SetScheme ensures that the outbound request req

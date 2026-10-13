@@ -3,8 +3,11 @@ package reverseproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"testing"
@@ -277,5 +280,38 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestHTTPTransport_TLSHandshakeDialError(t *testing.T) {
+	// Start a plain HTTP server (not TLS)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	// Configure HTTPTransport with TLS pointing to plain HTTP server
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			InsecureSkipVerify: true,
+		},
+	}
+	ctx := caddy.Context{Context: context.Background()}
+	err := ht.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Provision error: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", ts.URL, nil)
+	req.URL.Scheme = "https"
+
+	_, err = ht.RoundTrip(req)
+	if err == nil {
+		t.Fatalf("expected error from TLS handshake against plain HTTP server")
+	}
+
+	var dialErr DialError
+	if !errors.As(err, &dialErr) {
+		t.Fatalf("expected TLS handshake error to be wrapped in DialError, got: %T (%v)", err, err)
 	}
 }
