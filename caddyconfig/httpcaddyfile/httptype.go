@@ -1657,6 +1657,11 @@ func WasReplacedPlaceholderShorthand(token string) string {
 			return prev
 		}
 	}
+	for _, cs := range complexShorthands {
+		if cs.inverse.MatchString(token) {
+			return cs.inverse.ReplaceAllString(token, cs.inverseTempl)
+		}
+	}
 	return ""
 }
 
