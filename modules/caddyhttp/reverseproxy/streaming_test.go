@@ -3,10 +3,12 @@ package reverseproxy
 import (
 	"bytes"
 	"io"
+	"net"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +82,81 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestWriteDeadlineWriter(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	writer := writeDeadlineWriter{w: c1, timeout: 50 * time.Millisecond}
+
+	go func() {
+		buf := make([]byte, 10)
+		_, _ = c2.Read(buf)
+	}()
+
+	n, err := writer.Write([]byte("hello"))
+	if err != nil {
+		t.Fatalf("unexpected write error: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("expected 5 bytes written, got %d", n)
+	}
+}
+
+func TestSwitchProtocolCopierClientBackpressure(t *testing.T) {
+	userServer, userClient := net.Pipe()
+	backServer, backClient := net.Pipe()
+	defer userClient.Close()
+	defer backClient.Close()
+
+	var wg sync.WaitGroup
+	errc := make(chan error, 2)
+
+	copier := switchProtocolCopier{
+		user:         userServer,
+		backend:      backServer,
+		wg:           &wg,
+		writeTimeout: 50 * time.Millisecond,
+	}
+
+	wg.Add(2)
+	go copier.copyToBackend(errc)
+	go copier.copyFromBackend(errc)
+
+	done := make(chan struct{})
+	go func() {
+		largeData := bytes.Repeat([]byte("X"), 1024)
+		for {
+			_, err := backClient.Write(largeData)
+			if err != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("expected non-nil error due to write deadline timeout")
+		}
+		userServer.Close()
+		backServer.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for write deadline error under client backpressure")
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		// success
+	case <-time.After(1 * time.Second):
+		t.Fatal("wg.Wait() blocked after socket teardown")
+	}
+}
