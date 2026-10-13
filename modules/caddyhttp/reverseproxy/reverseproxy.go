@@ -761,6 +761,7 @@ func normalizeWebsocketHeaders(header http.Header) {
 // of the cloned request are performed by h during or after proxying.
 func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.Request, error) {
 	req = cloneRequest(req)
+	canonicalizeHeaders(req.Header)
 
 	// if enabled, perform rewrites on the cloned request; if
 	// the method is GET or HEAD, prevent the request body
@@ -831,7 +832,7 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 			req.Header.Set("Te", "trailers")
 			continue
 		}
-		req.Header.Del(h)
+		deleteHeaderCaseInsensitive(req.Header, h)
 	}
 
 	// After stripping all the hop-by-hop connection headers above, add back any
@@ -1215,6 +1216,8 @@ func (h *Handler) finalizeResponse(
 	start time.Time,
 	logger *zap.Logger,
 ) error {
+	canonicalizeHeaders(res.Header)
+
 	// deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
 	if res.StatusCode == http.StatusSwitchingProtocols {
 		var wg sync.WaitGroup
@@ -1226,7 +1229,7 @@ func (h *Handler) finalizeResponse(
 	removeConnectionHeaders(res.Header)
 
 	for _, h := range hopHeaders {
-		res.Header.Del(h)
+		deleteHeaderCaseInsensitive(res.Header, h)
 	}
 
 	// delete our Server header and use Via instead (see #6275)
@@ -1575,22 +1578,65 @@ func lastHeaderValue(h http.Header, field string) (value string, ok bool, omit b
 	return values[len(values)-1], true, false
 }
 
+// canonicalizeHeaders merges non-canonical header map keys into their canonical key locations.
+func canonicalizeHeaders(h http.Header) {
+	for k, vv := range h {
+		ck := http.CanonicalHeaderKey(k)
+		if k != ck {
+			h[ck] = append(h[ck], vv...)
+			delete(h, k)
+		}
+	}
+}
+
+// deleteHeaderCaseInsensitive removes all map entries matching name regardless of key casing.
+func deleteHeaderCaseInsensitive(h http.Header, name string) {
+	for k := range h {
+		if strings.EqualFold(k, name) {
+			delete(h, k)
+		}
+	}
+}
+
 func upgradeType(h http.Header) string {
-	if !httpguts.HeaderValuesContainsToken(h["Connection"], "Upgrade") {
+	var connVals []string
+	for k, vv := range h {
+		if strings.EqualFold(k, "Connection") {
+			connVals = append(connVals, vv...)
+		}
+	}
+	if !httpguts.HeaderValuesContainsToken(connVals, "Upgrade") {
 		return ""
 	}
-	return strings.ToLower(h.Get("Upgrade"))
+	for k, vv := range h {
+		if strings.EqualFold(k, "Upgrade") {
+			for _, v := range vv {
+				if v != "" {
+					return strings.ToLower(v)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // removeConnectionHeaders removes hop-by-hop headers listed in the "Connection" header of h.
 // See RFC 7230, section 6.1
 func removeConnectionHeaders(h http.Header) {
-	for _, f := range h["Connection"] {
-		for sf := range strings.SplitSeq(f, ",") {
-			if sf = textproto.TrimString(sf); sf != "" {
-				h.Del(sf)
+	var headersToRemove []string
+	for k, vv := range h {
+		if strings.EqualFold(k, "Connection") {
+			for _, f := range vv {
+				for sf := range strings.SplitSeq(f, ",") {
+					if sf = textproto.TrimString(sf); sf != "" {
+						headersToRemove = append(headersToRemove, sf)
+					}
+				}
 			}
 		}
+	}
+	for _, sf := range headersToRemove {
+		deleteHeaderCaseInsensitive(h, sf)
 	}
 }
 
