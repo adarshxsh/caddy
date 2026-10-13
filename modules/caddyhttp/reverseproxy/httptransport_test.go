@@ -2,6 +2,7 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -279,3 +280,98 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPTransport_DialTLSContext_NilTLSClientConfig(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	tests := []struct {
+		name          string
+		tls           *TLSConfig
+		proxyProtocol string
+		h1Only        bool
+	}{
+		{
+			name:   "nil TLSClientConfig with placeholder ServerName",
+			tls:    &TLSConfig{ServerName: "{http.request.host}"},
+			h1Only: true,
+		},
+		{
+			name:          "nil TLSClientConfig with ProxyProtocol",
+			tls:           &TLSConfig{},
+			proxyProtocol: "v2",
+			h1Only:        true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+			defer cancel()
+
+			ht := &HTTPTransport{
+				TLS:           tt.tls,
+				ProxyProtocol: tt.proxyProtocol,
+			}
+
+			rt, err := ht.NewTransport(ctx)
+			if err != nil {
+				t.Fatalf("NewTransport() error = %v", err)
+			}
+
+			if rt.DialTLSContext == nil {
+				t.Fatalf("expected DialTLSContext to be non-nil")
+			}
+
+			reqCtx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, caddy.NewReplacer())
+			reqCtx = context.WithValue(reqCtx, caddyhttp.VarsCtxKey, make(map[string]any))
+			if tt.h1Only {
+				caddyhttp.SetVar(reqCtx, tlsH1OnlyVarKey, true)
+			}
+
+			// DialTLSContext should not panic when rt.TLSClientConfig is nil
+			conn, err := rt.DialTLSContext(reqCtx, "tcp", ln.Addr().String())
+			if conn != nil {
+				conn.Close()
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_H3Dial_NilTLSConfig(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS:      &TLSConfig{ServerName: "{http.request.host}"},
+	}
+
+	_, err := ht.NewTransport(ctx)
+	if err != nil {
+		t.Fatalf("NewTransport() error = %v", err)
+	}
+
+	if ht.h3Transport == nil || ht.h3Transport.Dial == nil {
+		t.Fatalf("expected h3Transport and h3Transport.Dial to be non-nil")
+	}
+
+	reqCtx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, caddy.NewReplacer())
+
+	// Calling h3Transport.Dial with nil tlsCfg should not panic
+	var tlsCfg *tls.Config
+	_, _ = ht.h3Transport.Dial(reqCtx, "127.0.0.1:4433", tlsCfg, nil)
+}
+
