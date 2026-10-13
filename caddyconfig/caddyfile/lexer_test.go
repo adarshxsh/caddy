@@ -499,6 +499,45 @@ EOF`),
 			expectErr:    true,
 			errorMessage: "mismatched leading whitespace in heredoc <<EOF on line #3 [\t], expected whitespace [\t\t] to match the closing marker",
 		},
+		{
+			input: []byte(`heredoc <<EOF
+word_ending_with_EOF
+identifier_EOF_suffix
+EOF`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "word_ending_with_EOF\nidentifier_EOF_suffix"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<EOF
+EOF_identifier_prefix
+EOFA
+EOF`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "EOF_identifier_prefix\nEOFA"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<EOF
+# comment containing EOF
+text EOF text
+EOF`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "# comment containing EOF\ntext EOF text"},
+			},
+		},
+		{
+			input: []byte(`heredoc <<EOF
+	indented body with my_var_EOF and EOF_var
+	EOF`),
+			expected: []Token{
+				{Line: 1, Text: "heredoc"},
+				{Line: 1, Text: "indented body with my_var_EOF and EOF_var"},
+			},
+		},
 	}
 
 	for i, testCase := range testCases {
@@ -536,6 +575,24 @@ func lexerCompare(t *testing.T, n int, expected, actual []Token) {
 			t.Fatalf("Test case %d token %d: expected text '%s' but was '%s'",
 				n, i, expected[i].Text, actual[i].Text)
 			break
+		}
+	}
+}
+
+func BenchmarkTokenizeHeredoc(b *testing.B) {
+	input := []byte(`heredoc <<EOF
+	line 1 with word_ending_with_EOF
+	line 2 with EOF_identifier_prefix
+	line 3 with # comment containing EOF
+	line 4 with text EOF text inside
+	EOF same-line-arg`)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err := Tokenize(input, "Caddyfile")
+		if err != nil {
+			b.Fatal(err)
 		}
 	}
 }

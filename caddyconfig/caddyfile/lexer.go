@@ -186,7 +186,12 @@ func (l *lexer) next() (bool, error) {
 			}
 
 			// check if we're done, i.e. that the last few characters are the marker
-			if len(val) >= len(heredocMarker) && heredocMarker == string(val[len(val)-len(heredocMarker):]) {
+			// on line boundary with leading horizontal whitespace and trailing delimiter
+			isTerm, err := l.isHeredocTerminator(val, heredocMarker)
+			if err != nil {
+				return false, err
+			}
+			if isTerm {
 				// set the final value
 				val, err = l.finalizeHeredoc(val, heredocMarker)
 				if err != nil {
@@ -339,6 +344,59 @@ func (l *lexer) finalizeHeredoc(val []rune, marker string) ([]rune, error) {
 
 	// return the final value
 	return []rune(out), nil
+}
+
+// isHeredocTerminator checks if val ends with marker, verifying that marker is preceded
+// only by horizontal whitespace on the current line and followed by a token delimiter
+// (whitespace, newline, or EOF).
+func (l *lexer) isHeredocTerminator(val []rune, marker string) (bool, error) {
+	markerLen := len(marker)
+	if len(val) < markerLen {
+		return false, nil
+	}
+
+	// Verify that val ends with marker
+	offset := len(val) - markerLen
+	for i := 0; i < markerLen; i++ {
+		if val[offset+i] != rune(marker[i]) {
+			return false, nil
+		}
+	}
+
+	// Verify leading horizontal whitespace on current line
+	lineStart := 0
+	for i := offset - 1; i >= 0; i-- {
+		if val[i] == '\n' {
+			lineStart = i + 1
+			break
+		}
+	}
+
+	for i := lineStart; i < offset; i++ {
+		r := val[i]
+		if r != ' ' && r != '\t' {
+			return false, nil
+		}
+	}
+
+	// Verify trailing token delimiter by peeking next rune from reader
+	nextCh, _, err := l.reader.ReadRune()
+	if err == io.EOF {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	if err := l.reader.UnreadRune(); err != nil {
+		return false, err
+	}
+
+	if unicode.IsSpace(nextCh) {
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // Quoted returns true if the token was enclosed in quotes

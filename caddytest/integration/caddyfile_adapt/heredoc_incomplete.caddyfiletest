@@ -6,4 +6,4 @@ handle {
 # missing EOF marker
 }
 ----------
-mismatched leading whitespace in heredoc <<EOF on line #5 [    Hello], expected whitespace [# missing ] to match the closing marker
+incomplete heredoc <<EOF on line #8, expected ending marker EOF
