@@ -168,7 +168,8 @@ type Handler struct {
 	ResponseBuffers int64 `json:"response_buffers,omitempty"`
 
 	// If nonzero, streaming requests such as WebSockets will be
-	// forcibly closed at the end of the timeout. Default: no timeout.
+	// forcibly closed after no read or write activity for the
+	// duration of the timeout. Default: no timeout.
 	StreamTimeout caddy.Duration `json:"stream_timeout,omitempty"`
 
 	// The size of the buffer used for each direction of streaming
