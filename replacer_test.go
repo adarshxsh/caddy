@@ -310,6 +310,81 @@ func TestReplacerReplaceKnown(t *testing.T) {
 	}
 }
 
+func TestReplacerNested(t *testing.T) {
+	os.Setenv("VAR_example.com", "resolved_value")
+	defer os.Unsetenv("VAR_example.com")
+
+	rep := NewReplacer()
+	rep.Set("http.request.host", "example.com")
+	rep.Set("custom.VAR_example.com", "static_resolved")
+	rep.Set("inner", "middle")
+	rep.Set("outer_middle", "final_value")
+	rep.Set("c", "x")
+	rep.Set("b_x", "y")
+	rep.Set("a_y", "z")
+
+	testCases := []struct {
+		input  string
+		expect string
+		known  string
+	}{
+		{
+			input:  "{env.VAR_{http.request.host}}",
+			expect: "resolved_value",
+			known:  "resolved_value",
+		},
+		{
+			input:  "{custom.VAR_{http.request.host}}",
+			expect: "static_resolved",
+			known:  "static_resolved",
+		},
+		{
+			input:  "prefix-{env.VAR_{http.request.host}}-suffix",
+			expect: "prefix-resolved_value-suffix",
+			known:  "prefix-resolved_value-suffix",
+		},
+		{
+			input:  "{outer_{inner}}",
+			expect: "final_value",
+			known:  "final_value",
+		},
+		{
+			input:  "{a_{b_{c}}}",
+			expect: "z",
+			known:  "z",
+		},
+		{
+			input:  "{custom.VAR_{unknown}}",
+			expect: "",
+			known:  "{custom.VAR_{unknown}}",
+		},
+		{
+			input:  "{unknown_{http.request.host}}",
+			expect: "",
+			known:  "{unknown_example.com}",
+		},
+		{
+			input:  `\{custom.VAR_{http.request.host}\}`,
+			expect: `{custom.VAR_example.com}`,
+			known:  `{custom.VAR_example.com}`,
+		},
+	}
+
+	for i, tc := range testCases {
+		actualAll := rep.ReplaceAll(tc.input, "")
+		if actualAll != tc.expect {
+			t.Errorf("Test %d ReplaceAll '%s': expected '%s' but got '%s'",
+				i, tc.input, tc.expect, actualAll)
+		}
+
+		actualKnown := rep.ReplaceKnown(tc.input, "")
+		if actualKnown != tc.known {
+			t.Errorf("Test %d ReplaceKnown '%s': expected '%s' but got '%s'",
+				i, tc.input, tc.known, actualKnown)
+		}
+	}
+}
+
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
 		mapMutex: &sync.RWMutex{},
