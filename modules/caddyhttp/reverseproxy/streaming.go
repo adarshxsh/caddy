@@ -57,6 +57,33 @@ func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+type activityRWC struct {
+	io.ReadWriteCloser
+	activityChan chan<- struct{}
+}
+
+func (a activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 {
+		select {
+		case a.activityChan <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+func (a activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 {
+		select {
+		case a.activityChan <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
@@ -204,19 +231,27 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
+	// setup the timeout if requested
+	var (
+		timeoutc     <-chan time.Time
+		timer        *time.Timer
+		activityChan chan struct{}
+	)
+	if h.StreamTimeout > 0 {
+		activityChan = make(chan struct{}, 1)
+		conn = activityRWC{ReadWriteCloser: conn, activityChan: activityChan}
+		backConn = activityRWC{ReadWriteCloser: backConn, activityChan: activityChan}
+
+		timer = time.NewTimer(time.Duration(h.StreamTimeout))
+		defer timer.Stop()
+		timeoutc = timer.C
+	}
+
 	spc := switchProtocolCopier{
 		user:       conn,
 		backend:    backConn,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
-	}
-
-	// setup the timeout if requested
-	var timeoutc <-chan time.Time
-	if h.StreamTimeout > 0 {
-		timer := time.NewTimer(time.Duration(h.StreamTimeout))
-		defer timer.Stop()
-		timeoutc = timer.C
 	}
 
 	// when a stream timeout is encountered, no error will be read from errc
@@ -226,14 +261,28 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+	for {
+		select {
+		case err := <-errc:
+			if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+				c.Write(zap.Error(err))
+			}
+			return
+		case <-activityChan:
+			if timer != nil {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(time.Duration(h.StreamTimeout))
+			}
+		case time := <-timeoutc:
+			if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", time))
+			}
+			return
 		}
 	}
 }
