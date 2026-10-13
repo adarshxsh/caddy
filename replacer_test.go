@@ -16,6 +16,7 @@ package caddy
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -528,5 +529,38 @@ func testReplacer() Replacer {
 		providers: make([]replacementProvider, 0),
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
+	}
+}
+
+func TestToString(t *testing.T) {
+	for i, tc := range []struct {
+		input  any
+		expect string
+	}{
+		{input: nil, expect: ""},
+		{input: "hello", expect: "hello"},
+		{input: []byte("bytes"), expect: "bytes"},
+		{input: []rune("runes"), expect: "runes"},
+		{input: int(123), expect: "123"},
+		{input: int32(456), expect: "456"},
+		{input: int64(0), expect: "0"},
+		{input: int64(2147483647), expect: "2147483647"},
+		{input: int64(2147483648), expect: "2147483648"},
+		{input: int64(-2147483648), expect: "-2147483648"},
+		{input: int64(-2147483649), expect: "-2147483649"},
+		{input: int64(math.MaxInt64), expect: "9223372036854775807"},
+		{input: int64(math.MinInt64), expect: "-9223372036854775808"},
+		{input: uint(789), expect: "789"},
+		{input: uint32(1011), expect: "1011"},
+		{input: uint64(1213), expect: "1213"},
+		{input: float32(3.14), expect: "3.14"},
+		{input: float64(2.71828), expect: "2.71828"},
+		{input: true, expect: "true"},
+		{input: false, expect: "false"},
+	} {
+		actual := ToString(tc.input)
+		if actual != tc.expect {
+			t.Errorf("Test %d: expected %q for %T(%v), got %q", i, tc.expect, tc.input, tc.input, actual)
+		}
 	}
 }

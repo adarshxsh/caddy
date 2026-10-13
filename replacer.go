@@ -309,7 +309,7 @@ func ToString(val any) string {
 	case int32:
 		return strconv.Itoa(int(v))
 	case int64:
-		return strconv.Itoa(int(v))
+		return strconv.FormatInt(v, 10)
 	case uint:
 		return strconv.FormatUint(uint64(v), 10)
 	case uint32:
