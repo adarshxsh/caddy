@@ -49,10 +49,11 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 		bufferSize: 7,
 	}
 
-	buf := copier.buffer()
-	if got := len(buf); got != 7 {
+	buf := copier.getBuffer()
+	if got := len(*buf); got != 7 {
 		t.Fatalf("buffer len = %d, want 7", got)
 	}
+	copier.putBuffer(buf)
 
 	wg.Add(1)
 	go copier.copyToBackend(errc)
@@ -68,10 +69,25 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 
 func TestSwitchProtocolCopierDefaultBufferSize(t *testing.T) {
 	copier := switchProtocolCopier{}
-	buf := copier.buffer()
-	if got := len(buf); got != defaultBufferSize {
+	bufPtr1 := copier.getBuffer()
+	if got := len(*bufPtr1); got != defaultBufferSize {
 		t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
 	}
+	copier.putBuffer(bufPtr1)
+
+	bufPtr2 := copier.getBuffer()
+	if got := len(*bufPtr2); got != defaultBufferSize {
+		t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
+	}
+	copier.putBuffer(bufPtr2)
+
+	// Test explicit default buffer size
+	copierExplicit := switchProtocolCopier{bufferSize: defaultBufferSize}
+	bufPtr3 := copierExplicit.getBuffer()
+	if got := len(*bufPtr3); got != defaultBufferSize {
+		t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
+	}
+	copierExplicit.putBuffer(bufPtr3)
 }
 
 type nopReadWriteCloser struct {
