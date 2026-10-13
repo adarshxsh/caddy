@@ -16,6 +16,7 @@ package caddy
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -528,5 +529,52 @@ func testReplacer() Replacer {
 		providers: make([]replacementProvider, 0),
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
+	}
+}
+
+func TestToString(t *testing.T) {
+	for i, tc := range []struct {
+		input  any
+		expect string
+	}{
+		{input: nil, expect: ""},
+		{input: "hello", expect: "hello"},
+		{input: int(123), expect: "123"},
+		{input: int32(456), expect: "456"},
+		{input: int64(0), expect: "0"},
+		{input: int64(2147483647), expect: "2147483647"},
+		{input: int64(2147483648), expect: "2147483648"},
+		{input: int64(3000000000), expect: "3000000000"},
+		{input: int64(-3000000000), expect: "-3000000000"},
+		{input: int64(1700000000000), expect: "1700000000000"},
+		{input: int64(math.MaxInt64), expect: "9223372036854775807"},
+		{input: int64(math.MinInt64), expect: "-9223372036854775808"},
+		{input: uint64(18446744073709551615), expect: "18446744073709551615"},
+	} {
+		actual := ToString(tc.input)
+		if actual != tc.expect {
+			t.Errorf("Test %d: ToString(%v): expected '%s', got '%s'", i, tc.input, tc.expect, actual)
+		}
+	}
+}
+
+func TestReplacerInt64(t *testing.T) {
+	rep := NewEmptyReplacer()
+
+	rep.Set("large_pos", int64(3000000000))
+	rep.Set("large_neg", int64(-3000000000))
+	rep.Set("max_int64", int64(math.MaxInt64))
+	rep.Set("min_int64", int64(math.MinInt64))
+	rep.Set("timestamp_ms", int64(1700000000000))
+
+	str, found := rep.GetString("large_pos")
+	if !found || str != "3000000000" {
+		t.Errorf("GetString(large_pos): expected '3000000000', got '%s' (found=%v)", str, found)
+	}
+
+	replaced := rep.ReplaceAll("pos: {large_pos}, neg: {large_neg}, max: {max_int64}, min: {min_int64}, ts: {timestamp_ms}", "")
+	expected := "pos: 3000000000, neg: -3000000000, max: 9223372036854775807, min: -9223372036854775808, ts: 1700000000000"
+	if replaced != expected {
+		t.Errorf("ReplaceAll: expected '%s', got '%s'", expected, replaced)
 	}
 }
