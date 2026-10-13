@@ -376,12 +376,16 @@ func (p *parser) doImport(nesting int) error {
 	}
 	// initialize with size 1
 	blockMapping := make(map[string][]Token, 1)
+	var unnamedBlockTokens []Token
 	if len(blockTokens) > 0 {
 		// use such tokens to create a new dispenser, and then use it to parse each block
 		bd := NewDispenser(blockTokens)
 
+		var subblockRanges [][2]int
+
 		// one iteration processes one sub-block inside the import
 		for bd.Next() {
+			startIdx := bd.cursor
 			currentMappingKey := bd.Val()
 
 			if currentMappingKey == "{" {
@@ -392,11 +396,30 @@ func (p *parser) doImport(nesting int) error {
 			currentMappingTokens := bd.RemainingArgsAsTokens()
 
 			// load up the entire block
+			hasBlock := false
 			for mappingNesting := bd.Nesting(); bd.NextBlock(mappingNesting); {
+				hasBlock = true
 				currentMappingTokens = append(currentMappingTokens, bd.Token())
 			}
 
 			blockMapping[currentMappingKey] = currentMappingTokens
+
+			if hasBlock || (bd.cursor > startIdx && bd.tokens[bd.cursor].Text == "}") {
+				subblockRanges = append(subblockRanges, [2]int{startIdx, bd.cursor})
+			}
+		}
+
+		for i, tok := range blockTokens {
+			inSubblock := false
+			for _, r := range subblockRanges {
+				if i >= r[0] && i <= r[1] {
+					inSubblock = true
+					break
+				}
+			}
+			if !inSubblock {
+				unnamedBlockTokens = append(unnamedBlockTokens, tok)
+			}
 		}
 	}
 
@@ -538,7 +561,7 @@ func (p *parser) doImport(nesting int) error {
 		switch {
 		case token.Text == "{block}":
 			foundBlockDirective = true
-			tokensToAdd = blockTokens
+			tokensToAdd = unnamedBlockTokens
 		case strings.HasPrefix(token.Text, "{blocks.") && strings.HasSuffix(token.Text, "}"):
 			foundBlockDirective = true
 			// {blocks.foo.bar} will be extracted to key `foo.bar`
