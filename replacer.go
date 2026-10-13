@@ -95,6 +95,34 @@ func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Unlock()
 }
 
+// SetString sets a custom variable to a string value.
+func (r *Replacer) SetString(variable, value string) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetInt sets a custom variable to an int value.
+func (r *Replacer) SetInt(variable string, value int) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetFloat sets a custom variable to a float64 value.
+func (r *Replacer) SetFloat(variable string, value float64) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetBool sets a custom variable to a bool value.
+func (r *Replacer) SetBool(variable string, value bool) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
 // Get gets a value from the replacer. It returns
 // the value and whether the variable was known.
 func (r *Replacer) Get(variable string) (any, bool) {
@@ -111,6 +139,104 @@ func (r *Replacer) Get(variable string) (any, bool) {
 func (r *Replacer) GetString(variable string) (string, bool) {
 	s, found := r.Get(variable)
 	return ToString(s), found
+}
+
+// GetInt gets a value from the replacer and coerces it to an int if possible.
+func (r *Replacer) GetInt(variable string) (int, bool) {
+	v, found := r.Get(variable)
+	if !found || v == nil {
+		return 0, false
+	}
+	switch val := v.(type) {
+	case int:
+		return val, true
+	case int32:
+		return int(val), true
+	case int64:
+		return int(val), true
+	case int8:
+		return int(val), true
+	case int16:
+		return int(val), true
+	case uint:
+		return int(val), true
+	case uint32:
+		return int(val), true
+	case uint64:
+		return int(val), true
+	case uint16:
+		return int(val), true
+	case uint8:
+		return int(val), true
+	case float32:
+		return int(val), true
+	case float64:
+		return int(val), true
+	case bool:
+		if val {
+			return 1, true
+		}
+		return 0, true
+	case string:
+		if i, err := strconv.Atoi(val); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// GetFloat gets a value from the replacer and coerces it to a float64 if possible.
+func (r *Replacer) GetFloat(variable string) (float64, bool) {
+	v, found := r.Get(variable)
+	if !found || v == nil {
+		return 0, false
+	}
+	switch val := v.(type) {
+	case float64:
+		return val, true
+	case float32:
+		return float64(val), true
+	case int:
+		return float64(val), true
+	case int32:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	case uint:
+		return float64(val), true
+	case uint32:
+		return float64(val), true
+	case uint64:
+		return float64(val), true
+	case string:
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+// GetBool gets a value from the replacer and coerces it to a bool if possible.
+func (r *Replacer) GetBool(variable string) (bool, bool) {
+	v, found := r.Get(variable)
+	if !found || v == nil {
+		return false, false
+	}
+	switch val := v.(type) {
+	case bool:
+		return val, true
+	case string:
+		if b, err := strconv.ParseBool(val); err == nil {
+			return b, true
+		}
+	case int:
+		return val != 0, true
+	case int32:
+		return val != 0, true
+	case int64:
+		return val != 0, true
+	}
+	return false, false
 }
 
 // Delete removes a variable with a static value
@@ -259,20 +385,14 @@ scan:
 			}
 		}
 
-		// convert val to a string as efficiently as possible
-		valStr := ToString(val)
-
-		// write the value; if it's empty, either return
-		// an error or write a default value
-		if valStr == "" {
+		// append evaluated value directly or handle empty value
+		if !appendValue(&sb, val) {
 			if errOnEmpty {
 				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
 					string(phOpen), key, string(phClose))
 			} else if empty != "" {
 				sb.WriteString(empty)
 			}
-		} else {
-			sb.WriteString(valStr)
 		}
 
 		// advance cursor to end of placeholder
@@ -284,6 +404,110 @@ scan:
 	sb.WriteString(input[lastWriteCursor:])
 
 	return sb.String(), nil
+}
+
+// appendValue appends val directly to sb using zero-allocation appenders where possible.
+// It returns true if a non-empty value was appended, or false if val was empty or nil.
+func appendValue(sb *strings.Builder, val any) bool {
+	switch v := val.(type) {
+	case nil:
+		return false
+	case string:
+		if v == "" {
+			return false
+		}
+		sb.WriteString(v)
+		return true
+	case []byte:
+		if len(v) == 0 {
+			return false
+		}
+		sb.Write(v)
+		return true
+	case int:
+		var buf [32]byte
+		sb.Write(strconv.AppendInt(buf[:0], int64(v), 10))
+		return true
+	case int32:
+		var buf [32]byte
+		sb.Write(strconv.AppendInt(buf[:0], int64(v), 10))
+		return true
+	case int64:
+		var buf [32]byte
+		sb.Write(strconv.AppendInt(buf[:0], v, 10))
+		return true
+	case int8:
+		var buf [32]byte
+		sb.Write(strconv.AppendInt(buf[:0], int64(v), 10))
+		return true
+	case int16:
+		var buf [32]byte
+		sb.Write(strconv.AppendInt(buf[:0], int64(v), 10))
+		return true
+	case uint:
+		var buf [32]byte
+		sb.Write(strconv.AppendUint(buf[:0], uint64(v), 10))
+		return true
+	case uint32:
+		var buf [32]byte
+		sb.Write(strconv.AppendUint(buf[:0], uint64(v), 10))
+		return true
+	case uint64:
+		var buf [32]byte
+		sb.Write(strconv.AppendUint(buf[:0], v, 10))
+		return true
+	case uint16:
+		var buf [32]byte
+		sb.Write(strconv.AppendUint(buf[:0], uint64(v), 10))
+		return true
+	case byte:
+		sb.WriteByte(v)
+		return true
+	case float32:
+		var buf [64]byte
+		sb.Write(strconv.AppendFloat(buf[:0], float64(v), 'f', -1, 32))
+		return true
+	case float64:
+		var buf [64]byte
+		sb.Write(strconv.AppendFloat(buf[:0], v, 'f', -1, 64))
+		return true
+	case bool:
+		if v {
+			sb.WriteString("true")
+		} else {
+			sb.WriteString("false")
+		}
+		return true
+	case []rune:
+		if len(v) == 0 {
+			return false
+		}
+		for _, r := range v {
+			sb.WriteRune(r)
+		}
+		return true
+	case fmt.Stringer:
+		s := v.String()
+		if s == "" {
+			return false
+		}
+		sb.WriteString(s)
+		return true
+	case error:
+		s := v.Error()
+		if s == "" {
+			return false
+		}
+		sb.WriteString(s)
+		return true
+	default:
+		s := fmt.Sprintf("%+v", v)
+		if s == "" {
+			return false
+		}
+		sb.WriteString(s)
+		return true
+	}
 }
 
 // ToString returns val as a string, as efficiently as possible.

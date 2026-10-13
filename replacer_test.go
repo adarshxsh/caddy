@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -484,14 +485,134 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestTypedSettersAndGetters(t *testing.T) {
+	rep := NewEmptyReplacer()
+
+	rep.SetString("str", "hello")
+	if val, ok := rep.GetString("str"); !ok || val != "hello" {
+		t.Errorf("SetString/GetString failed: got %v, %v; expected hello, true", val, ok)
+	}
+
+	rep.SetInt("num", 42)
+	if val, ok := rep.GetInt("num"); !ok || val != 42 {
+		t.Errorf("SetInt/GetInt failed: got %v, %v; expected 42, true", val, ok)
+	}
+
+	rep.SetFloat("pi", 3.14159)
+	if val, ok := rep.GetFloat("pi"); !ok || val != 3.14159 {
+		t.Errorf("SetFloat/GetFloat failed: got %v, %v; expected 3.14159, true", val, ok)
+	}
+
+	rep.SetBool("flag", true)
+	if val, ok := rep.GetBool("flag"); !ok || val != true {
+		t.Errorf("SetBool/GetBool failed: got %v, %v; expected true, true", val, ok)
+	}
+
+	// Test coercion in getters
+	rep.SetString("str_int", "100")
+	if val, ok := rep.GetInt("str_int"); !ok || val != 100 {
+		t.Errorf("GetInt coercion from string failed: got %v, %v", val, ok)
+	}
+
+	rep.SetString("str_float", "2.718")
+	if val, ok := rep.GetFloat("str_float"); !ok || val != 2.718 {
+		t.Errorf("GetFloat coercion from string failed: got %v, %v", val, ok)
+	}
+
+	rep.SetString("str_bool", "true")
+	if val, ok := rep.GetBool("str_bool"); !ok || val != true {
+		t.Errorf("GetBool coercion from string failed: got %v, %v", val, ok)
+	}
+
+	// Missing keys
+	if _, ok := rep.GetInt("missing"); ok {
+		t.Errorf("GetInt on missing key returned ok=true")
+	}
+	if _, ok := rep.GetFloat("missing"); ok {
+		t.Errorf("GetFloat on missing key returned ok=true")
+	}
+	if _, ok := rep.GetBool("missing"); ok {
+		t.Errorf("GetBool on missing key returned ok=true")
+	}
+}
+
+type dummyStringer struct{ val string }
+
+func (d dummyStringer) String() string { return d.val }
+
+type dummyError struct{ msg string }
+
+func (d dummyError) Error() string { return d.msg }
+
+func TestAppendValue(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    any
+		expected string
+		written  bool
+	}{
+		{"nil", nil, "", false},
+		{"empty string", "", "", false},
+		{"string", "hello", "hello", true},
+		{"empty byte slice", []byte{}, "", false},
+		{"byte slice", []byte("world"), "world", true},
+		{"byte", byte('A'), "A", true},
+		{"int", int(123), "123", true},
+		{"int32", int32(-456), "-456", true},
+		{"int64", int64(789), "789", true},
+		{"uint", uint(100), "100", true},
+		{"uint64", uint64(200), "200", true},
+		{"float32", float32(1.25), "1.25", true},
+		{"float64", float64(3.14159), "3.14159", true},
+		{"bool true", true, "true", true},
+		{"bool false", false, "false", true},
+		{"runes", []rune{'a', 'b'}, "ab", true},
+		{"empty runes", []rune{}, "", false},
+		{"stringer", dummyStringer{val: "custom"}, "custom", true},
+		{"empty stringer", dummyStringer{val: ""}, "", false},
+		{"error", dummyError{msg: "err msg"}, "err msg", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var sb strings.Builder
+			written := appendValue(&sb, tc.input)
+			if written != tc.written {
+				t.Errorf("appendValue written = %v, expected %v", written, tc.written)
+			}
+			if sb.String() != tc.expected {
+				t.Errorf("appendValue result = %q, expected %q", sb.String(), tc.expected)
+			}
+		})
+	}
+}
+
+func TestReplacerTypedAndByteSlice(t *testing.T) {
+	rep := NewEmptyReplacer()
+	rep.SetString("strKey", "val")
+	rep.SetInt("intKey", 42)
+	rep.SetFloat("floatKey", 1.5)
+	rep.SetBool("boolKey", true)
+	rep.Set("bytesKey", []byte("byteVal"))
+
+	out := rep.ReplaceAll("s={strKey} i={intKey} f={floatKey} b={boolKey} bytes={bytesKey}", "")
+	expected := "s=val i=42 f=1.5 b=true bytes=byteVal"
+	if out != expected {
+		t.Errorf("ReplaceAll output = %q, expected %q", out, expected)
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
 	}
 
 	rep := testReplacer()
-	rep.Set("str", "a string")
-	rep.Set("int", 123.456)
+	rep.SetString("str", "a string")
+	rep.SetInt("int", 123)
+	rep.SetFloat("float", 123.456)
+	rep.SetBool("bool", true)
+	rep.Set("bytes", []byte("byte slice"))
 
 	for _, bm := range []testCase{
 		{
@@ -505,6 +626,18 @@ func BenchmarkReplacer(b *testing.B) {
 		{
 			name:  "int replacement",
 			input: `int={int}`,
+		},
+		{
+			name:  "float replacement",
+			input: `float={float}`,
+		},
+		{
+			name:  "bool replacement",
+			input: `bool={bool}`,
+		},
+		{
+			name:  "bytes replacement",
+			input: `bytes={bytes}`,
 		},
 		{
 			name:  "placeholder",
