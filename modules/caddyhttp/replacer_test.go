@@ -296,3 +296,50 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPVarReplacement_MissingLocalAddr(t *testing.T) {
+	testCases := []struct {
+		name string
+		ctx  context.Context
+	}{
+		{
+			name: "missing key",
+			ctx:  context.Background(),
+		},
+		{
+			name: "nil value",
+			ctx:  context.WithValue(context.Background(), http.LocalAddrContextKey, nil),
+		},
+		{
+			name: "invalid type value",
+			ctx:  context.WithValue(context.Background(), http.LocalAddrContextKey, "invalid"),
+		},
+	}
+
+	placeholders := []string{
+		"http.request.local",
+		"http.request.local.host",
+		"http.request.local.port",
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodGet, "/", nil)
+			repl := caddy.NewReplacer()
+			ctx := context.WithValue(tc.ctx, caddy.ReplacerCtxKey, repl)
+			req = req.WithContext(ctx)
+			addHTTPVarsToReplacer(repl, req, nil)
+
+			for _, ph := range placeholders {
+				val, ok := repl.GetString(ph)
+				if !ok {
+					t.Errorf("expected placeholder %q to be recognized", ph)
+				}
+				if val != "" {
+					t.Errorf("expected placeholder %q to return empty string, got %q", ph, val)
+				}
+			}
+		})
+	}
+}
+
