@@ -296,3 +296,85 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestReplacerEmptyContext(t *testing.T) {
+	placeholders := []string{
+		"http.request.duration",
+		"http.request.duration_ms",
+		"http.request.uuid",
+		"http.request.local",
+		"http.request.local.host",
+		"http.request.local.port",
+		"http.request.orig_method",
+		"http.request.orig_uri",
+		"http.request.orig_uri.path",
+		"http.request.orig_uri.path.file",
+		"http.request.orig_uri.path.dir",
+		"http.request.orig_uri.query",
+		"http.request.orig_uri.prefixed_query",
+		"http.request.orig_uri.path.0",
+		"http.shutting_down",
+		"http.time_until_shutdown",
+		"http.request.uri",
+		"http.request.uri_escaped",
+		"http.request.uri.path",
+		"http.request.uri.path_escaped",
+		"http.request.uri.path.file",
+		"http.request.uri.path.dir",
+		"http.request.uri.path.file.base",
+		"http.request.uri.path.file.ext",
+		"http.request.uri.query",
+		"http.request.uri.query_escaped",
+		"http.request.uri.prefixed_query",
+		"http.request.uri.path.0",
+		"http.request.uri.query.foo",
+	}
+
+	// 1. Request with background (empty) context
+	t.Run("empty_context", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		for _, ph := range placeholders {
+			_ = repl.ReplaceAll("{"+ph+"}", "")
+		}
+	})
+
+	// 2. Request with wrong types in context
+	t.Run("wrong_context_types", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+		vars := make(map[string]any)
+		ctx := context.WithValue(req.Context(), VarsCtxKey, vars)
+		SetVar(ctx, "start_time", "not a time.Time")
+		SetVar(ctx, "uuid", 12345)
+		ctx = context.WithValue(ctx, http.LocalAddrContextKey, "not a net.Addr")
+		ctx = context.WithValue(ctx, OriginalRequestCtxKey, "not an http.Request")
+		ctx = context.WithValue(ctx, ExtraLogFieldsCtxKey, "not ExtraLogFields")
+		ctx = context.WithValue(ctx, ServerCtxKey, "not a Server")
+		req = req.WithContext(ctx)
+
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		for _, ph := range placeholders {
+			_ = repl.ReplaceAll("{"+ph+"}", "")
+		}
+	})
+
+	// 3. Request with nil URL
+	t.Run("nil_url", func(t *testing.T) {
+		req := &http.Request{
+			Method:     http.MethodGet,
+			Header:     make(http.Header),
+			RemoteAddr: "127.0.0.1:1234",
+		}
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		for _, ph := range placeholders {
+			_ = repl.ReplaceAll("{"+ph+"}", "")
+		}
+	})
+}
+

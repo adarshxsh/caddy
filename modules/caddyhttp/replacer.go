@@ -63,6 +63,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 		if req != nil {
 			// query string parameters
 			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
+				if req.URL == nil {
+					return "", true
+				}
 				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
 				// always return true, since the query param might
 				// be present only in some requests
@@ -128,10 +131,16 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			case "http.request.hostport":
 				return req.Host, true
 			case "http.request.local":
-				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				if !ok || localAddr == nil {
+					return nil, false
+				}
 				return localAddr.String(), true
 			case "http.request.local.host":
-				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				if !ok || localAddr == nil {
+					return nil, false
+				}
 				host, _, err := net.SplitHostPort(localAddr.String())
 				if err != nil {
 					// localAddr is host:port for tcp and udp sockets and /unix/socket.path
@@ -143,7 +152,10 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				}
 				return host, true
 			case "http.request.local.port":
-				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				if !ok || localAddr == nil {
+					return nil, false
+				}
 				_, port, _ := net.SplitHostPort(localAddr.String())
 				if portNum, err := strconv.Atoi(port); err == nil {
 					return portNum, true
@@ -179,46 +191,89 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 
 			// current URI, including any internal rewrites
 			case "http.request.uri":
+				if req.URL == nil {
+					return "", true
+				}
 				return req.URL.RequestURI(), true
 			case "http.request.uri_escaped":
+				if req.URL == nil {
+					return "", true
+				}
 				return url.QueryEscape(req.URL.RequestURI()), true
 			case "http.request.uri.path":
+				if req.URL == nil {
+					return "", true
+				}
 				return req.URL.Path, true
 			case "http.request.uri.path_escaped":
+				if req.URL == nil {
+					return "", true
+				}
 				return url.QueryEscape(req.URL.Path), true
 			case "http.request.uri.path.file":
+				if req.URL == nil {
+					return "", true
+				}
 				_, file := path.Split(req.URL.Path)
 				return file, true
 			case "http.request.uri.path.dir":
+				if req.URL == nil {
+					return "", true
+				}
 				dir, _ := path.Split(req.URL.Path)
 				return dir, true
 			case "http.request.uri.path.file.base":
+				if req.URL == nil {
+					return "", true
+				}
 				return strings.TrimSuffix(path.Base(req.URL.Path), path.Ext(req.URL.Path)), true
 			case "http.request.uri.path.file.ext":
+				if req.URL == nil {
+					return "", true
+				}
 				return path.Ext(req.URL.Path), true
 			case "http.request.uri.query":
+				if req.URL == nil {
+					return "", true
+				}
 				return req.URL.RawQuery, true
 			case "http.request.uri.query_escaped":
+				if req.URL == nil {
+					return "", true
+				}
 				return url.QueryEscape(req.URL.RawQuery), true
 			case "http.request.uri.prefixed_query":
+				if req.URL == nil {
+					return "", true
+				}
 				if req.URL.RawQuery == "" {
 					return "", true
 				}
 				return "?" + req.URL.RawQuery, true
 			case "http.request.duration":
-				start := GetVar(req.Context(), "start_time").(time.Time)
+				start, ok := GetVar(req.Context(), "start_time").(time.Time)
+				if !ok {
+					return nil, false
+				}
 				return time.Since(start), true
 			case "http.request.duration_ms":
-				start := GetVar(req.Context(), "start_time").(time.Time)
+				start, ok := GetVar(req.Context(), "start_time").(time.Time)
+				if !ok {
+					return nil, false
+				}
 				return time.Since(start).Seconds() * 1e3, true // multiply seconds to preserve decimal (see #4666)
 
 			case "http.request.uuid":
 				// fetch the UUID for this request
-				id := GetVar(req.Context(), "uuid").(*requestID)
+				id, ok := GetVar(req.Context(), "uuid").(*requestID)
+				if !ok || id == nil {
+					return nil, false
+				}
 
 				// set it to this request's access log
-				extra := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields)
-				extra.Set(zap.String("uuid", id.String()))
+				if extra, ok := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields); ok && extra != nil {
+					extra.Set(zap.String("uuid", id.String()))
+				}
 
 				return id.String(), true
 
@@ -254,27 +309,48 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 
 			// original request, before any internal changes
 			case "http.request.orig_method":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or, ok := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if !ok {
+					return nil, false
+				}
 				return or.Method, true
 			case "http.request.orig_uri":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or, ok := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if !ok {
+					return nil, false
+				}
 				return or.RequestURI, true
 			case "http.request.orig_uri.path":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or, ok := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if !ok || or.URL == nil {
+					return nil, false
+				}
 				return or.URL.Path, true
 			case "http.request.orig_uri.path.file":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or, ok := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if !ok || or.URL == nil {
+					return nil, false
+				}
 				_, file := path.Split(or.URL.Path)
 				return file, true
 			case "http.request.orig_uri.path.dir":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or, ok := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if !ok || or.URL == nil {
+					return nil, false
+				}
 				dir, _ := path.Split(or.URL.Path)
 				return dir, true
 			case "http.request.orig_uri.query":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or, ok := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if !ok || or.URL == nil {
+					return nil, false
+				}
 				return or.URL.RawQuery, true
 			case "http.request.orig_uri.prefixed_query":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or, ok := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if !ok || or.URL == nil {
+					return nil, false
+				}
 				if or.URL.RawQuery == "" {
 					return "", true
 				}
@@ -332,6 +408,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 
 			// path parts
 			if strings.HasPrefix(key, reqURIPathReplPrefix) {
+				if req.URL == nil {
+					return "", true
+				}
 				idxStr := key[len(reqURIPathReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
 				if err != nil {
@@ -357,7 +436,10 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil {
 					return "", false
 				}
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or, ok := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if !ok || or.URL == nil {
+					return "", true
+				}
 				pathParts := strings.Split(or.URL.Path, "/")
 				if len(pathParts) > 0 && pathParts[0] == "" {
 					pathParts = pathParts[1:]
@@ -394,10 +476,22 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 
 		switch key {
 		case "http.shutting_down":
-			server := req.Context().Value(ServerCtxKey).(*Server)
+			if req == nil {
+				return nil, false
+			}
+			server, ok := req.Context().Value(ServerCtxKey).(*Server)
+			if !ok || server == nil {
+				return nil, false
+			}
 			return server.shutdownAt.Load() != nil, true
 		case "http.time_until_shutdown":
-			server := req.Context().Value(ServerCtxKey).(*Server)
+			if req == nil {
+				return nil, false
+			}
+			server, ok := req.Context().Value(ServerCtxKey).(*Server)
+			if !ok || server == nil {
+				return nil, false
+			}
 			t := server.shutdownAt.Load()
 			if t == nil {
 				return nil, true
