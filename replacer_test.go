@@ -371,6 +371,25 @@ func TestReplacerMap(t *testing.T) {
 	}
 }
 
+type dummyProvider struct{}
+
+func (d dummyProvider) Replace(key string) (any, bool) {
+	if key == "custom.key" {
+		return "custom.value", true
+	}
+	return nil, false
+}
+
+func TestReplacerMapProvider(t *testing.T) {
+	repl := NewReplacer()
+	repl.MapProvider(dummyProvider{})
+
+	val, ok := repl.GetString("custom.key")
+	if !ok || val != "custom.value" {
+		t.Fatalf("expected 'custom.value', got %q (ok=%t)", val, ok)
+	}
+}
+
 func TestReplacerNew(t *testing.T) {
 	repl := NewReplacer()
 
@@ -413,7 +432,7 @@ func TestReplacerNew(t *testing.T) {
 			value:    "envtest",
 		},
 	} {
-		if val, ok := repl.providers[0].replace(tc.variable); ok {
+		if val, ok := repl.providers[0].Replace(tc.variable); ok {
 			if val != tc.value {
 				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
 			}
@@ -440,7 +459,7 @@ func TestReplacerNew(t *testing.T) {
 			value:    "foo" + getEOL(),
 		},
 	} {
-		if val, ok := repl.providers[1].replace(tc.variable); ok {
+		if val, ok := repl.providers[1].Replace(tc.variable); ok {
 			if val != tc.value {
 				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
 			}

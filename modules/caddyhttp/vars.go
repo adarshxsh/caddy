@@ -435,7 +435,13 @@ func GetVar(ctx context.Context, key string) any {
 	if !ok {
 		return nil
 	}
-	return varMap[key]
+	val, exists := varMap[key]
+	if !exists && key == "uuid" {
+		reqID := new(requestID)
+		varMap["uuid"] = reqID
+		return reqID
+	}
+	return val
 }
 
 // SetVar sets a value in the context's variable table with
