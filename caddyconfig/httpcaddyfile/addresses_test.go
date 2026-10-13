@@ -95,6 +95,11 @@ func TestAddressString(t *testing.T) {
 		{Address{Scheme: "", Host: "host", Port: "80", Path: "/path"}, "http://host/path"},
 		{Address{Scheme: "http", Host: "", Port: "1234", Path: ""}, "http://:1234"},
 		{Address{Scheme: "", Host: "", Port: "", Path: ""}, ""},
+		{Address{Scheme: "http", Host: "::1"}, "http://[::1]"},
+		{Address{Scheme: "https", Host: "2001:db8::1", Port: "443"}, "https://[2001:db8::1]"},
+		{Address{Scheme: "http", Host: "2001:db8::1", Port: "8080"}, "http://[2001:db8::1]:8080"},
+		{Address{Scheme: "http", Host: "[::1]"}, "http://[::1]"},
+		{Address{Scheme: "", Host: "::1", Port: "80", Path: ""}, "http://[::1]"},
 	} {
 		actual := test.addr.String()
 		if actual != test.expected {
@@ -249,5 +254,23 @@ func TestKeyNormalization(t *testing.T) {
 		if actual.Path != tc.expect.Path {
 			t.Errorf("Test %d: Input '%s': Expected Path='%s' but got Path='%s'", i, tc.input, tc.expect.Path, actual.Path)
 		}
+	}
+}
+
+func BenchmarkAddressStringIPv4(b *testing.B) {
+	addr := Address{Scheme: "http", Host: "127.0.0.1"}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = addr.String()
+	}
+}
+
+func BenchmarkAddressStringIPv6(b *testing.B) {
+	addr := Address{Scheme: "http", Host: "2001:db8::1"}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = addr.String()
 	}
 }
