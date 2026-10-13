@@ -20,81 +20,104 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func TestParseVariadic(t *testing.T) {
 	args := make([]string, 10)
 	for i, tc := range []struct {
-		input  string
-		result bool
+		input string
+		isVar bool
+		valid bool
 	}{
 		{
-			input:  "",
-			result: false,
+			input: "",
+			isVar: false,
+			valid: false,
 		},
 		{
-			input:  "{args[1",
-			result: false,
+			input: "{args[1",
+			isVar: false,
+			valid: false,
 		},
 		{
-			input:  "1]}",
-			result: false,
+			input: "1]}",
+			isVar: false,
+			valid: false,
 		},
 		{
-			input:  "{args[:]}aaaaa",
-			result: false,
+			input: "{args[:]}aaaaa",
+			isVar: false,
+			valid: false,
 		},
 		{
-			input:  "aaaaa{args[:]}",
-			result: false,
+			input: "aaaaa{args[:]}",
+			isVar: false,
+			valid: false,
 		},
 		{
-			input:  "{args.}",
-			result: false,
+			input: "{args.}",
+			isVar: false,
+			valid: false,
 		},
 		{
-			input:  "{args.1}",
-			result: false,
+			input: "{args.1}",
+			isVar: false,
+			valid: false,
 		},
 		{
-			input:  "{args[]}",
-			result: false,
+			input: "{args[]}",
+			isVar: false,
+			valid: false,
 		},
 		{
-			input:  "{args[:]}",
-			result: true,
+			input: "{args[:]}",
+			isVar: true,
+			valid: true,
 		},
 		{
-			input:  "{args[:]}",
-			result: true,
+			input: "{args[:]}",
+			isVar: true,
+			valid: true,
 		},
 		{
-			input:  "{args[0:]}",
-			result: true,
+			input: "{args[0:]}",
+			isVar: true,
+			valid: true,
 		},
 		{
-			input:  "{args[:0]}",
-			result: true,
+			input: "{args[:0]}",
+			isVar: true,
+			valid: false,
 		},
 		{
-			input:  "{args[-1:]}",
-			result: false,
+			input: "{args[-1:]}",
+			isVar: true,
+			valid: false,
 		},
 		{
-			input:  "{args[:11]}",
-			result: false,
+			input: "{args[:11]}",
+			isVar: true,
+			valid: false,
 		},
 		{
-			input:  "{args[10:0]}",
-			result: false,
+			input: "{args[10:0]}",
+			isVar: true,
+			valid: false,
 		},
 		{
-			input:  "{args[0:10]}",
-			result: true,
+			input: "{args[0:10]}",
+			isVar: true,
+			valid: true,
 		},
 		{
-			input:  "{args[0]}:{args[1]}:{args[2]}",
-			result: false,
+			input: "{args[0]}:{args[1]}:{args[2]}",
+			isVar: false,
+			valid: false,
 		},
 	} {
 		token := Token{
@@ -102,8 +125,157 @@ func TestParseVariadic(t *testing.T) {
 			Line: 1,
 			Text: tc.input,
 		}
-		if v, _, _ := parseVariadic(token, len(args)); v != tc.result {
-			t.Errorf("Test %d error expectation failed Expected: %t, got %t", i, tc.result, v)
+		isVar, valid, _, _ := parseVariadic(token, len(args))
+		if isVar != tc.isVar || valid != tc.valid {
+			t.Errorf("Test %d (%s) expectation failed Expected isVar: %t, valid: %t; got isVar: %t, valid: %t",
+				i, tc.input, tc.isVar, tc.valid, isVar, valid)
+		}
+	}
+}
+
+func TestVariadicImportTokenDropping(t *testing.T) {
+	for i, tc := range []struct {
+		input            string
+		expectedSegments [][]string
+	}{
+		{
+			// Out-of-bounds variadic placeholder: {args[0:10]} with 2 args.
+			// The token {args[0:10]} must be dropped and NOT left in AST tokens.
+			input: `(snippet) {
+				echo {args[0:10]}
+			}
+			:8080 {
+				import snippet val1 val2
+			}`,
+			expectedSegments: [][]string{
+				{"echo"},
+			},
+		},
+		{
+			// Zero-argument variadic evaluation: {args[0:]} with 0 args.
+			// The token {args[0:]} must be dropped.
+			input: `(snippet) {
+				echo {args[0:]}
+			}
+			:8080 {
+				import snippet
+			}`,
+			expectedSegments: [][]string{
+				{"echo"},
+			},
+		},
+		{
+			// Zero-length variadic range: {args[2:]} with 2 args (indices 2 to 2).
+			// The token {args[2:]} must be dropped.
+			input: `(snippet) {
+				echo {args[2:]}
+			}
+			:8080 {
+				import snippet val1 val2
+			}`,
+			expectedSegments: [][]string{
+				{"echo"},
+			},
+		},
+		{
+			// Valid variadic placeholder expansion.
+			input: `(snippet) {
+				echo {args[0:2]}
+			}
+			:8080 {
+				import snippet val1 val2 val3
+			}`,
+			expectedSegments: [][]string{
+				{"echo", "val1", "val2"},
+			},
+		},
+	} {
+		blocks, err := Parse("Testfile", []byte(tc.input))
+		if err != nil {
+			t.Fatalf("Test %d failed with error: %v", i, err)
+		}
+		if len(blocks) != 1 {
+			t.Fatalf("Test %d expected 1 block, got %d", i, len(blocks))
+		}
+
+		block := blocks[0]
+		if len(block.Segments) != len(tc.expectedSegments) {
+			t.Fatalf("Test %d expected %d segments, got %d", i, len(block.Segments), len(block.Segments))
+		}
+
+		for segIdx, seg := range block.Segments {
+			expSeg := tc.expectedSegments[segIdx]
+			if len(seg) != len(expSeg) {
+				t.Fatalf("Test %d segment %d expected %d tokens, got %d: %v", i, segIdx, len(expSeg), len(seg), seg)
+			}
+			for tokenIdx, tok := range seg {
+				if tok.Text != expSeg[tokenIdx] {
+					t.Errorf("Test %d segment %d token %d expected %q, got %q", i, segIdx, tokenIdx, expSeg[tokenIdx], tok.Text)
+				}
+			}
+		}
+	}
+}
+
+func TestVariadicImportWarnings(t *testing.T) {
+	for i, tc := range []struct {
+		input           string
+		expectedWarnMsg string
+	}{
+		{
+			input: `(snippet) {
+				echo {args[0:10]}
+			}
+			:8080 {
+				import snippet val1 val2
+			}`,
+			expectedWarnMsg: "Variadic placeholder {args[0:10]} indices are out of bounds, only 2 argument(s) exist",
+		},
+		{
+			input: `(snippet) {
+				echo {args[0:]}
+			}
+			:8080 {
+				import snippet
+			}`,
+			expectedWarnMsg: "Variadic placeholder {args[0:]} evaluated to 0 arguments",
+		},
+		{
+			input: `(snippet) {
+				echo {args[2:]}
+			}
+			:8080 {
+				import snippet val1 val2
+			}`,
+			expectedWarnMsg: "Variadic placeholder {args[2:]} evaluated to 0 arguments",
+		},
+	} {
+		core, recorded := observer.New(zap.WarnLevel)
+		testLogger := zap.New(core)
+
+		_, _, bufCore := caddy.BufferedLog()
+		_, err := Parse("Testfile", []byte(tc.input))
+		if err != nil {
+			t.Fatalf("Test %d failed with error: %v", i, err)
+		}
+
+		bufCore.FlushTo(testLogger)
+
+		logs := recorded.All()
+		var found bool
+		for _, entry := range logs {
+			if strings.Contains(entry.Message, tc.expectedWarnMsg) {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			var logMsgs []string
+			for _, entry := range logs {
+				logMsgs = append(logMsgs, entry.Message)
+			}
+			t.Errorf("Test %d expected warning message %q, got logs: %v", i, tc.expectedWarnMsg, logMsgs)
 		}
 	}
 }
