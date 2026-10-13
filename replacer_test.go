@@ -15,10 +15,12 @@
 package caddy
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -484,6 +486,65 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerZeroAllocations(t *testing.T) {
+	rep := testReplacer()
+
+	tests := []struct {
+		name string
+		fn   func()
+	}{
+		{
+			name: "unclosed brace in ReplaceAll",
+			fn: func() {
+				rep.ReplaceAll("string { unclosed brace", "")
+			},
+		},
+		{
+			name: "unmatched brace in ReplaceKnown",
+			fn: func() {
+				rep.ReplaceKnown("string with {unknown} brace", "")
+			},
+		},
+		{
+			name: "no braces",
+			fn: func() {
+				rep.ReplaceAll("simple static string", "")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, tc.fn)
+			if allocs > 0 {
+				t.Errorf("Expected 0 allocs/op for %s, got %f", tc.name, allocs)
+			}
+		})
+	}
+}
+
+func TestReplacerBufferPoolLimit(t *testing.T) {
+	rep := NewEmptyReplacer()
+	// Create a large string exceeding 64 KiB (maxBufSize)
+	largeVal := strings.Repeat("A", maxBufSize+1024)
+	rep.Set("large", largeVal)
+
+	out := rep.ReplaceAll("prefix {large} suffix", "")
+	expectedLen := len("prefix ") + len(largeVal) + len(" suffix")
+	if len(out) != expectedLen {
+		t.Errorf("Expected output length %d, got %d", expectedLen, len(out))
+	}
+
+	// Verify that the pooled buffer from bufPool does NOT retain the large capacity (>64 KiB)
+	buf := bufPool.Get().(*bytes.Buffer)
+	cap := buf.Cap()
+	bufPool.Put(buf)
+
+	if cap > maxBufSize {
+		t.Errorf("Expected pooled buffer capacity <= %d, but got %d", maxBufSize, cap)
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
@@ -514,10 +575,24 @@ func BenchmarkReplacer(b *testing.B) {
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
+		{
+			name:  "unclosed brace",
+			input: `string { unclosed brace`,
+		},
+		{
+			name:  "unused brace replace known",
+			input: `string with {unknown} brace`,
+		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
-			for b.Loop() {
-				rep.ReplaceAll(bm.input, bm.empty)
+			if bm.name == "unused brace replace known" {
+				for b.Loop() {
+					rep.ReplaceKnown(bm.input, bm.empty)
+				}
+			} else {
+				for b.Loop() {
+					rep.ReplaceAll(bm.input, bm.empty)
+				}
 			}
 		})
 	}
