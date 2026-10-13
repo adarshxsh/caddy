@@ -251,3 +251,52 @@ func TestKeyNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestListenersForServerBlockAddress(t *testing.T) {
+	st := &ServerType{}
+
+	sblock := serverBlock{
+		pile: map[string][]ConfigValue{
+			"bind": {
+				{
+					Value: addressesWithProtocols{
+						addresses: []string{"127.0.0.1"},
+						protocols: []string{"http/1.1", "h2"},
+					},
+				},
+				{
+					Value: addressesWithProtocols{
+						addresses: []string{"127.0.0.1"},
+						protocols: []string{"h3"},
+					},
+				},
+			},
+		},
+	}
+
+	addr, err := ParseAddress("example.com:443")
+	if err != nil {
+		t.Fatalf("ParseAddress error: %v", err)
+	}
+
+	listeners, err := st.listenersForServerBlockAddress(sblock, addr, nil)
+	if err != nil {
+		t.Fatalf("listenersForServerBlockAddress error: %v", err)
+	}
+
+	expectedKey := "127.0.0.1:443"
+	protocolsMap, ok := listeners[expectedKey]
+	if !ok {
+		t.Fatalf("expected listener key %q in listeners map, got map: %v", expectedKey, listeners)
+	}
+
+	expectedProtocols := []string{"http/1.1", "h2", "h3"}
+	for _, proto := range expectedProtocols {
+		if _, exists := protocolsMap[proto]; !exists {
+			t.Errorf("expected protocol %q in listener protocols map for key %q, but not found. Map: %v", proto, expectedKey, protocolsMap)
+		}
+	}
+	if len(protocolsMap) != len(expectedProtocols) {
+		t.Errorf("expected %d protocols, got %d: %v", len(expectedProtocols), len(protocolsMap), protocolsMap)
+	}
+}
