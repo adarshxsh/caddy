@@ -31,7 +31,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"net/textproto"
 	"net/url"
 	"path"
 	"strconv"
@@ -63,19 +62,22 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 		if req != nil {
 			// query string parameters
 			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
-				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
+				field := key[len(reqURIQueryReplPrefix):]
+				var rawQuery string
+				if req.URL != nil {
+					rawQuery = req.URL.RawQuery
+				}
 				// always return true, since the query param might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return getURLQueryVar(rawQuery, field), true
 			}
 
 			// request header fields
 			if strings.HasPrefix(key, reqHeaderReplPrefix) {
 				field := key[len(reqHeaderReplPrefix):]
-				vals := req.Header[textproto.CanonicalMIMEHeaderKey(field)]
 				// always return true, since the header field might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return getHeaderVar(req.Header, field), true
 			}
 
 			// cookies
@@ -385,10 +387,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// response header fields
 			if strings.HasPrefix(key, respHeaderReplPrefix) {
 				field := key[len(respHeaderReplPrefix):]
-				vals := w.Header()[textproto.CanonicalMIMEHeaderKey(field)]
 				// always return true, since the header field might
 				// be present only in some responses
-				return strings.Join(vals, ","), true
+				return getHeaderVar(w.Header(), field), true
 			}
 		}
 
@@ -597,3 +598,95 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+// getURLQueryVar parses key-value pairs directly from rawQuery in-place
+// without allocating url.Values maps.
+func getURLQueryVar(rawQuery, targetKey string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	var firstValue string
+	var otherValues []string
+	found := 0
+
+	for rawQuery != "" {
+		var pair string
+		pair, rawQuery, _ = strings.Cut(rawQuery, "&")
+		if pair == "" {
+			continue
+		}
+		if strings.Contains(pair, ";") {
+			continue
+		}
+
+		key, val, _ := strings.Cut(pair, "=")
+
+		// Check key
+		keyMatched := false
+		if strings.IndexByte(key, '%') < 0 && strings.IndexByte(key, '+') < 0 {
+			keyMatched = (key == targetKey)
+		} else {
+			unescapedKey, err := url.QueryUnescape(key)
+			if err != nil {
+				continue
+			}
+			keyMatched = (unescapedKey == targetKey)
+		}
+
+		if !keyMatched {
+			continue
+		}
+
+		// Unescape value if necessary
+		var unescapedVal string
+		if strings.IndexByte(val, '%') < 0 && strings.IndexByte(val, '+') < 0 {
+			unescapedVal = val
+		} else {
+			var err error
+			unescapedVal, err = url.QueryUnescape(val)
+			if err != nil {
+				continue
+			}
+		}
+
+		found++
+		if found == 1 {
+			firstValue = unescapedVal
+		} else if found == 2 {
+			otherValues = []string{firstValue, unescapedVal}
+		} else {
+			otherValues = append(otherValues, unescapedVal)
+		}
+	}
+
+	if found == 0 {
+		return ""
+	}
+	if found == 1 {
+		return firstValue
+	}
+	return strings.Join(otherValues, ",")
+}
+
+// getHeaderVar performs a direct map lookup first, falling back to
+// case-insensitive key comparison using strings.EqualFold.
+func getHeaderVar(h http.Header, field string) string {
+	if len(h) == 0 {
+		return ""
+	}
+	if vals, ok := h[field]; ok {
+		return strings.Join(vals, ",")
+	}
+	var matches []string
+	for k, vals := range h {
+		if strings.EqualFold(k, field) {
+			if matches == nil {
+				matches = vals
+			} else {
+				matches = append(append([]string(nil), matches...), vals...)
+			}
+		}
+	}
+	return strings.Join(matches, ",")
+}
+

@@ -296,3 +296,105 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestQueryParamLookups(t *testing.T) {
+	for i, tc := range []struct {
+		rawQuery string
+		key      string
+		expect   string
+	}{
+		{rawQuery: "", key: "a", expect: ""},
+		{rawQuery: "a=1", key: "a", expect: "1"},
+		{rawQuery: "a=1&b=2", key: "a", expect: "1"},
+		{rawQuery: "a=1&b=2", key: "b", expect: "2"},
+		{rawQuery: "a=1&b=2", key: "c", expect: ""},
+		{rawQuery: "a=1&b=2&a=3", key: "a", expect: "1,3"},
+		{rawQuery: "a", key: "a", expect: ""},
+		{rawQuery: "a=", key: "a", expect: ""},
+		{rawQuery: "a&a=", key: "a", expect: ","},
+		{rawQuery: "a%20b=c%20d", key: "a b", expect: "c d"},
+		{rawQuery: "a+b=c+d", key: "a b", expect: "c d"},
+		{rawQuery: "a=1;b=2", key: "a", expect: ""},
+		{rawQuery: "a=%XX", key: "a", expect: ""},
+		{rawQuery: "a=1&&b=2", key: "b", expect: "2"},
+	} {
+		req, _ := http.NewRequest(http.MethodGet, "/?"+tc.rawQuery, nil)
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		actual, ok := repl.GetString("http.request.uri.query." + tc.key)
+		if !ok {
+			t.Errorf("Test %d: expected recognized placeholder", i)
+		}
+		if actual != tc.expect {
+			t.Errorf("Test %d (query %q, key %q): expected %q, got %q", i, tc.rawQuery, tc.key, tc.expect, actual)
+		}
+	}
+}
+
+func TestHeaderLookups(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("User-Agent", "CaddyTest/1.0")
+	req.Header.Add("Accept", "text/html")
+	req.Header.Add("Accept", "application/json")
+	req.Header["x-custom-case"] = []string{"custom-value"}
+
+	res := httptest.NewRecorder()
+	res.Header().Set("Content-Type", "text/plain")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	for i, tc := range []struct {
+		placeholder string
+		expect      string
+	}{
+		{placeholder: "http.request.header.User-Agent", expect: "CaddyTest/1.0"},
+		{placeholder: "http.request.header.user-agent", expect: "CaddyTest/1.0"},
+		{placeholder: "http.request.header.USER-AGENT", expect: "CaddyTest/1.0"},
+		{placeholder: "http.request.header.uSeR-aGeNt", expect: "CaddyTest/1.0"},
+		{placeholder: "http.request.header.Accept", expect: "text/html,application/json"},
+		{placeholder: "http.request.header.accept", expect: "text/html,application/json"},
+		{placeholder: "http.request.header.X-Custom-Case", expect: "custom-value"},
+		{placeholder: "http.request.header.x-custom-case", expect: "custom-value"},
+		{placeholder: "http.request.header.Non-Existent", expect: ""},
+		{placeholder: "http.response.header.Content-Type", expect: "text/plain"},
+		{placeholder: "http.response.header.content-type", expect: "text/plain"},
+		{placeholder: "http.response.header.CONTENT-TYPE", expect: "text/plain"},
+		{placeholder: "http.response.header.Non-Existent", expect: ""},
+	} {
+		actual, ok := repl.GetString(tc.placeholder)
+		if !ok {
+			t.Errorf("Test %d: expected recognized placeholder %s", i, tc.placeholder)
+		}
+		if actual != tc.expect {
+			t.Errorf("Test %d (%s): expected %q, got %q", i, tc.placeholder, tc.expect, actual)
+		}
+	}
+}
+
+func BenchmarkReplacerQueryLookup(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1?api_key=secret_12345&format=json&limit=50", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.uri.query.api_key")
+	}
+}
+
+func BenchmarkReplacerHeaderLookup(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.header.user-agent")
+	}
+}
+
