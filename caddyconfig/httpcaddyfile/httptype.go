@@ -58,6 +58,9 @@ func (st ServerType) Setup(
 	inputServerBlocks []caddyfile.ServerBlock,
 	options map[string]any,
 ) (*caddy.Config, []caddyconfig.Warning, error) {
+	if options == nil {
+		options = make(map[string]any)
+	}
 	var warnings []caddyconfig.Warning
 	gc := counter{new(int)}
 	state := make(map[string]any)
@@ -368,6 +371,9 @@ func (st ServerType) Setup(
 // keys. It returns the updated list of server blocks with the
 // global options block removed, and updates options accordingly.
 func (ServerType) evaluateGlobalOptionsBlock(serverBlocks []serverBlock, options map[string]any) ([]serverBlock, error) {
+	if options == nil {
+		options = make(map[string]any)
+	}
 	if len(serverBlocks) == 0 || len(serverBlocks[0].block.Keys) > 0 {
 		return serverBlocks, nil
 	}
@@ -463,6 +469,9 @@ func (ServerType) extractNamedRoutes(
 	warnings *[]caddyconfig.Warning,
 	replacer ShorthandReplacer,
 ) ([]serverBlock, error) {
+	if options == nil {
+		options = make(map[string]any)
+	}
 	namedRoutes := map[string]*caddyhttp.Route{}
 
 	gc := counter{new(int)}
