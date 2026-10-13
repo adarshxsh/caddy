@@ -192,7 +192,6 @@ func (r *Replacer) replace(input, empty string,
 	// fail fast if too many placeholders are unclosed
 	var unclosedCount int
 
-scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
@@ -212,21 +211,34 @@ scan:
 			return "", fmt.Errorf("too many unclosed placeholders")
 		}
 
-		// find the end of the placeholder
-		end := strings.Index(input[i:], string(phClose)) + i
-		if end < i {
-			unclosedCount++
-			continue
+		// find the end of the placeholder using balanced brace depth scanning
+		end := -1
+		firstUnescapedClose := -1
+
+		depth := 1
+		for j := i + 1; j < len(input); j++ {
+			if isUnescapedOpen(input, j) {
+				depth++
+			} else if isUnescapedClose(input, j) {
+				if firstUnescapedClose == -1 {
+					firstUnescapedClose = j
+				}
+				depth--
+				if depth == 0 {
+					end = j
+					break
+				}
+			}
 		}
 
-		// if necessary look for the first closing brace that is not escaped
-		for end > 0 && end < len(input)-1 && input[end-1] == phEscape {
-			nextEnd := strings.Index(input[end+1:], string(phClose))
-			if nextEnd < 0 {
-				unclosedCount++
-				continue scan
-			}
-			end += nextEnd + 1
+		// if balanced outer closing brace was not found, fall back to first unescaped closing brace
+		if end == -1 {
+			end = firstUnescapedClose
+		}
+
+		if end == -1 {
+			unclosedCount++
+			continue
 		}
 
 		// write the substring from the last cursor to this point
@@ -234,6 +246,15 @@ scan:
 
 		// trim opening bracket
 		key := input[i+1 : end]
+
+		// recursively evaluate nested placeholders inside the key if present
+		if strings.Contains(key, string(phOpen)) {
+			var err error
+			key, err = r.replace(key, empty, treatUnknownAsEmpty, errOnEmpty, errOnUnknown, f)
+			if err != nil {
+				return "", err
+			}
+		}
 
 		// try to get a value for this key, handle empty values accordingly
 		val, found := r.Get(key)
@@ -447,6 +468,14 @@ var nowFunc = time.Now
 
 // ReplacerCtxKey is the context key for a replacer.
 const ReplacerCtxKey CtxKey = "replacer"
+
+func isUnescapedOpen(input string, idx int) bool {
+	return input[idx] == phOpen && (idx == 0 || input[idx-1] != phEscape)
+}
+
+func isUnescapedClose(input string, idx int) bool {
+	return input[idx] == phClose && (idx == len(input)-1 || idx == 0 || input[idx-1] != phEscape)
+}
 
 const phOpen, phClose, phEscape = '{', '}', '\\'
 
