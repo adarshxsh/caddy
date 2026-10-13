@@ -254,28 +254,46 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 
 			// original request, before any internal changes
 			case "http.request.orig_method":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or := getOriginalRequest(req)
 				return or.Method, true
 			case "http.request.orig_uri":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				return or.RequestURI, true
+				or := getOriginalRequest(req)
+				if or.RequestURI != "" {
+					return or.RequestURI, true
+				}
+				if or.URL != nil {
+					return or.URL.RequestURI(), true
+				}
+				return "", true
 			case "http.request.orig_uri.path":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or := getOriginalRequest(req)
+				if or.URL == nil {
+					return "", true
+				}
 				return or.URL.Path, true
 			case "http.request.orig_uri.path.file":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or := getOriginalRequest(req)
+				if or.URL == nil {
+					return "", true
+				}
 				_, file := path.Split(or.URL.Path)
 				return file, true
 			case "http.request.orig_uri.path.dir":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or := getOriginalRequest(req)
+				if or.URL == nil {
+					return "", true
+				}
 				dir, _ := path.Split(or.URL.Path)
 				return dir, true
 			case "http.request.orig_uri.query":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or := getOriginalRequest(req)
+				if or.URL == nil {
+					return "", true
+				}
 				return or.URL.RawQuery, true
 			case "http.request.orig_uri.prefixed_query":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				if or.URL.RawQuery == "" {
+				or := getOriginalRequest(req)
+				if or.URL == nil || or.URL.RawQuery == "" {
 					return "", true
 				}
 				return "?" + or.URL.RawQuery, true
@@ -357,7 +375,10 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil {
 					return "", false
 				}
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				or := getOriginalRequest(req)
+				if or.URL == nil {
+					return "", true
+				}
 				pathParts := strings.Split(or.URL.Path, "/")
 				if len(pathParts) > 0 && pathParts[0] == "" {
 					pathParts = pathParts[1:]
@@ -570,6 +591,20 @@ func getTLSPeerCert(cs *tls.ConnectionState) *x509.Certificate {
 		return nil
 	}
 	return cs.PeerCertificates[0]
+}
+
+// getOriginalRequest retrieves the original request from the context if present.
+// If missing, it falls back to current HTTP request when req.URL exists.
+func getOriginalRequest(req *http.Request) http.Request {
+	if req != nil {
+		if or, ok := req.Context().Value(OriginalRequestCtxKey).(http.Request); ok {
+			return or
+		}
+		if req.URL != nil {
+			return *req
+		}
+	}
+	return http.Request{}
 }
 
 type requestID struct {
