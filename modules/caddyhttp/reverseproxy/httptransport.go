@@ -21,14 +21,17 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	weakrand "math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -355,12 +358,15 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 		// if read/write timeouts are configured and this is a TCP connection,
 		// enforce the timeouts by wrapping the connection with our own type
 		if tcpConn, ok := conn.(*net.TCPConn); ok && (h.ReadTimeout > 0 || h.WriteTimeout > 0) {
-			conn = &tcpRWTimeoutConn{
+			tc := &tcpRWTimeoutConn{
 				TCPConn:      tcpConn,
 				readTimeout:  time.Duration(h.ReadTimeout),
 				writeTimeout: time.Duration(h.WriteTimeout),
 				logger:       caddyCtx.Logger(),
+				active:       true,
 			}
+			registerTimeoutConn(tc)
+			conn = tc
 		}
 
 		return conn, nil
@@ -642,7 +648,69 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return h.h3Transport.RoundTrip(req)
 	}
 
-	return h.Transport.RoundTrip(req)
+	hasTimeouts := h.ReadTimeout > 0 || h.WriteTimeout > 0
+
+	var (
+		activeConn *tcpRWTimeoutConn
+		cancel     context.CancelFunc
+	)
+
+	if hasTimeouts {
+		trace := &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				tc := findTimeoutConn(info.Conn)
+				if isHTTP2Conn(info.Conn) || slices.Contains(h.Versions, "h2c") {
+					if tc != nil {
+						tc.disable()
+					}
+				} else {
+					if tc != nil {
+						tc.markActive()
+						activeConn = tc
+					}
+				}
+			},
+			PutIdleConn: func(err error) {
+				if activeConn != nil {
+					activeConn.markIdle()
+					activeConn = nil
+				}
+			},
+		}
+
+		ctx := httptrace.WithClientTrace(req.Context(), trace)
+
+		var timeout time.Duration
+		if h.ReadTimeout > 0 && h.WriteTimeout > 0 {
+			timeout = time.Duration(h.ReadTimeout) + time.Duration(h.WriteTimeout)
+		} else if h.ReadTimeout > 0 {
+			timeout = time.Duration(h.ReadTimeout)
+		} else {
+			timeout = time.Duration(h.WriteTimeout)
+		}
+		if timeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+		}
+
+		req = req.WithContext(ctx)
+	}
+
+	res, err := h.Transport.RoundTrip(req)
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return nil, err
+	}
+
+	if cancel != nil {
+		res.Body = &cancelResponseBody{
+			ReadCloser: res.Body,
+			cancel:     cancel,
+		}
+	}
+
+	return res, nil
 }
 
 // SetScheme ensures that the outbound request req
@@ -921,6 +989,74 @@ type KeepAlive struct {
 	IdleConnTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 }
 
+var timeoutConnsMap sync.Map // map[string]*tcpRWTimeoutConn
+
+func connKey(c net.Conn) string {
+	if c == nil || c.LocalAddr() == nil || c.RemoteAddr() == nil {
+		return ""
+	}
+	return c.LocalAddr().String() + "->" + c.RemoteAddr().String()
+}
+
+func registerTimeoutConn(tc *tcpRWTimeoutConn) {
+	key := connKey(tc.TCPConn)
+	if key != "" {
+		timeoutConnsMap.Store(key, tc)
+	}
+}
+
+func unregisterTimeoutConn(tc *tcpRWTimeoutConn) {
+	key := connKey(tc.TCPConn)
+	if key != "" {
+		timeoutConnsMap.Delete(key)
+	}
+}
+
+func findTimeoutConn(c net.Conn) *tcpRWTimeoutConn {
+	if c == nil {
+		return nil
+	}
+	if tc, ok := c.(*tcpRWTimeoutConn); ok {
+		return tc
+	}
+	key := connKey(c)
+	if key != "" {
+		if val, ok := timeoutConnsMap.Load(key); ok {
+			return val.(*tcpRWTimeoutConn)
+		}
+	}
+	return nil
+}
+
+func isHTTP2Conn(c net.Conn) bool {
+	if c == nil {
+		return false
+	}
+	if tlsConn, ok := c.(*tls.Conn); ok {
+		return tlsConn.ConnectionState().NegotiatedProtocol == "h2"
+	}
+	return false
+}
+
+type cancelResponseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (b *cancelResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.once.Do(b.cancel)
+	}
+	return n, err
+}
+
+func (b *cancelResponseBody) Close() error {
+	b.once.Do(b.cancel)
+	return b.ReadCloser.Close()
+}
+
 // tcpRWTimeoutConn enforces read/write timeouts for a TCP connection.
 // If it fails to set deadlines, the error is logged but does not abort
 // the read/write attempt (ignoring the error is consistent with what
@@ -929,12 +1065,49 @@ type tcpRWTimeoutConn struct {
 	*net.TCPConn
 	readTimeout, writeTimeout time.Duration
 	logger                    *zap.Logger
+
+	mu       sync.Mutex
+	active   bool
+	disabled bool
+}
+
+func (c *tcpRWTimeoutConn) markActive() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.disabled {
+		return
+	}
+	c.active = true
+}
+
+func (c *tcpRWTimeoutConn) markIdle() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.active = false
+	_ = c.TCPConn.SetDeadline(time.Time{})
+}
+
+func (c *tcpRWTimeoutConn) disable() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.disabled = true
+	c.active = false
+	_ = c.TCPConn.SetDeadline(time.Time{})
+}
+
+func (c *tcpRWTimeoutConn) Close() error {
+	unregisterTimeoutConn(c)
+	return c.TCPConn.Close()
 }
 
 func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
-	if c.readTimeout > 0 {
+	c.mu.Lock()
+	active := c.active && !c.disabled
+	c.mu.Unlock()
+
+	if active && c.readTimeout > 0 {
 		err := c.TCPConn.SetReadDeadline(time.Now().Add(c.readTimeout))
-		if err != nil {
+		if err != nil && c.logger != nil {
 			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
 				ce.Write(zap.Error(err))
 			}
@@ -944,9 +1117,13 @@ func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
 }
 
 func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
-	if c.writeTimeout > 0 {
+	c.mu.Lock()
+	active := c.active && !c.disabled
+	c.mu.Unlock()
+
+	if active && c.writeTimeout > 0 {
 		err := c.TCPConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-		if err != nil {
+		if err != nil && c.logger != nil {
 			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
 				ce.Write(zap.Error(err))
 			}
