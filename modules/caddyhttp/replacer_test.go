@@ -296,3 +296,98 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPReplacerAllocations(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/foo/bar?a=1&b=2", nil)
+	req.Header.Set("User-Agent", "TestAgent")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Zero-placeholder strings trigger 0 allocations
+	a0 := testing.AllocsPerRun(100, func() {
+		_ = repl.ReplaceAll("no placeholders here", "")
+	})
+	if a0 > 0 {
+		t.Errorf("Expected 0 allocs/op for zero-placeholder string, got %f", a0)
+	}
+
+	// Single HTTP variable GetString does not exceed 1 allocation
+	aGetMethod := testing.AllocsPerRun(100, func() {
+		_, _ = repl.GetString("http.request.method")
+	})
+	if aGetMethod > 1 {
+		t.Errorf("Expected <= 1 alloc/op for GetString(http.request.method), got %f", aGetMethod)
+	}
+
+	aGetHeader := testing.AllocsPerRun(100, func() {
+		_, _ = repl.GetString("http.request.header.User-Agent")
+	})
+	if aGetHeader > 1 {
+		t.Errorf("Expected <= 1 alloc/op for GetString(http.request.header.User-Agent), got %f", aGetHeader)
+	}
+
+	// Single HTTP variable ReplaceAll does not exceed 2 allocations
+	aRep := testing.AllocsPerRun(100, func() {
+		_ = repl.ReplaceAll("method={http.request.method}", "")
+	})
+	if aRep > 2 {
+		t.Errorf("Expected <= 2 allocs/op for single HTTP variable ReplaceAll, got %f", aRep)
+	}
+}
+
+func BenchmarkHTTPReplacer(b *testing.B) {
+	b.Run("addHTTPVarsToReplacer", func(b *testing.B) {
+		req, _ := http.NewRequest(http.MethodGet, "/foo/bar?a=1&b=2", nil)
+		req.Header.Set("User-Agent", "CaddyBench")
+		res := httptest.NewRecorder()
+		b.ResetTimer()
+		for b.Loop() {
+			reqCopy := *req
+			repl := caddy.NewReplacer()
+			addHTTPVarsToReplacer(repl, &reqCopy, res)
+		}
+	})
+
+	b.Run("header evaluation", func(b *testing.B) {
+		req, _ := http.NewRequest(http.MethodGet, "/foo/bar", nil)
+		req.Header.Set("User-Agent", "CaddyBench")
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+		b.ResetTimer()
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.header.User-Agent")
+		}
+	})
+
+	b.Run("query evaluation", func(b *testing.B) {
+		req, _ := http.NewRequest(http.MethodGet, "/foo/bar?a=1&b=2", nil)
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+		b.ResetTimer()
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.uri.query.a")
+		}
+	})
+
+	b.Run("path evaluation", func(b *testing.B) {
+		req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz", nil)
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+		b.ResetTimer()
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.uri.path")
+		}
+	})
+
+	b.Run("replace_all", func(b *testing.B) {
+		req, _ := http.NewRequest(http.MethodGet, "/foo/bar?a=1", nil)
+		req.Header.Set("User-Agent", "CaddyBench")
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+		template := "method={http.request.method} path={http.request.uri.path} ua={http.request.header.User-Agent}"
+		b.ResetTimer()
+		for b.Loop() {
+			_ = repl.ReplaceAll(template, "")
+		}
+	})
+}

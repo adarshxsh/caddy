@@ -484,6 +484,35 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+
+	// Zero-placeholder strings trigger 0 allocations
+	a0 := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("simple string", "")
+	})
+	if a0 > 0 {
+		t.Errorf("Expected 0 allocs/op for zero-placeholder string, got %f", a0)
+	}
+
+	// Single-placeholder replacements do not exceed 1 allocation
+	a1 := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("str={str}", "")
+	})
+	if a1 > 1 {
+		t.Errorf("Expected <= 1 alloc/op for single-placeholder replacement, got %f", a1)
+	}
+
+	// NewReplacer allocation assertion
+	aNew := testing.AllocsPerRun(100, func() {
+		_ = NewReplacer()
+	})
+	if aNew > 5 {
+		t.Errorf("Expected <= 5 allocs/op for NewReplacer(), got %f", aNew)
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
@@ -507,6 +536,18 @@ func BenchmarkReplacer(b *testing.B) {
 			input: `int={int}`,
 		},
 		{
+			name:  "2 placeholders",
+			input: `str={str} int={int}`,
+		},
+		{
+			name:  "3 placeholders",
+			input: `str={str} int={int} str2={str}`,
+		},
+		{
+			name:  "5 placeholders",
+			input: `str={str} int={int} str2={str} int2={int} str3={str}`,
+		},
+		{
 			name:  "placeholder",
 			input: `{"json": "object"}`,
 		},
@@ -520,6 +561,33 @@ func BenchmarkReplacer(b *testing.B) {
 				rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
+		b.Run(bm.name+"/parallel", func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					rep.ReplaceAll(bm.input, bm.empty)
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkReplacerNew(b *testing.B) {
+	for b.Loop() {
+		_ = NewReplacer()
+	}
+}
+
+func BenchmarkReplacerNewEmpty(b *testing.B) {
+	for b.Loop() {
+		_ = NewEmptyReplacer()
+	}
+}
+
+func BenchmarkReplacerWithoutFile(b *testing.B) {
+	rep := NewReplacer()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = rep.WithoutFile()
 	}
 }
 
