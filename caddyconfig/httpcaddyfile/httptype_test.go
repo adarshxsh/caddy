@@ -91,6 +91,24 @@ func TestMatcherSyntax(t *testing.T) {
 			`,
 			expectError: true,
 		},
+		{
+			input: `http://localhost {
+				@m "path('/foo*')" path /bar
+				respond @m "hello"
+			}
+			`,
+			expectError: false,
+		},
+		{
+			input: `http://localhost {
+				@m "path('/foo*')" {
+					path /bar
+				}
+				respond @m "hello"
+			}
+			`,
+			expectError: false,
+		},
 	} {
 
 		adapter := caddyfile.Adapter{
@@ -296,5 +314,68 @@ func TestDefaultSNIWithoutHTTPS(t *testing.T) {
 
 	if !found {
 		t.Errorf("Expected default_sni 'my-sni.com' in TLS connection policies, but it was missing. Generated JSON: %s", string(result))
+	}
+}
+
+func TestQuotedExpressionMultiMatcher(t *testing.T) {
+	for i, tc := range []struct {
+		input string
+	}{
+		{
+			input: `http://localhost {
+				@m "path('/foo*')" path /bar
+				respond @m "hello"
+			}`,
+		},
+		{
+			input: `http://localhost {
+				@m "path('/foo*')" {
+					path /bar
+				}
+				respond @m "hello"
+			}`,
+		},
+	} {
+		adapter := caddyfile.Adapter{
+			ServerType: ServerType{},
+		}
+
+		result, _, err := adapter.Adapt([]byte(tc.input), nil)
+		if err != nil {
+			t.Fatalf("Test %d: Failed to adapt Caddyfile: %v", i, err)
+		}
+
+		var config struct {
+			Apps struct {
+				HTTP struct {
+					Servers map[string]struct {
+						Routes []struct {
+							MatcherSets []map[string]json.RawMessage `json:"match"`
+						} `json:"routes"`
+					} `json:"servers"`
+				} `json:"http"`
+			} `json:"apps"`
+		}
+
+		if err := json.Unmarshal(result, &config); err != nil {
+			t.Fatalf("Test %d: Failed to unmarshal JSON config: %v", i, err)
+		}
+
+		server, ok := config.Apps.HTTP.Servers["srv0"]
+		if !ok {
+			t.Fatalf("Test %d: Expected server 'srv0' to be created", i)
+		}
+
+		if len(server.Routes) == 0 || len(server.Routes[0].MatcherSets) == 0 {
+			t.Fatalf("Test %d: Expected route and matcher sets to be generated, got none", i)
+		}
+
+		resultStr := string(result)
+		if !strings.Contains(resultStr, `"expression"`) {
+			t.Errorf("Test %d: Expected 'expression' matcher in adapted config, missing in: %s", i, resultStr)
+		}
+		if !strings.Contains(resultStr, `"path"`) {
+			t.Errorf("Test %d: Expected 'path' matcher in adapted config, missing in: %s", i, resultStr)
+		}
 	}
 }

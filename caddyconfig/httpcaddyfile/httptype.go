@@ -1585,6 +1585,8 @@ func parseMatcherDefinitions(d *caddyfile.Dispenser, matchers map[string]caddy.M
 		return fmt.Errorf("matcher module '%s' is not a request matcher", matcherName)
 	}
 
+	tokensByMatcherName := make(map[string][]caddyfile.Token)
+
 	// if the next token is quoted, we can assume it's not a matcher name
 	// and that it's probably an 'expression' matcher
 	if d.NextArg() {
@@ -1596,23 +1598,18 @@ func parseMatcherDefinitions(d *caddyfile.Dispenser, matchers map[string]caddy.M
 			// see https://github.com/caddyserver/caddy/issues/6287
 			expressionToken := d.Token().Clone()
 			expressionToken.Text = "expression"
-			err := makeMatcher("expression", []caddyfile.Token{expressionToken, d.Token()})
-			if err != nil {
-				return err
-			}
-			return nil
+			tokensByMatcherName["expression"] = append(tokensByMatcherName["expression"], expressionToken, d.Token())
+		} else {
+			// if it wasn't quoted, then we need to rewind after calling
+			// d.NextArg() so the below properly grabs the matcher name
+			d.Prev()
 		}
-
-		// if it wasn't quoted, then we need to rewind after calling
-		// d.NextArg() so the below properly grabs the matcher name
-		d.Prev()
 	}
 
 	// in case there are multiple instances of the same matcher, concatenate
 	// their tokens (we expect that UnmarshalCaddyfile should be able to
 	// handle more than one segment); otherwise, we'd overwrite other
 	// instances of the matcher in this set
-	tokensByMatcherName := make(map[string][]caddyfile.Token)
 	for nesting := d.Nesting(); d.NextArg() || d.NextBlock(nesting); {
 		matcherName := d.Val()
 		tokensByMatcherName[matcherName] = append(tokensByMatcherName[matcherName], d.NextSegment()...)
