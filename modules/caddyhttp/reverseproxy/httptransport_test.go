@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -278,4 +279,46 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPTransport_NegativeDialTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	ht := &HTTPTransport{
+		DialTimeout: caddy.Duration(-1 * time.Second),
+	}
+
+	rt, err := ht.NewTransport(ctx)
+	if err != nil {
+		t.Fatalf("NewTransport() error = %v", err)
+	}
+
+	// Make sure dial timeout field on HTTPTransport remains negative as configured
+	if ht.DialTimeout >= 0 {
+		t.Errorf("expected ht.DialTimeout to remain negative, got %v", ht.DialTimeout)
+	}
+
+	// DialContext should succeed without failing immediately with deadline exceeded error
+	conn, err := rt.DialContext(ctx, "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("DialContext() error = %v, want nil", err)
+	}
+	defer conn.Close()
 }

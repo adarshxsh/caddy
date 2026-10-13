@@ -225,8 +225,13 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 		h.DialTimeout = caddy.Duration(3 * time.Second)
 	}
 
+	dialTimeout := time.Duration(h.DialTimeout)
+	if dialTimeout < 0 {
+		dialTimeout = 0
+	}
+
 	dialer := &net.Dialer{
-		Timeout:       time.Duration(h.DialTimeout),
+		Timeout:       dialTimeout,
 		FallbackDelay: time.Duration(h.FallbackDelay),
 	}
 
@@ -261,7 +266,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			return nil, err
 		}
 		d := &net.Dialer{
-			Timeout:       time.Duration(h.DialTimeout),
+			Timeout:       dialTimeout,
 			FallbackDelay: time.Duration(h.FallbackDelay),
 		}
 		dialer.Resolver = &net.Resolver{
