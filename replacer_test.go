@@ -523,6 +523,45 @@ func BenchmarkReplacer(b *testing.B) {
 	}
 }
 
+func TestReplacerDefaults(t *testing.T) {
+	rep := NewReplacer()
+	rep.Set("http.request.host", "example.com")
+	rep.Set("http.request.header.X-Custom", "actual-header")
+	rep.Set("empty_var", "")
+
+	tests := []struct {
+		input  string
+		expect string
+	}{
+		// Key present and non-empty -> use actual value
+		{input: "{http.request.host:default.com}", expect: "example.com"},
+		{input: "{http.request.header.X-Custom:fallback}", expect: "actual-header"},
+
+		// Key missing or unknown -> use default fallback
+		{input: "{http.request.port:8080}", expect: "8080"},
+		{input: "{http.request.header.X-Missing:fallback-value}", expect: "fallback-value"},
+		{input: "{http.request.uri.path:/index.html}", expect: "/index.html"},
+
+		// Key present but empty string -> use default fallback
+		{input: "{empty_var:fallback_for_empty}", expect: "fallback_for_empty"},
+
+		// Defaults containing colons
+		{input: "{http.request.host:http://default.local:8080}", expect: "example.com"},
+		{input: "{missing_var:http://default.local:8080}", expect: "http://default.local:8080"},
+
+		// Nested placeholders in default values
+		{input: "{missing_var:{http.request.host}}", expect: "example.com"},
+		{input: "{missing_var:{missing_var2:fallback_nested}}", expect: "fallback_nested"},
+	}
+
+	for i, tc := range tests {
+		actual := rep.ReplaceAll(tc.input, "")
+		if actual != tc.expect {
+			t.Errorf("Test %d failed for input %q: expected %q, got %q", i, tc.input, tc.expect, actual)
+		}
+	}
+}
+
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
