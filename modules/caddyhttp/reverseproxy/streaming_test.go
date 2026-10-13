@@ -6,7 +6,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +84,98 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestMaxLatencyWriterStopFlushesPending(t *testing.T) {
+	var flushCount int
+	mlw := &maxLatencyWriter{
+		dst: &bytes.Buffer{},
+		flush: func() error {
+			flushCount++
+			return nil
+		},
+		flushPending: true,
+		logger:       zap.NewNop(),
+	}
+
+	mlw.stop()
+
+	if flushCount != 1 {
+		t.Errorf("expected 1 flush on stop, got %d", flushCount)
+	}
+	if mlw.flushPending {
+		t.Errorf("expected flushPending to be false after stop")
+	}
+}
+
+func TestMaxLatencyWriterStopNoPending(t *testing.T) {
+	var flushCount int
+	mlw := &maxLatencyWriter{
+		dst: &bytes.Buffer{},
+		flush: func() error {
+			flushCount++
+			return nil
+		},
+		flushPending: true,
+		logger:       zap.NewNop(),
+	}
+
+	mlw.delayedFlush()
+	if flushCount != 1 {
+		t.Fatalf("expected 1 flush on delayedFlush, got %d", flushCount)
+	}
+
+	mlw.stop()
+	if flushCount != 1 {
+		t.Errorf("expected no additional flush on stop when not pending, got total %d", flushCount)
+	}
+}
+
+func TestMaxLatencyWriterStopConcurrent(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		var flushCount atomic.Int32
+		mlw := &maxLatencyWriter{
+			dst: &bytes.Buffer{},
+			flush: func() error {
+				flushCount.Add(1)
+				return nil
+			},
+			flushPending: true,
+			logger:       zap.NewNop(),
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			mlw.delayedFlush()
+		}()
+		go func() {
+			defer wg.Done()
+			mlw.stop()
+		}()
+		wg.Wait()
+
+		if got := flushCount.Load(); got != 1 {
+			t.Errorf("iteration %d: expected exactly 1 flush, got %d", i, got)
+		}
+	}
+}
+
+func TestHandlerCopyResponseWithFlushInterval(t *testing.T) {
+	h := Handler{}
+	recorder := httptest.NewRecorder()
+	src := strings.NewReader("hello trailing response")
+
+	err := h.copyResponse(recorder, src, 100*time.Millisecond, caddy.Log())
+	if err != nil {
+		t.Fatalf("copyResponse failed: %v", err)
+	}
+
+	if got := recorder.Body.String(); got != "hello trailing response" {
+		t.Errorf("expected %q, got %q", "hello trailing response", got)
+	}
+	if !recorder.Flushed {
+		t.Errorf("expected response recorder to be flushed upon stream completion")
+	}
+}
+
