@@ -664,23 +664,30 @@ func (st *ServerType) serversFromPairings(
 			var iLongestPath, jLongestPath string
 			var iLongestHost, jLongestHost string
 			var iWildcardHost, jWildcardHost bool
+			var iHasHost, jHasHost bool
 			for _, addr := range p.serverBlocks[i].parsedKeys {
-				if strings.Contains(addr.Host, "*") || addr.Host == "" {
+				if strings.Contains(addr.Host, "*") {
 					iWildcardHost = true
 				}
-				if specificity(addr.Host) > specificity(iLongestHost) {
-					iLongestHost = addr.Host
+				if addr.Host != "" {
+					if !iHasHost || specificity(addr.Host) > specificity(iLongestHost) {
+						iLongestHost = addr.Host
+					}
+					iHasHost = true
 				}
 				if specificity(addr.Path) > specificity(iLongestPath) {
 					iLongestPath = addr.Path
 				}
 			}
 			for _, addr := range p.serverBlocks[j].parsedKeys {
-				if strings.Contains(addr.Host, "*") || addr.Host == "" {
+				if strings.Contains(addr.Host, "*") {
 					jWildcardHost = true
 				}
-				if specificity(addr.Host) > specificity(jLongestHost) {
-					jLongestHost = addr.Host
+				if addr.Host != "" {
+					if !jHasHost || specificity(addr.Host) > specificity(jLongestHost) {
+						jLongestHost = addr.Host
+					}
+					jHasHost = true
 				}
 				if specificity(addr.Path) > specificity(jLongestPath) {
 					jLongestPath = addr.Path
@@ -688,10 +695,10 @@ func (st *ServerType) serversFromPairings(
 			}
 			// catch-all blocks (blocks with no hostname) should always go
 			// last, even after blocks with wildcard hosts
-			if specificity(iLongestHost) == 0 {
+			if !iHasHost {
 				return false
 			}
-			if specificity(jLongestHost) == 0 {
+			if !jHasHost {
 				return true
 			}
 			if iWildcardHost != jWildcardHost {
@@ -1718,9 +1725,8 @@ func mapContains[K comparable, V any](m map[K]V, keys []K) bool {
 	return false
 }
 
-// specificity returns len(s) minus any wildcards (*) and
-// placeholders ({...}). Basically, it's a length count
-// that penalizes the use of wildcards and placeholders.
+// specificity returns len(s) minus any wildcards (*).
+// Basically, it's a length count that penalizes the use of wildcards.
 // This is useful for comparing hostnames and paths.
 // However, wildcards in paths are not a sure answer to
 // the question of specificity. For example,
@@ -1728,20 +1734,7 @@ func mapContains[K comparable, V any](m map[K]V, keys []K) bool {
 // 'a.example.com', but is '/a' more or less specific
 // than '/a*'?
 func specificity(s string) int {
-	l := len(s) - strings.Count(s, "*")
-	for len(s) > 0 {
-		start := strings.Index(s, "{")
-		if start < 0 {
-			return l
-		}
-		end := strings.Index(s[start:], "}") + start + 1
-		if end <= start {
-			return l
-		}
-		l -= end - start
-		s = s[end:]
-	}
-	return l
+	return len(s) - strings.Count(s, "*")
 }
 
 type counter struct {
