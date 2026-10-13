@@ -1031,6 +1031,94 @@ func TestImportedSnippetDefinitionRetainsBlockPlaceholder(t *testing.T) {
 	}
 }
 
+func TestImportWithBlockNoPhantomTokens(t *testing.T) {
+	input := `
+		(site) {
+			http://{args[0]} {
+				respond "before"
+				{block}
+				respond "after"
+			}
+		}
+
+		import site example.com {
+			redir https://example.net
+			log
+		}
+	`
+	p := testParser(input)
+	blocks, err := p.parseAll()
+	if err != nil {
+		t.Fatalf("parseAll: %v", err)
+	}
+
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 server block, got %d", len(blocks))
+	}
+
+	// Verify p.tokens contains no phantom "import" tokens after evaluation
+	for i, token := range p.tokens {
+		if token.Text == "import" {
+			t.Errorf("token %d: found phantom 'import' token in p.tokens", i)
+		}
+	}
+
+	expectedDirectives := []string{"respond", "redir", "log", "respond"}
+	if len(blocks[0].Segments) != len(expectedDirectives) {
+		t.Fatalf("expected %d segments, got %d", len(expectedDirectives), len(blocks[0].Segments))
+	}
+
+	for i, directive := range expectedDirectives {
+		if actual := blocks[0].Segments[i].Directive(); actual != directive {
+			t.Fatalf("segment %d: expected directive %q, got %q", i, directive, actual)
+		}
+	}
+}
+
+func TestDirectiveImportWithBlockNoPhantomTokens(t *testing.T) {
+	input := `
+		(snippet1) {
+			encode gzip
+			{block}
+			tls off
+		}
+
+		example.com {
+			respond "before"
+			import snippet1 {
+				header_up Host {host}
+			}
+			respond "after"
+		}
+	`
+	p := testParser(input)
+	blocks, err := p.parseAll()
+	if err != nil {
+		t.Fatalf("parseAll: %v", err)
+	}
+
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 server block, got %d", len(blocks))
+	}
+
+	for i, token := range p.tokens {
+		if token.Text == "import" {
+			t.Errorf("token %d: found phantom 'import' token in p.tokens", i)
+		}
+	}
+
+	expectedDirectives := []string{"respond", "encode", "header_up", "tls", "respond"}
+	if len(blocks[0].Segments) != len(expectedDirectives) {
+		t.Fatalf("expected %d segments, got %d", len(expectedDirectives), len(blocks[0].Segments))
+	}
+
+	for i, directive := range expectedDirectives {
+		if actual := blocks[0].Segments[i].Directive(); actual != directive {
+			t.Fatalf("segment %d: expected directive %q, got %q", i, directive, actual)
+		}
+	}
+}
+
 func testParser(input string) parser {
 	return parser{Dispenser: NewTestDispenser(input)}
 }
