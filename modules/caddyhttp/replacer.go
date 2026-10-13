@@ -129,9 +129,15 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return req.Host, true
 			case "http.request.local":
 				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				if localAddr == nil {
+					return "", true
+				}
 				return localAddr.String(), true
 			case "http.request.local.host":
 				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				if localAddr == nil {
+					return "", true
+				}
 				host, _, err := net.SplitHostPort(localAddr.String())
 				if err != nil {
 					// localAddr is host:port for tcp and udp sockets and /unix/socket.path
@@ -144,6 +150,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return host, true
 			case "http.request.local.port":
 				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				if localAddr == nil {
+					return "", true
+				}
 				_, port, _ := net.SplitHostPort(localAddr.String())
 				if portNum, err := strconv.Atoi(port); err == nil {
 					return portNum, true
