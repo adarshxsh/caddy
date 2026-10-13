@@ -1,6 +1,10 @@
 package fastcgi
 
 import (
+	"context"
+	"errors"
+	"net"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -8,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -354,4 +360,38 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 	for _, p := range payloads {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
 	}
+}
+
+func TestFastCGIDialErrorWrapping(t *testing.T) {
+	// create closed listener to get an unreachable address
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	unreachableAddr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
+	caddyCtx := caddy.Context{Context: context.Background()}
+	tr := &Transport{}
+	require.NoError(t, tr.Provision(caddyCtx))
+	req := httptest.NewRequest("GET", "http://"+unreachableAddr+"/index.php", nil)
+
+	// embed server, replacer, original request, and dial info in context
+	ctx := context.WithValue(req.Context(), caddyhttp.ServerCtxKey, &caddyhttp.Server{})
+	ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, caddy.NewReplacer())
+	ctx = context.WithValue(ctx, caddyhttp.OriginalRequestCtxKey, *req)
+	vars := map[string]any{}
+	ctx = context.WithValue(ctx, caddyhttp.VarsCtxKey, vars)
+	caddyhttp.SetVar(ctx, "reverse_proxy.dial_info", reverseproxy.DialInfo{
+		Network: "tcp",
+		Address: unreachableAddr,
+	})
+	req = req.WithContext(ctx)
+
+	_, err = tr.RoundTrip(req)
+	require.Error(t, err)
+
+	var dialErr reverseproxy.DialError
+	require.True(t, errors.As(err, &dialErr), "expected error to wrap reverseproxy.DialError")
+
+	var netErr net.Error
+	require.True(t, errors.As(err, &netErr), "expected error to wrap net.Error")
 }
