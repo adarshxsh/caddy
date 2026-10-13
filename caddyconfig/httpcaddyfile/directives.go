@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -97,10 +98,27 @@ var defaultDirectiveOrder = []string{
 	"acme_server",
 }
 
-// directiveOrder specifies the order to apply directives
-// in HTTP routes, after being modified by either the
-// plugins or by the user via the "order" global option.
-var directiveOrder = defaultDirectiveOrder
+// directiveOrder specifies the baseline order to apply directives
+// in HTTP routes, after being modified by plugins during registration.
+var (
+	directiveOrderMu sync.RWMutex
+	directiveOrder   = slices.Clone(defaultDirectiveOrder)
+)
+
+func defaultDirectiveOrderClone() []string {
+	directiveOrderMu.RLock()
+	defer directiveOrderMu.RUnlock()
+	return slices.Clone(directiveOrder)
+}
+
+func getDirectiveOrder(options map[string]any) []string {
+	if options != nil {
+		if order, ok := options["order"].([]string); ok {
+			return order
+		}
+	}
+	return defaultDirectiveOrderClone()
+}
 
 // RegisterDirective registers a unique directive dir with an
 // associated unmarshaling (setup) function. When directive dir
@@ -151,6 +169,9 @@ func RegisterHandlerDirective(dir string, setupFunc UnmarshalHandlerFunc) {
 //
 // EXPERIMENTAL: This API may change or be removed.
 func RegisterDirectiveOrder(dir string, position Positional, standardDir string) {
+	directiveOrderMu.Lock()
+	defer directiveOrderMu.Unlock()
+
 	// check if directive was already ordered
 	if slices.Contains(directiveOrder, dir) {
 		panic("directive '" + dir + "' already ordered")
@@ -169,7 +190,7 @@ func RegisterDirectiveOrder(dir string, position Positional, standardDir string)
 	}
 
 	// insert directive into proper position
-	newOrder := directiveOrder
+	newOrder := slices.Clone(directiveOrder)
 	for i, d := range newOrder {
 		if d != standardDir {
 			continue
@@ -347,7 +368,7 @@ func ParseSegmentAsSubroute(h Helper) (caddyhttp.MiddlewareHandler, error) {
 		return nil, err
 	}
 
-	return buildSubroute(allResults, h.groupCounter, true)
+	return buildSubroute(allResults, h.groupCounter, h.options, true)
 }
 
 // parseSegmentAsConfig parses the segment such that its subdirectives
@@ -443,9 +464,9 @@ type ConfigValue struct {
 	directive string
 }
 
-func sortRoutes(routes []ConfigValue) {
-	dirPositions := make(map[string]int)
-	for i, dir := range directiveOrder {
+func sortRoutes(routes []ConfigValue, order []string) {
+	dirPositions := make(map[string]int, len(order))
+	for i, dir := range order {
 		dirPositions[dir] = i
 	}
 
