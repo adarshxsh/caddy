@@ -482,6 +482,17 @@ func (b *bodyNopCloserIfNotRead) Close() error {
 	return b.ReadCloser.Close()
 }
 
+func (b *bodyNopCloserIfNotRead) WasRead() bool {
+	return b.read > 0
+}
+
+func (b *bodyNopCloserIfNotRead) BytesRead() int {
+	if b.read < 0 {
+		return 0
+	}
+	return b.read
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
@@ -1354,6 +1365,16 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 		// because its retry decision was already made in reverseProxy()
 		// when the response matchers were evaluated
 		if !isDialError && !isRetryableResponse && (!isHandlerError || !errors.Is(herr, errNoUpstream)) {
+			// do not retry if an unbuffered request body was consumed
+			if req != nil && req.Body != nil {
+				if br, ok := req.Body.(interface{ WasRead() bool }); ok && br.WasRead() {
+					return false
+				}
+				if br, ok := req.Body.(interface{ BytesRead() int }); ok && br.BytesRead() > 0 {
+					return false
+				}
+			}
+
 			if lb.RetryMatch == nil && req.Method != "GET" {
 				// by default, don't retry requests if they aren't GET
 				return false
