@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	weakrand "math/rand/v2"
 	"net"
 	"net/http"
@@ -29,13 +30,13 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
 
 	"github.com/caddyserver/caddy/v2"
@@ -352,16 +353,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			}
 		}
 
-		// if read/write timeouts are configured and this is a TCP connection,
-		// enforce the timeouts by wrapping the connection with our own type
-		if tcpConn, ok := conn.(*net.TCPConn); ok && (h.ReadTimeout > 0 || h.WriteTimeout > 0) {
-			conn = &tcpRWTimeoutConn{
-				TCPConn:      tcpConn,
-				readTimeout:  time.Duration(h.ReadTimeout),
-				writeTimeout: time.Duration(h.WriteTimeout),
-				logger:       caddyCtx.Logger(),
-			}
-		}
+
 
 		return conn, nil
 	}
@@ -637,12 +629,48 @@ func (h *HTTPTransport) RequestHeaderOps() *headers.HeaderOps {
 func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	h.SetScheme(req)
 
-	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
-	if h.h3Transport != nil {
-		return h.h3Transport.RoundTrip(req)
+	if h.WriteTimeout > 0 && req.Body != nil && req.Body != http.NoBody {
+		req.Body = &timeoutReadCloser{
+			rc:      req.Body,
+			timeout: time.Duration(h.WriteTimeout),
+		}
+		if req.GetBody != nil {
+			origGetBody := req.GetBody
+			req.GetBody = func() (io.ReadCloser, error) {
+				body, err := origGetBody()
+				if err != nil {
+					return nil, err
+				}
+				return &timeoutReadCloser{
+					rc:      body,
+					timeout: time.Duration(h.WriteTimeout),
+				}, nil
+			}
+		}
 	}
 
-	return h.Transport.RoundTrip(req)
+	var res *http.Response
+	var err error
+
+	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
+	if h.h3Transport != nil {
+		res, err = h.h3Transport.RoundTrip(req)
+	} else {
+		res, err = h.Transport.RoundTrip(req)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if h.ReadTimeout > 0 && res != nil && res.Body != nil {
+		res.Body = &timeoutReadCloser{
+			rc:      res.Body,
+			timeout: time.Duration(h.ReadTimeout),
+		}
+	}
+
+	return res, nil
 }
 
 // SetScheme ensures that the outbound request req
@@ -921,38 +949,50 @@ type KeepAlive struct {
 	IdleConnTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 }
 
-// tcpRWTimeoutConn enforces read/write timeouts for a TCP connection.
-// If it fails to set deadlines, the error is logged but does not abort
-// the read/write attempt (ignoring the error is consistent with what
-// the standard library does: https://github.com/golang/go/blob/c5da4fb7ac5cb7434b41fc9a1df3bee66c7f1a4d/src/net/http/server.go#L981-L986)
-type tcpRWTimeoutConn struct {
-	*net.TCPConn
-	readTimeout, writeTimeout time.Duration
-	logger                    *zap.Logger
+type timeoutError struct {
+	message string
 }
 
-func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
-	if c.readTimeout > 0 {
-		err := c.TCPConn.SetReadDeadline(time.Now().Add(c.readTimeout))
-		if err != nil {
-			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
-				ce.Write(zap.Error(err))
-			}
-		}
-	}
-	return c.TCPConn.Read(b)
+func (e timeoutError) Error() string   { return e.message }
+func (e timeoutError) Timeout() bool   { return true }
+func (e timeoutError) Temporary() bool { return true }
+
+// timeoutReadCloser wraps an io.ReadCloser and enforces a per-chunk read timeout.
+type timeoutReadCloser struct {
+	rc       io.ReadCloser
+	timeout  time.Duration
+	timedOut atomic.Bool
+	closed   atomic.Bool
 }
 
-func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
-	if c.writeTimeout > 0 {
-		err := c.TCPConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-		if err != nil {
-			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
-				ce.Write(zap.Error(err))
-			}
-		}
+func (tr *timeoutReadCloser) Read(p []byte) (int, error) {
+	if tr.closed.Load() {
+		return 0, io.ErrClosedPipe
 	}
-	return c.TCPConn.Write(b)
+	if tr.timedOut.Load() {
+		return 0, timeoutError{"i/o timeout"}
+	}
+	if tr.timeout <= 0 {
+		return tr.rc.Read(p)
+	}
+
+	timer := time.AfterFunc(tr.timeout, func() {
+		tr.timedOut.Store(true)
+		_ = tr.rc.Close()
+	})
+
+	n, err := tr.rc.Read(p)
+	timer.Stop()
+
+	if tr.timedOut.Load() {
+		return n, timeoutError{"i/o timeout"}
+	}
+	return n, err
+}
+
+func (tr *timeoutReadCloser) Close() error {
+	tr.closed.Store(true)
+	return tr.rc.Close()
 }
 
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
