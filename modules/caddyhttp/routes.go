@@ -29,6 +29,9 @@ import (
 // parameters which customize the handling of HTTP requests
 // in a highly flexible and performant manner.
 type Route struct {
+	// Configures route-level early data policy ("safe_only", "allow", "deny").
+	EarlyData string `json:"early_data,omitempty"`
+
 	// Group is an optional name for a group to which this
 	// route belongs. Grouping a route makes it mutually
 	// exclusive with others in its group; if a route belongs
