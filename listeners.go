@@ -459,7 +459,7 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 			}
 		}
 
-		sqs := newSharedQUICState(tlsConf)
+		sqs := newSharedQUICState(tlsConf, allow0rttconf)
 		// http3.ConfigureTLSConfig only uses this field and tls App sets this field as well
 		//nolint:gosec
 		quicTlsConfig := &tls.Config{
@@ -473,15 +473,11 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 			Conn:                h3ln,
 			VerifySourceAddress: func(addr net.Addr) bool { return !limiter.Allow() },
 		}
-		allow0rtt := true
-		if allow0rttconf != nil {
-			allow0rtt = *allow0rttconf
-		}
 		earlyLn, err := tr.ListenEarly(
 			http3.ConfigureTLSConfig(quicTlsConfig),
 			&quic.Config{
-				Allow0RTT: allow0rtt,
-				Tracer:    h3qlog.DefaultConnectionTracer,
+				GetConfigForClient: sqs.getQuicConfigForClient,
+				Tracer:             h3qlog.DefaultConnectionTracer,
 			},
 		)
 		if err != nil {
@@ -497,7 +493,7 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 
 	sql := sharedEarlyListener.(*sharedQuicListener)
 	// add current tls.Config to sqs, so GetConfigForClient will always return the latest tls.Config in case of context cancellation
-	ctx, cancel := sql.sqs.addState(tlsConf)
+	ctx, cancel := sql.sqs.addState(tlsConf, allow0rttconf)
 
 	return &fakeCloseQuicListener{
 		sharedQuicListener: sql,
@@ -518,21 +514,26 @@ type contextAndCancelFunc struct {
 	context.CancelCauseFunc
 }
 
+type quicServerState struct {
+	contextAndCancelFunc
+	allow0RTT bool
+}
+
 // sharedQUICState manages GetConfigForClient
 // see issue: https://github.com/caddyserver/caddy/pull/4849
 type sharedQUICState struct {
 	rmu           sync.RWMutex
-	tlsConfs      map[*tls.Config]contextAndCancelFunc
+	tlsConfs      map[*tls.Config]quicServerState
 	activeTlsConf *tls.Config
 }
 
 // newSharedQUICState creates a new sharedQUICState
-func newSharedQUICState(tlsConfig *tls.Config) *sharedQUICState {
+func newSharedQUICState(tlsConfig *tls.Config, allow0rttconf ...*bool) *sharedQUICState {
 	sqtc := &sharedQUICState{
-		tlsConfs:      make(map[*tls.Config]contextAndCancelFunc),
+		tlsConfs:      make(map[*tls.Config]quicServerState),
 		activeTlsConf: tlsConfig,
 	}
-	sqtc.addState(tlsConfig)
+	sqtc.addState(tlsConfig, allow0rttconf...)
 	return sqtc
 }
 
@@ -553,14 +554,40 @@ func (sqs *sharedQUICState) getEncryptedClientHelloKeys(ch *tls.ClientHelloInfo)
 	return sqs.activeTlsConf.GetEncryptedClientHelloKeys(ch)
 }
 
+// getQuicConfigForClient evaluates the active 0-RTT policy dynamically during handshakes across all attached servers
+func (sqs *sharedQUICState) getQuicConfigForClient(_ *quic.ClientInfo) (*quic.Config, error) {
+	sqs.rmu.RLock()
+	defer sqs.rmu.RUnlock()
+
+	allow0RTT := true
+	for _, state := range sqs.tlsConfs {
+		if !state.allow0RTT {
+			allow0RTT = false
+			break
+		}
+	}
+
+	return &quic.Config{
+		Allow0RTT: allow0RTT,
+		Tracer:    h3qlog.DefaultConnectionTracer,
+	}, nil
+}
+
 // addState adds tls.Config and activeRequests to the map if not present and returns the corresponding context and its cancelFunc
 // so that when cancelled, the active tls.Config will change
-func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, context.CancelCauseFunc) {
+func (sqs *sharedQUICState) addState(tlsConfig *tls.Config, allow0rttconf ...*bool) (context.Context, context.CancelCauseFunc) {
 	sqs.rmu.Lock()
 	defer sqs.rmu.Unlock()
 
-	if cacc, ok := sqs.tlsConfs[tlsConfig]; ok {
-		return cacc.Context, cacc.CancelCauseFunc
+	allow0rtt := true
+	if len(allow0rttconf) > 0 && allow0rttconf[0] != nil {
+		allow0rtt = *allow0rttconf[0]
+	}
+
+	if state, ok := sqs.tlsConfs[tlsConfig]; ok {
+		state.allow0RTT = allow0rtt
+		sqs.tlsConfs[tlsConfig] = state
+		return state.Context, state.CancelCauseFunc
 	}
 
 	ctx, cancel := context.WithCancelCause(context.Background())
@@ -580,7 +607,10 @@ func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, co
 			}
 		}
 	}
-	sqs.tlsConfs[tlsConfig] = contextAndCancelFunc{ctx, wrappedCancel}
+	sqs.tlsConfs[tlsConfig] = quicServerState{
+		contextAndCancelFunc: contextAndCancelFunc{ctx, wrappedCancel},
+		allow0RTT:            allow0rtt,
+	}
 	// there should be at most 2 tls.Configs
 	if len(sqs.tlsConfs) > 2 {
 		Log().Warn("quic listener tls configs are more than 2", zap.Int("number of configs", len(sqs.tlsConfs)))
