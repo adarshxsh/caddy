@@ -2,12 +2,15 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +280,109 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestIsMethodSafe(t *testing.T) {
+	safeMethods := []string{"GET", "HEAD", "OPTIONS", "TRACE", "get", "Head", "options", "Trace"}
+	for _, m := range safeMethods {
+		if !isMethodSafe(m) {
+			t.Errorf("expected method %q to be safe, got unsafe", m)
+		}
+	}
+
+	unsafeMethods := []string{"POST", "PUT", "DELETE", "PATCH", "CONNECT", "post", "Put", "Delete", "Patch", ""}
+	for _, m := range unsafeMethods {
+		if isMethodSafe(m) {
+			t.Errorf("expected method %q to be unsafe, got safe", m)
+		}
+	}
+}
+
+func TestHTTPTransport_MethodSafetyContextDecoration(t *testing.T) {
+	tests := []struct {
+		method string
+		want   bool
+	}{
+		{"GET", true},
+		{"HEAD", true},
+		{"OPTIONS", true},
+		{"TRACE", true},
+		{"POST", false},
+		{"PUT", false},
+		{"DELETE", false},
+		{"PATCH", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			req, err := http.NewRequest(tt.method, "http://example.com/", nil)
+			if err != nil {
+				t.Fatalf("http.NewRequest failed: %v", err)
+			}
+			decoratedReq := req.WithContext(context.WithValue(req.Context(), MethodSafetyCtxKey, isMethodSafe(req.Method)))
+			got, ok := decoratedReq.Context().Value(MethodSafetyCtxKey).(bool)
+			if !ok {
+				t.Fatalf("MethodSafetyCtxKey not found in decorated request context")
+			}
+			if got != tt.want {
+				t.Errorf("Method %s safety = %v, want %v", tt.method, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_H3CustomDialer(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{http.request.host}",
+		},
+	}
+
+	_, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport failed: %v", err)
+	}
+	defer ht.Cleanup()
+
+	if ht.h3Transport == nil {
+		t.Fatal("expected h3Transport to be non-nil")
+	}
+	if ht.quicTransport == nil {
+		t.Fatal("expected quicTransport to be non-nil")
+	}
+	if ht.h3Transport.Dial == nil {
+		t.Fatal("expected h3Transport.Dial to be non-nil")
+	}
+
+	repl := caddy.NewReplacer()
+	repl.Set("http.request.host", "backend.example.com")
+
+	// Safe method context
+	safeCtx, cancelSafe := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelSafe()
+	safeCtx = context.WithValue(safeCtx, caddy.ReplacerCtxKey, repl)
+	safeCtx = context.WithValue(safeCtx, MethodSafetyCtxKey, true)
+
+	tlsCfg := &tls.Config{ServerName: "{http.request.host}"}
+	_, _ = ht.h3Transport.Dial(safeCtx, "127.0.0.1:54321", tlsCfg, nil)
+	if tlsCfg.ServerName != "backend.example.com" {
+		t.Errorf("expected tlsCfg.ServerName to be 'backend.example.com', got %q", tlsCfg.ServerName)
+	}
+
+	// Unsafe method context
+	unsafeCtx, cancelUnsafe := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelUnsafe()
+	unsafeCtx = context.WithValue(unsafeCtx, caddy.ReplacerCtxKey, repl)
+	unsafeCtx = context.WithValue(unsafeCtx, MethodSafetyCtxKey, false)
+
+	tlsCfg2 := &tls.Config{ServerName: "{http.request.host}"}
+	_, _ = ht.h3Transport.Dial(unsafeCtx, "127.0.0.1:54321", tlsCfg2, nil)
+	if tlsCfg2.ServerName != "backend.example.com" {
+		t.Errorf("expected tlsCfg.ServerName to be 'backend.example.com', got %q", tlsCfg2.ServerName)
 	}
 }
