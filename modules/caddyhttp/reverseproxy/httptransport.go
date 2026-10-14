@@ -432,9 +432,17 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				}
 
 				// but add our own handshake logic
-				tlsConfig := rt.TLSClientConfig.Clone()
+				var tlsConfig *tls.Config
+				if rt.TLSClientConfig != nil {
+					tlsConfig = rt.TLSClientConfig.Clone()
+				} else {
+					tlsConfig = new(tls.Config)
+				}
 				if serverNameHasPlaceholder {
-					repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+					repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+					if !ok {
+						repl = caddy.NewReplacer()
+					}
 					tlsConfig.ServerName = repl.ReplaceAll(tlsConfig.ServerName, "")
 				}
 
@@ -511,7 +519,10 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				h.quicTransport = &quic.Transport{Conn: udpConn}
 				h.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 					// tlsCfg is already cloned from h3Transport.TLSClientConfig
-					repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+					repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+					if !ok {
+						repl = caddy.NewReplacer()
+					}
 					tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
 					udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
 					if err != nil {

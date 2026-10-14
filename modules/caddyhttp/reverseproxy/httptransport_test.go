@@ -279,3 +279,46 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPTransport_DialTLSContext_NilTLSClientConfig(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	ht := &HTTPTransport{
+		TLS:           &TLSConfig{},
+		ProxyProtocol: "v1",
+	}
+
+	rt, err := ht.NewTransport(ctx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	if rt.DialTLSContext == nil {
+		t.Fatal("expected DialTLSContext to be non-nil")
+	}
+
+	if rt.TLSClientConfig != nil {
+		t.Fatal("expected TLSClientConfig to be nil for empty TLSConfig")
+	}
+
+	// Executing DialTLSContext should not panic even when rt.TLSClientConfig is nil.
+	dialCtx := context.WithValue(ctx, caddyhttp.VarsCtxKey, make(map[string]any))
+	_, _ = rt.DialTLSContext(dialCtx, "tcp", ln.Addr().String())
+}
