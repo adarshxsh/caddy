@@ -419,47 +419,41 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 
 		serverNameHasPlaceholder := strings.Contains(h.TLS.ServerName, "{")
 
-		// We need to use custom DialTLSContext if:
-		// 1. ServerName has a placeholder that needs to be replaced at request-time, OR
-		// 2. ProxyProtocol is enabled, because req.URL.Host is modified to include
-		//    client address info with "->" separator which breaks Go's address parsing
-		if serverNameHasPlaceholder || h.ProxyProtocol != "" {
-			rt.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// reuses the dialer from above to establish a plaintext connection
-				conn, err := dialContext(ctx, network, addr)
-				if err != nil {
-					return nil, err
-				}
-
-				// but add our own handshake logic
-				tlsConfig := rt.TLSClientConfig.Clone()
-				if serverNameHasPlaceholder {
-					repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-					tlsConfig.ServerName = repl.ReplaceAll(tlsConfig.ServerName, "")
-				}
-
-				// h1 only
-				if caddyhttp.GetVar(ctx, tlsH1OnlyVarKey) == true {
-					// stdlib does this
-					// https://github.com/golang/go/blob/4837fbe4145cd47b43eed66fee9eed9c2b988316/src/net/http/transport.go#L1701
-					tlsConfig.NextProtos = nil
-				}
-
-				tlsConn := tls.Client(conn, tlsConfig)
-
-				// complete the handshake before returning the connection
-				if rt.TLSHandshakeTimeout != 0 {
-					var cancel context.CancelFunc
-					ctx, cancel = context.WithTimeoutCause(ctx, rt.TLSHandshakeTimeout, fmt.Errorf("HTTP transport TLS handshake %ds timeout", int(rt.TLSHandshakeTimeout.Seconds())))
-					defer cancel()
-				}
-				err = tlsConn.HandshakeContext(ctx)
-				if err != nil {
-					_ = tlsConn.Close()
-					return nil, err
-				}
-				return tlsConn, nil
+		rt.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// reuses the dialer from above to establish a plaintext connection
+			conn, err := dialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
 			}
+
+			// but add our own handshake logic
+			tlsConfig := rt.TLSClientConfig.Clone()
+			if serverNameHasPlaceholder {
+				repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+				tlsConfig.ServerName = repl.ReplaceAll(tlsConfig.ServerName, "")
+			}
+
+			// h1 only
+			if caddyhttp.GetVar(ctx, tlsH1OnlyVarKey) == true {
+				// stdlib does this
+				// https://github.com/golang/go/blob/4837fbe4145cd47b43eed66fee9eed9c2b988316/src/net/http/transport.go#L1701
+				tlsConfig.NextProtos = nil
+			}
+
+			tlsConn := tls.Client(conn, tlsConfig)
+
+			// complete the handshake before returning the connection
+			if rt.TLSHandshakeTimeout != 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeoutCause(ctx, rt.TLSHandshakeTimeout, tlsHandshakeTimeoutError{timeout: rt.TLSHandshakeTimeout})
+				defer cancel()
+			}
+			err = tlsConn.HandshakeContext(ctx)
+			if err != nil {
+				_ = tlsConn.Close()
+				return nil, DialError{err}
+			}
+			return tlsConn, nil
 		}
 	}
 
@@ -967,6 +961,16 @@ func decodeBase64DERCert(certStr string) (*x509.Certificate, error) {
 	return x509.ParseCertificate(derBytes)
 }
 
+type tlsHandshakeTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e tlsHandshakeTimeoutError) Error() string {
+	return fmt.Sprintf("HTTP transport TLS handshake %ds timeout", int(e.timeout.Seconds()))
+}
+func (e tlsHandshakeTimeoutError) Timeout() bool   { return true }
+func (e tlsHandshakeTimeoutError) Temporary() bool { return true }
+
 // Interface guards
 var (
 	_ caddy.Provisioner                   = (*HTTPTransport)(nil)
@@ -976,4 +980,5 @@ var (
 	_ H2CTransport                        = (*HTTPTransport)(nil)
 	_ HealthCheckSchemeOverriderTransport = (*HTTPTransport)(nil)
 	_ ProxyProtocolTransport              = (*HTTPTransport)(nil)
+	_ net.Error                           = tlsHandshakeTimeoutError{}
 )
