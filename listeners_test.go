@@ -16,7 +16,10 @@ package caddy
 
 import (
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/internal"
@@ -210,16 +213,16 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 
 	_, cancel := sqs.addState(updatedConfig)
-	sqs.rmu.Lock()
-	sqs.activeTlsConf = updatedConfig
-	sqs.rmu.Unlock()
+
+	expectedAggregated := append([]tls.EncryptedClientHelloKey{}, updatedKeys...)
+	expectedAggregated = append(expectedAggregated, initialKeys...)
 
 	keys, err = sqs.getEncryptedClientHelloKeys(hello)
 	if err != nil {
-		t.Fatalf("getting updated ECH keys: %v", err)
+		t.Fatalf("getting aggregated ECH keys: %v", err)
 	}
-	if !reflect.DeepEqual(keys, updatedKeys) {
-		t.Fatalf("unexpected updated ECH keys: got %#v, want %#v", keys, updatedKeys)
+	if !reflect.DeepEqual(keys, expectedAggregated) {
+		t.Fatalf("unexpected aggregated ECH keys: got %#v, want %#v", keys, expectedAggregated)
 	}
 
 	cancel(nil)
@@ -231,6 +234,109 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	if !reflect.DeepEqual(keys, initialKeys) {
 		t.Fatalf("unexpected restored ECH keys: got %#v, want %#v", keys, initialKeys)
 	}
+}
+
+func TestSharedQUICStateGetConfigForClient(t *testing.T) {
+	errNoMatch := errors.New("no match for domain")
+
+	confA := &tls.Config{}
+	confA.GetConfigForClient = func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+		if ch.ServerName == "domainA.com" || ch.ServerName == "shared.com" {
+			return confA, nil
+		}
+		return nil, errNoMatch
+	}
+
+	sqs := newSharedQUICState(confA)
+
+	// Check domainA lookup
+	cfg, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domainA.com"})
+	if err != nil || cfg != confA {
+		t.Fatalf("expected confA for domainA.com, got cfg: %v, err: %v", cfg, err)
+	}
+
+	// Register confB
+	confB := &tls.Config{}
+	confB.GetConfigForClient = func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+		if ch.ServerName == "domainB.com" || ch.ServerName == "shared.com" {
+			return confB, nil
+		}
+		return nil, errNoMatch
+	}
+
+	_, cancelB := sqs.addState(confB)
+
+	// domainA should still resolve to confA
+	cfg, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domainA.com"})
+	if err != nil || cfg != confA {
+		t.Fatalf("expected confA for domainA.com, got cfg: %v, err: %v", cfg, err)
+	}
+
+	// domainB should resolve to confB
+	cfg, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domainB.com"})
+	if err != nil || cfg != confB {
+		t.Fatalf("expected confB for domainB.com, got cfg: %v, err: %v", cfg, err)
+	}
+
+	// shared.com should resolve to confB because confB was registered later (reverse registration order)
+	cfg, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "shared.com"})
+	if err != nil || cfg != confB {
+		t.Fatalf("expected confB (reverse registration order) for shared.com, got cfg: %v, err: %v", cfg, err)
+	}
+
+	// unknown domain should return error
+	_, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "unknown.com"})
+	if err == nil {
+		t.Fatalf("expected error for unknown domain, got nil")
+	}
+
+	// Cancel confB unregistration
+	cancelB(nil)
+
+	// domainB should now fail lookup
+	_, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domainB.com"})
+	if err == nil {
+		t.Fatalf("expected error for domainB.com after confB unregistration")
+	}
+
+	// shared.com should now resolve to confA
+	cfg, err = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "shared.com"})
+	if err != nil || cfg != confA {
+		t.Fatalf("expected confA for shared.com after confB unregistration, got cfg: %v, err: %v", cfg, err)
+	}
+}
+
+func TestSharedQUICStateConcurrent(t *testing.T) {
+	confBase := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			return nil, errors.New("no match")
+		},
+	}
+	sqs := newSharedQUICState(confBase)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			cfg := &tls.Config{
+				GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+					if ch.ServerName == fmt.Sprintf("domain%d.com", id) {
+						return confBase, nil
+					}
+					return nil, errors.New("no match")
+				},
+				GetEncryptedClientHelloKeys: func(ch *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+					return []tls.EncryptedClientHelloKey{{Config: []byte(fmt.Sprintf("key%d", id))}}, nil
+				},
+			}
+			_, cancel := sqs.addState(cfg)
+			_, _ = sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: fmt.Sprintf("domain%d.com", id)})
+			_, _ = sqs.getEncryptedClientHelloKeys(&tls.ClientHelloInfo{ServerName: fmt.Sprintf("domain%d.com", id)})
+			cancel(nil)
+		}(i)
+	}
+	wg.Wait()
 }
 
 func TestParseNetworkAddress(t *testing.T) {
