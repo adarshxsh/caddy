@@ -125,3 +125,33 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
 	}
 }
+
+func TestAddForwardedHeaders_UntrustedEmptyClientIP(t *testing.T) {
+	h := Handler{}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = ":8080"
+	req.Header.Set("X-Forwarded-For", "10.0.0.1")
+
+	vars := map[string]any{
+		caddyhttp.TrustedProxyVarKey: false,
+		caddyhttp.ClientIPVarKey:     "",
+	}
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	err := h.addForwardedHeaders(req)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "" {
+		t.Errorf("X-Forwarded-For should be deleted for untrusted request with empty client IP, got %q", got)
+	}
+	if got := req.Header.Get("X-Forwarded-Proto"); got != "http" {
+		t.Errorf("X-Forwarded-Proto = %q, want %q", got, "http")
+	}
+	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
+		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
