@@ -233,6 +233,76 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 }
 
+func TestSharedQUICState0RTTPolicy(t *testing.T) {
+	allow0RTTTrue := true
+	allow0RTTFalse := false
+
+	tlsConfig1 := &tls.Config{}
+	tlsConfig2 := &tls.Config{}
+	tlsConfig3 := &tls.Config{}
+
+	// Server 1 starts with 0-RTT enabled
+	sqs := newSharedQUICState(tlsConfig1, &allow0RTTTrue)
+
+	qc, err := sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if !qc.Allow0RTT {
+		t.Fatalf("expected Allow0RTT to be true for single server allowing 0-RTT")
+	}
+
+	// Server 2 attaches on shared socket with 0-RTT disabled
+	_, cancel2 := sqs.addState(tlsConfig2, &allow0RTTFalse)
+
+	qc, err = sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if qc.Allow0RTT {
+		t.Fatalf("expected Allow0RTT to be false when any attached server disables 0-RTT")
+	}
+
+	// Server 3 attaches on shared socket with 0-RTT enabled
+	_, _ = sqs.addState(tlsConfig3, &allow0RTTTrue)
+
+	qc, err = sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if qc.Allow0RTT {
+		t.Fatalf("expected Allow0RTT to remain false while server 2 with 0-RTT disabled is active")
+	}
+
+	// Remove server 2 (server shutdown)
+	cancel2(nil)
+
+	qc, err = sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if !qc.Allow0RTT {
+		t.Fatalf("expected Allow0RTT to be restored to true after removing server with 0-RTT disabled")
+	}
+
+	// Reload server 1 to disable 0-RTT
+	tlsConfig1Reload := &tls.Config{}
+	_, cancel1Old := sqs.addState(tlsConfig1Reload, &allow0RTTFalse)
+	// Cancel old server 1
+	sqs.rmu.Lock()
+	delete(sqs.tlsConfs, tlsConfig1)
+	sqs.rmu.Unlock()
+	_ = cancel1Old
+
+	qc, err = sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if qc.Allow0RTT {
+		t.Fatalf("expected Allow0RTT to be false after reload setting 0-RTT disabled")
+	}
+}
+
 func TestParseNetworkAddress(t *testing.T) {
 	for i, tc := range []struct {
 		input          string
