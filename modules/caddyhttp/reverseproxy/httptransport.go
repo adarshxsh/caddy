@@ -163,7 +163,21 @@ type HTTPTransport struct {
 	NetworkProxyRaw json.RawMessage `json:"network_proxy,omitempty" caddy:"namespace=caddy.network_proxy inline_key=from"`
 
 	h3Transport   *http3.Transport // TODO: EXPERIMENTAL (May 2024)
-	quicTransport *quic.Transport  // used by h3Transport if sni placeholder is used, otherwise nil
+	quicTransport *quic.Transport  // used by h3Transport
+}
+
+// MethodSafetyCtxKey is the context key used to decorate HTTP request contexts with method safety metadata.
+const MethodSafetyCtxKey caddy.CtxKey = "method_safety"
+
+// isMethodSafe reports whether method is considered safe according to RFC 8470.
+// Safe methods (GET, HEAD, OPTIONS, TRACE) return true; unsafe methods return false.
+func isMethodSafe(method string) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, "TRACE":
+		return true
+	default:
+		return false
+	}
 }
 
 // CaddyModule returns the Caddy module information.
@@ -501,25 +515,32 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			if err != nil {
 				return nil, fmt.Errorf("making TLS client config for HTTP/3 transport: %v", err)
 			}
+		}
 
-			if strings.Contains(h.TLS.ServerName, "{") {
-				// copied from quic-go
-				udpConn, err := net.ListenUDP("udp", nil)
-				if err != nil {
-					return nil, fmt.Errorf("making udp socket for HTTP/3 transport: %v", err)
-				}
-				h.quicTransport = &quic.Transport{Conn: udpConn}
-				h.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-					// tlsCfg is already cloned from h3Transport.TLSClientConfig
-					repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+		// copied from quic-go
+		udpConn, err := net.ListenUDP("udp", nil)
+		if err != nil {
+			return nil, fmt.Errorf("making udp socket for HTTP/3 transport: %v", err)
+		}
+		h.quicTransport = &quic.Transport{Conn: udpConn}
+		h.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			if tlsCfg != nil {
+				if repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer); ok && repl != nil {
 					tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
-					udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
-					if err != nil {
-						return nil, err
-					}
-					return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
 				}
 			}
+			udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
+			if err != nil {
+				return nil, err
+			}
+			isSafe := false
+			if safe, ok := ctx.Value(MethodSafetyCtxKey).(bool); ok {
+				isSafe = safe
+			}
+			if isSafe {
+				return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+			}
+			return h.quicTransport.Dial(ctx, udpAddr, tlsCfg, cfg)
 		}
 	} else if len(h.Versions) > 1 && slices.Contains(h.Versions, "3") {
 		return nil, fmt.Errorf("if HTTP/3 is enabled to the upstream, no other HTTP versions are supported")
@@ -637,6 +658,8 @@ func (h *HTTPTransport) RequestHeaderOps() *headers.HeaderOps {
 func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	h.SetScheme(req)
 
+	req = req.WithContext(context.WithValue(req.Context(), MethodSafetyCtxKey, isMethodSafe(req.Method)))
+
 	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
 	if h.h3Transport != nil {
 		return h.h3Transport.RoundTrip(req)
@@ -716,7 +739,9 @@ func (h HTTPTransport) Cleanup() error {
 		_ = h.h3Transport.Close()
 		if h.quicTransport != nil {
 			_ = h.quicTransport.Close()
-			_ = h.quicTransport.Conn.Close()
+			if h.quicTransport.Conn != nil {
+				_ = h.quicTransport.Conn.Close()
+			}
 		}
 	}
 	return nil
