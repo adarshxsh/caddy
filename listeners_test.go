@@ -15,7 +15,9 @@
 package caddy
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 	"reflect"
 	"testing"
 
@@ -230,6 +232,68 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(keys, initialKeys) {
 		t.Fatalf("unexpected restored ECH keys: got %#v, want %#v", keys, initialKeys)
+	}
+}
+
+func TestFakeCloseQuicListener(t *testing.T) {
+	na, err := ParseNetworkAddress("udp/127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ParseNetworkAddress failed: %v", err)
+	}
+
+	tlsConf := &tls.Config{
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			return nil, nil
+		},
+	}
+
+	ctx := context.Background()
+	ln, err := na.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf, nil, nil)
+	if err != nil {
+		t.Fatalf("ListenQUIC failed: %v", err)
+	}
+
+	fcql, ok := ln.(*fakeCloseQuicListener)
+	if !ok {
+		t.Fatalf("expected *fakeCloseQuicListener, got %T", ln)
+	}
+
+	key := fcql.sharedQuicListener.key
+	if usage, _ := listenerPool.References(key); usage != 1 {
+		t.Fatalf("expected usage 1, got %d", usage)
+	}
+
+	// First close: cancels context, sets closed = 1, keeps socket open in listenerPool
+	if err := fcql.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+
+	if fcql.closed.Load() != 1 {
+		t.Fatalf("expected closed state 1, got %d", fcql.closed.Load())
+	}
+
+	select {
+	case <-fcql.context.Done():
+		// expected
+	default:
+		t.Fatalf("expected listener context to be canceled after first Close")
+	}
+
+	if usage, _ := listenerPool.References(key); usage != 1 {
+		t.Fatalf("expected usage 1 after first Close, got %d", usage)
+	}
+
+	// Second close: deletes from listenerPool, sets closed = 2, closes packetConn
+	if err := fcql.Close(); err != nil {
+		t.Fatalf("second Close failed: %v", err)
+	}
+
+	if fcql.closed.Load() != 2 {
+		t.Fatalf("expected closed state 2, got %d", fcql.closed.Load())
+	}
+
+	if usage, _ := listenerPool.References(key); usage != 0 {
+		t.Fatalf("expected usage 0 after second Close, got %d", usage)
 	}
 }
 

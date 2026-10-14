@@ -732,6 +732,17 @@ func (app *App) Stop() error {
 			return
 		}
 
+		// close the underlying net.PacketConns after connection draining completes;
+		// see the comment for ListenQUIC
+		defer func() {
+			for _, h3ln := range server.quicListeners {
+				if err := h3ln.Close(); err != nil {
+					app.logger.Error("http3 listener close socket",
+						zap.Error(err))
+				}
+			}
+		}()
+
 		// closing quic listeners won't affect accepted connections now
 		// so like stdlib, close listeners first, but keep the net.PacketConns open
 		for _, h3ln := range server.quicListeners {
@@ -748,15 +759,6 @@ func (app *App) Stop() error {
 			app.logger.Error("HTTP/3 server shutdown",
 				zap.Error(err),
 				zap.Strings("addresses", server.Listen))
-		}
-
-		// close the underlying net.PacketConns now
-		// see the comment for ListenQUIC
-		for _, h3ln := range server.quicListeners {
-			if err := h3ln.Close(); err != nil {
-				app.logger.Error("http3 listener close socket",
-					zap.Error(err))
-			}
 		}
 	}
 
