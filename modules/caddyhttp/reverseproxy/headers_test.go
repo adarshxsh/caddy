@@ -2,6 +2,7 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http/httptest"
 	"testing"
 
@@ -123,5 +124,74 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestPrepareRequestEarlyDataHeader(t *testing.T) {
+	h := Handler{}
+
+	tests := []struct {
+		name       string
+		tls        *tls.ConnectionState
+		initHeader string
+		wantHeader string
+	}{
+		{
+			name:       "Plain HTTP with Early-Data header",
+			tls:        nil,
+			initHeader: "1",
+			wantHeader: "",
+		},
+		{
+			name:       "Plain HTTP without Early-Data header",
+			tls:        nil,
+			initHeader: "",
+			wantHeader: "",
+		},
+		{
+			name:       "TLS completed handshake with spoofed Early-Data header",
+			tls:        &tls.ConnectionState{HandshakeComplete: true},
+			initHeader: "1",
+			wantHeader: "",
+		},
+		{
+			name:       "TLS 0-RTT early data request without prior Early-Data header",
+			tls:        &tls.ConnectionState{HandshakeComplete: false},
+			initHeader: "",
+			wantHeader: "1",
+		},
+		{
+			name:       "TLS 0-RTT early data request with Early-Data header",
+			tls:        &tls.ConnectionState{HandshakeComplete: false},
+			initHeader: "1",
+			wantHeader: "1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com/", nil)
+			req.TLS = tc.tls
+			if tc.initHeader != "" {
+				req.Header.Set("Early-Data", tc.initHeader)
+			}
+
+			vars := map[string]any{
+				caddyhttp.TrustedProxyVarKey: false,
+				caddyhttp.ClientIPVarKey:     "127.0.0.1",
+			}
+			ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+			req = req.WithContext(ctx)
+
+			prepared, err := h.prepareRequest(req, nil)
+			if err != nil {
+				t.Fatalf("prepareRequest unexpected error: %v", err)
+			}
+
+			got := prepared.Header.Get("Early-Data")
+			if got != tc.wantHeader {
+				t.Errorf("Early-Data header = %q, want %q", got, tc.wantHeader)
+			}
+		})
 	}
 }
