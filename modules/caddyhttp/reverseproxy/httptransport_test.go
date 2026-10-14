@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -95,6 +96,82 @@ func TestHTTPTransportUnmarshalCaddyFileWithCaPools(t *testing.T) {
 			}
 			if !tt.wantErr && !reflect.DeepEqual(&tt.expectedTLSConfig, ht.TLS) {
 				t.Errorf("HTTPTransport.UnmarshalCaddyfile() = %v, want %v", ht, tt.expectedTLSConfig)
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_Validate(t *testing.T) {
+	tests := []struct {
+		name        string
+		dialTimeout caddy.Duration
+		wantErr     bool
+	}{
+		{
+			name:        "zero dial timeout is valid",
+			dialTimeout: 0,
+			wantErr:     false,
+		},
+		{
+			name:        "positive dial timeout is valid",
+			dialTimeout: caddy.Duration(5 * time.Second),
+			wantErr:     false,
+		},
+		{
+			name:        "negative dial timeout returns error",
+			dialTimeout: caddy.Duration(-1 * time.Second),
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ht := &HTTPTransport{
+				DialTimeout: tt.dialTimeout,
+			}
+			err := ht.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("HTTPTransport.Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_UnmarshalCaddyfile_DialTimeout(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantTimeout caddy.Duration
+		wantErr     bool
+	}{
+		{
+			name: "valid dial timeout",
+			input: `http {
+				dial_timeout 5s
+			}`,
+			wantTimeout: caddy.Duration(5 * time.Second),
+			wantErr:     false,
+		},
+		{
+			name: "negative dial timeout returns error",
+			input: `http {
+				dial_timeout -1s
+			}`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ht := &HTTPTransport{}
+			d := caddyfile.NewTestDispenser(tt.input)
+			err := ht.UnmarshalCaddyfile(d)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("HTTPTransport.UnmarshalCaddyfile() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && ht.DialTimeout != tt.wantTimeout {
+				t.Errorf("HTTPTransport.DialTimeout = %v, want %v", ht.DialTimeout, tt.wantTimeout)
 			}
 		})
 	}

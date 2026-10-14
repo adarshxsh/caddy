@@ -1113,6 +1113,9 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err != nil {
 				return d.Errf("bad timeout value '%s': %v", d.Val(), err)
 			}
+			if dur < 0 {
+				return d.Errf("dial_timeout cannot be negative: %s", d.Val())
+			}
 			h.DialTimeout = caddy.Duration(dur)
 
 		case "dial_fallback_delay":
