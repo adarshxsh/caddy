@@ -50,6 +50,7 @@ type SessionTicketService struct {
 	keySource   STEKProvider
 	configs     map[*tls.Config]struct{}
 	stopChan    chan struct{}
+	stopOnce    sync.Once
 	currentKeys [][32]byte
 	mu          *sync.Mutex
 }
@@ -150,7 +151,9 @@ func (s *SessionTicketService) stayUpdated() {
 // stop terminates the key rotation goroutine.
 func (s *SessionTicketService) stop() {
 	if s.stopChan != nil {
-		close(s.stopChan)
+		s.stopOnce.Do(func() {
+			close(s.stopChan)
+		})
 	}
 }
 
