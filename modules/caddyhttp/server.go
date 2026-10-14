@@ -253,6 +253,14 @@ type Server struct {
 	// A nil value or element indicates that Protocols will be used instead.
 	ListenProtocols [][]string `json:"listen_protocols,omitempty"`
 
+	// Configures early data (0-RTT) policy for incoming HTTP requests over TLS/QUIC.
+	// Supported values:
+	// - "safe_only" (or empty): Only safe HTTP methods (GET, HEAD, OPTIONS, TRACE)
+	//   are allowed during 0-RTT early data. Unsafe methods return HTTP status 425 Too Early.
+	// - "allow": All HTTP methods are permitted during 0-RTT early data.
+	// - "deny": All HTTP requests received during 0-RTT early data are rejected with HTTP status 425 Too Early.
+	EarlyData string `json:"early_data,omitempty"`
+
 	// If set, overrides whether QUIC listeners allow 0-RTT (early data).
 	// If nil, the default behavior is used (currently allowed).
 	//
@@ -318,6 +326,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Early data (0-RTT) method guard per RFC 8470
+	if r.TLS != nil && !r.TLS.HandshakeComplete {
+		policy := s.getEarlyDataPolicy(r)
+		switch policy {
+		case "deny":
+			w.Header().Set("Too-Early", "1")
+			w.WriteHeader(http.StatusTooEarly)
+			return
+		case "allow":
+			// allow 0-RTT processing
+		default: // "safe_only", "", "default"
+			if !isSafeMethod(r.Method) {
+				w.Header().Set("Too-Early", "1")
+				w.WriteHeader(http.StatusTooEarly)
+				return
+			}
+		}
+	}
+
 	// enable full-duplex for HTTP/1, ensuring the entire
 	// request body gets consumed before writing the response
 	if s.EnableFullDuplex && r.ProtoMajor == 1 {
@@ -354,7 +381,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Request:              r.Clone(r.Context()),
 		ShouldLogCredentials: shouldLogCredentials,
 	})
-	errLog := s.errorLogger.WithLazy(loggableReq)
+	var errLog *zap.Logger
+	if s.errorLogger != nil {
+		errLog = s.errorLogger.WithLazy(loggableReq)
+	} else {
+		errLog = zap.NewNop()
+	}
 
 	var duration time.Duration
 
@@ -508,6 +540,13 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	// execute the primary handler chain
+	if s.primaryHandlerChain == nil {
+		if s.Routes != nil {
+			s.primaryHandlerChain = s.wrapPrimaryRoute(s.Routes.Compile(emptyHandler))
+		} else {
+			s.primaryHandlerChain = emptyHandler
+		}
+	}
 	return s.primaryHandlerChain.ServeHTTP(w, r)
 }
 
@@ -1244,4 +1283,41 @@ func getHTTP3Network(originalNetwork string) (string, error) {
 		return "", fmt.Errorf("network '%s' cannot handle HTTP/3 connections", originalNetwork)
 	}
 	return h3Network, nil
+}
+
+func (s *Server) getEarlyDataPolicy(r *http.Request) string {
+	if r.Context().Value(caddy.ReplacerCtxKey) == nil {
+		repl := caddy.NewReplacer()
+		r = r.WithContext(context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl))
+	}
+	for _, route := range s.Routes {
+		if route.MatcherSets.AnyMatch(r) {
+			if route.EarlyData != "" {
+				return route.EarlyData
+			}
+			for _, h := range route.Handlers {
+				if ed, ok := h.(*EarlyData); ok && ed.Policy != "" {
+					return ed.Policy
+				}
+				if ed, ok := h.(EarlyData); ok && ed.Policy != "" {
+					return ed.Policy
+				}
+			}
+		}
+	}
+	if s.EarlyData != "" {
+		return s.EarlyData
+	}
+	return "safe_only"
+}
+
+// isSafeMethod returns true if the HTTP method is defined as safe according to RFC 7231 and RFC 8470.
+// Safe methods are GET, HEAD, OPTIONS, and TRACE.
+func isSafeMethod(method string) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, "TRACE":
+		return true
+	default:
+		return false
+	}
 }

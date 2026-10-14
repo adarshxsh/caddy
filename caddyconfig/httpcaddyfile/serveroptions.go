@@ -57,6 +57,7 @@ type serverOptions struct {
 	ShouldLogCredentials  bool
 	Metrics               *caddyhttp.Metrics
 	Trace                 bool // TODO: EXPERIMENTAL
+	EarlyData             string
 	// If set, overrides whether QUIC listeners allow 0-RTT (early data).
 	// If nil, the default behavior is used (currently allowed).
 	Allow0RTT *bool
@@ -312,6 +313,12 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
 			}
 			serverOpts.Trace = true
 
+		case "early_data":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			serverOpts.EarlyData = d.Val()
+
 		case "0rtt":
 			// only supports "off" for now
 			if !d.NextArg() {
@@ -388,6 +395,7 @@ func applyServerOptions(
 		server.TrustedProxiesUnix = opts.TrustedProxiesUnix
 		server.Metrics = opts.Metrics
 		server.Allow0RTT = opts.Allow0RTT
+		server.EarlyData = opts.EarlyData
 		if opts.ShouldLogCredentials {
 			if server.Logs == nil {
 				server.Logs = new(caddyhttp.ServerLogConfig)

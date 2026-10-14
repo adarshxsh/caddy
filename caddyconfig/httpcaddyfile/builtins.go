@@ -53,6 +53,7 @@ func init() {
 	RegisterHandlerDirective("skip_log", parseLogSkip)
 	RegisterHandlerDirective("log_skip", parseLogSkip)
 	RegisterHandlerDirective("log_name", parseLogName)
+	RegisterHandlerDirective("early_data", parseEarlyData)
 }
 
 // parseBind parses the bind directive. Syntax:
@@ -1218,4 +1219,13 @@ func parseLogName(h Helper) (caddyhttp.MiddlewareHandler, error) {
 	return caddyhttp.VarsMiddleware{
 		caddyhttp.AccessLoggerNameVarKey: h.RemainingArgs(),
 	}, nil
+}
+
+func parseEarlyData(h Helper) (caddyhttp.MiddlewareHandler, error) {
+	ed := new(caddyhttp.EarlyData)
+	err := ed.UnmarshalCaddyfile(h.Dispenser)
+	if err != nil {
+		return nil, err
+	}
+	return ed, nil
 }
