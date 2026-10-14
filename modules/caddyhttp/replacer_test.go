@@ -18,11 +18,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"unsafe"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -294,5 +296,162 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestToLowerASCII(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+		sameData bool
+	}{
+		{input: "version", expected: "version", sameData: true},
+		{input: "client.subject", expected: "client.subject", sameData: true},
+		{input: "server_name", expected: "server_name", sameData: true},
+		{input: "VERSION", expected: "version", sameData: false},
+		{input: "Server_Name", expected: "server_name", sameData: false},
+		{input: "Client.Subject", expected: "client.subject", sameData: false},
+	}
+
+	for _, tc := range tests {
+		actual := toLowerASCII(tc.input)
+		if actual != tc.expected {
+			t.Errorf("toLowerASCII(%q) = %q; expected %q", tc.input, actual, tc.expected)
+		}
+		if tc.sameData && unsafe.StringData(actual) != unsafe.StringData(tc.input) {
+			t.Errorf("toLowerASCII(%q) created new string allocation; expected same underlying string data pointer", tc.input)
+		}
+	}
+}
+
+func TestTLSPlaceholderClientNoCert(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:           tls.VersionTLS13,
+		HandshakeComplete: true,
+		ServerName:        "example.com",
+	}
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Evaluating client.* placeholders without a client cert should use emptyCert
+	val, ok := getReqTLSReplacement(req, "http.request.tls.client.subject")
+	if !ok {
+		t.Errorf("expected placeholder http.request.tls.client.subject to be recognized")
+	}
+	if val == nil {
+		t.Errorf("expected non-nil value from getReqTLSReplacement for client.subject")
+	}
+
+	// Verify that emptyCert is used (Subject should be empty pkix.Name)
+	if subject, ok := val.(pkix.Name); !ok || subject.CommonName != "" {
+		t.Errorf("expected empty pkix.Name subject for missing cert, got %#v", val)
+	}
+
+	// Confirm 0 allocations for client placeholder lookups that return nil or primitive/static values when cert is absent
+	allocs := testing.AllocsPerRun(100, func() {
+		getReqTLSReplacement(req, "http.request.tls.client.public_key")
+	})
+	if allocs != 0 {
+		t.Errorf("expected 0 allocs for client.public_key lookup without cert, got %f", allocs)
+	}
+}
+
+func TestTLSPlaceholderCaseInsensitive(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:           tls.VersionTLS13,
+		HandshakeComplete: true,
+		ServerName:        "example.com",
+	}
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	val, ok := repl.GetString("http.request.tls.VERSION")
+	if !ok || val != "tls1.3" {
+		t.Errorf("http.request.tls.VERSION = %q (ok=%t); expected %q", val, ok, "tls1.3")
+	}
+
+	val, ok = repl.GetString("http.request.tls.Server_Name")
+	if !ok || val != "example.com" {
+		t.Errorf("http.request.tls.Server_Name = %q (ok=%t); expected %q", val, ok, "example.com")
+	}
+}
+
+func BenchmarkReqTLSReplacement(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:           tls.VersionTLS13,
+		HandshakeComplete: true,
+		ServerName:        "example.com",
+		CipherSuite:       tls.TLS_AES_256_GCM_SHA384,
+	}
+
+	keys := []string{
+		"http.request.tls.version",
+		"http.request.tls.server_name",
+		"http.request.tls.cipher_suite",
+		"http.request.tls.resumed",
+		"http.request.tls.proto",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := keys[i%len(keys)]
+		_, _ = getReqTLSReplacement(req, key)
+	}
+}
+
+func BenchmarkReqTLSReplacementClientNoCert(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:           tls.VersionTLS13,
+		HandshakeComplete: true,
+		ServerName:        "example.com",
+	}
+
+	keys := []string{
+		"http.request.tls.client.subject",
+		"http.request.tls.client.issuer",
+		"http.request.tls.client.serial",
+		"http.request.tls.client.fingerprint",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := keys[i%len(keys)]
+		_, _ = getReqTLSReplacement(req, key)
+	}
+}
+
+func BenchmarkToLowerASCII(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = toLowerASCII("client.subject")
+	}
+}
+
+func BenchmarkReqTLSReplacementZeroAlloc(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:           tls.VersionTLS13,
+		HandshakeComplete: true,
+	}
+
+	keys := []string{
+		"http.request.tls.resumed",
+		"http.request.tls.client.public_key",
+		"http.request.tls.client.san.dns_names.0",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := keys[i%len(keys)]
+		_, _ = getReqTLSReplacement(req, key)
 	}
 }
