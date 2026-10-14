@@ -157,4 +157,4 @@ func AppDataDir() string {
 var ConfigAutosavePath = filepath.Join(AppConfigDir(), "autosave.json")
 
 // DefaultStorage is Caddy's default storage module.
-var DefaultStorage = &certmagic.FileStorage{Path: AppDataDir()}
+var DefaultStorage certmagic.Storage = &certmagic.FileStorage{Path: AppDataDir()}
