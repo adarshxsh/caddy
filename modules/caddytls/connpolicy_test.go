@@ -19,7 +19,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -360,4 +362,75 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+type dummyConn struct {
+	net.Conn
+}
+
+func (dummyConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443}
+}
+
+func (dummyConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345}
+}
+
+type mockHandshakeContext struct{}
+
+func (m mockHandshakeContext) HandshakeContext(hello *tls.ClientHelloInfo) (context.Context, error) {
+	return hello.Context(), nil
+}
+
+func TestConcurrentHandshakeContextEvaluation(t *testing.T) {
+	tlsApp := new(TLS)
+	tlsAppJSON, err := json.Marshal(tlsApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &caddy.Config{
+		AppsRaw: caddy.ModuleMap{
+			"tls": tlsAppJSON,
+		},
+	}
+
+	ctx, err := caddy.ProvisionContext(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pol := &ConnectionPolicy{
+		handshakeContext: mockHandshakeContext{},
+	}
+
+	err = pol.buildStandardTLSConfig(ctx)
+	if err != nil {
+		t.Fatalf("buildStandardTLSConfig error: %v", err)
+	}
+
+	if pol.TLSConfig == nil || pol.TLSConfig.GetCertificate == nil {
+		t.Fatal("expected GetCertificate to be set on TLSConfig")
+	}
+
+	hello := &tls.ClientHelloInfo{
+		ServerName: "example.com",
+		Conn:       dummyConn{},
+	}
+
+	var wg sync.WaitGroup
+	const numGoroutines = 20
+	const numIterations = 50
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numIterations; j++ {
+				_, _ = pol.TLSConfig.GetCertificate(hello)
+			}
+		}()
+	}
+
+	wg.Wait()
 }
