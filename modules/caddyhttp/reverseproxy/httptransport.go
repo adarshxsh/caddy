@@ -203,6 +203,14 @@ func (h *HTTPTransport) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+// Validate ensures h's configuration is valid.
+func (h *HTTPTransport) Validate() error {
+	if h.DialTimeout < 0 {
+		return fmt.Errorf("dial_timeout cannot be negative")
+	}
+	return nil
+}
+
 // NewTransport builds a standard-lib-compatible http.Transport value from h.
 func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, error) {
 	// Set keep-alive defaults if it wasn't otherwise configured
@@ -970,6 +978,7 @@ func decodeBase64DERCert(certStr string) (*x509.Certificate, error) {
 // Interface guards
 var (
 	_ caddy.Provisioner                   = (*HTTPTransport)(nil)
+	_ caddy.Validator                     = (*HTTPTransport)(nil)
 	_ http.RoundTripper                   = (*HTTPTransport)(nil)
 	_ caddy.CleanerUpper                  = (*HTTPTransport)(nil)
 	_ TLSTransport                        = (*HTTPTransport)(nil)
