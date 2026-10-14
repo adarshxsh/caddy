@@ -58,6 +58,8 @@ func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
 }
 
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
+	canonicalizeHeaders(req.Header)
+	canonicalizeHeaders(res.Header)
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
 
@@ -563,6 +565,10 @@ func newMaskKey() [4]byte {
 // isWebsocket returns true if r looks to be an upgrade request for WebSockets.
 // It is a fairly naive check.
 func isWebsocket(r *http.Request) bool {
+	if r == nil || r.Header == nil {
+		return false
+	}
+	canonicalizeHeaders(r.Header)
 	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
 }

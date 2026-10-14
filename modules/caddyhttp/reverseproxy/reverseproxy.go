@@ -815,6 +815,7 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 		req.Header.Set("Early-Data", "1")
 	}
 
+	canonicalizeHeaders(req.Header)
 	reqUpgradeType := upgradeType(req.Header)
 	removeConnectionHeaders(req.Header)
 
@@ -1164,6 +1165,8 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 			c.Write(zap.Int("handler", i))
 		}
 
+		canonicalizeHeaders(res.Header)
+
 		// we make some data available via request context to child routes
 		// so that they may inherit some options and functions from the
 		// handler, and be able to copy the response.
@@ -1215,6 +1218,8 @@ func (h *Handler) finalizeResponse(
 	start time.Time,
 	logger *zap.Logger,
 ) error {
+	canonicalizeHeaders(res.Header)
+
 	// deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
 	if res.StatusCode == http.StatusSwitchingProtocols {
 		var wg sync.WaitGroup
@@ -1575,7 +1580,19 @@ func lastHeaderValue(h http.Header, field string) (value string, ok bool, omit b
 	return values[len(values)-1], true, false
 }
 
+// canonicalizeHeaders normalizes all header keys in h to their canonical form in-place.
+func canonicalizeHeaders(h http.Header) {
+	for k, vv := range h {
+		ck := http.CanonicalHeaderKey(k)
+		if k != ck {
+			h[ck] = append(h[ck], vv...)
+			delete(h, k)
+		}
+	}
+}
+
 func upgradeType(h http.Header) string {
+	canonicalizeHeaders(h)
 	if !httpguts.HeaderValuesContainsToken(h["Connection"], "Upgrade") {
 		return ""
 	}
@@ -1585,6 +1602,7 @@ func upgradeType(h http.Header) string {
 // removeConnectionHeaders removes hop-by-hop headers listed in the "Connection" header of h.
 // See RFC 7230, section 6.1
 func removeConnectionHeaders(h http.Header) {
+	canonicalizeHeaders(h)
 	for _, f := range h["Connection"] {
 		for sf := range strings.SplitSeq(f, ",") {
 			if sf = textproto.TrimString(sf); sf != "" {
