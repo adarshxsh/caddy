@@ -2,12 +2,14 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +279,147 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestHTTPTransport_DialTLSContext_Replacer(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	t.Setenv("TEST_TLS_HOST", "envhost.example.com")
+
+	// Create a dummy TCP listener
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	sniChan := make(chan string, 10)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			serverCfg := &tls.Config{
+				GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+					sniChan <- chi.ServerName
+					return nil, fmt.Errorf("handshake abort for test")
+				},
+			}
+			tlsConn := tls.Server(conn, serverCfg)
+			_ = tlsConn.Handshake()
+			_ = tlsConn.Close()
+		}
+	}()
+
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			ServerName: "{custom_var}.example.com",
+		},
+	}
+	rt, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	// 1. Context with replacer
+	repl := caddy.NewReplacer()
+	repl.Set("custom_var", "myhost")
+	ctxWithReplacer := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+
+	_, _ = rt.DialTLSContext(ctxWithReplacer, "tcp", ln.Addr().String())
+	select {
+	case sni := <-sniChan:
+		if sni != "myhost.example.com" {
+			t.Errorf("got SNI %q, want %q", sni, "myhost.example.com")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SNI")
+	}
+
+	// 2. Context without replacer (background context)
+	htEnv := &HTTPTransport{
+		TLS: &TLSConfig{
+			ServerName: "{env.TEST_TLS_HOST}",
+		},
+	}
+	rtEnv, err := htEnv.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	ctxNoReplacer := context.Background()
+	_, _ = rtEnv.DialTLSContext(ctxNoReplacer, "tcp", ln.Addr().String())
+	select {
+	case sni := <-sniChan:
+		if sni != "envhost.example.com" {
+			t.Errorf("got SNI %q, want %q", sni, "envhost.example.com")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SNI")
+	}
+
+	// 3. Context with invalid type in ReplacerCtxKey
+	ctxInvalidReplacer := context.WithValue(context.Background(), caddy.ReplacerCtxKey, "not-a-replacer")
+	_, _ = rtEnv.DialTLSContext(ctxInvalidReplacer, "tcp", ln.Addr().String())
+	select {
+	case sni := <-sniChan:
+		if sni != "envhost.example.com" {
+			t.Errorf("got SNI %q, want %q", sni, "envhost.example.com")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SNI")
+	}
+}
+
+func TestHTTPTransport_H3Dial_Replacer(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	t.Setenv("TEST_H3_HOST", "h3envhost.example.com")
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{custom_var}.example.com",
+		},
+	}
+
+	_, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	if ht.h3Transport == nil || ht.h3Transport.Dial == nil {
+		t.Fatal("expected h3Transport.Dial to be set")
+	}
+
+	// 1. Context with replacer
+	repl := caddy.NewReplacer()
+	repl.Set("custom_var", "myh3host")
+	ctxWithReplacer := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+
+	tlsCfg1 := &tls.Config{ServerName: ht.TLS.ServerName}
+	_, _ = ht.h3Transport.Dial(ctxWithReplacer, "127.0.0.1:0", tlsCfg1, nil)
+	if tlsCfg1.ServerName != "myh3host.example.com" {
+		t.Errorf("got h3 tlsCfg.ServerName %q, want %q", tlsCfg1.ServerName, "myh3host.example.com")
+	}
+
+	// 2. Context without replacer (background context)
+	ctxNoReplacer := context.Background()
+	tlsCfg2 := &tls.Config{ServerName: "{env.TEST_H3_HOST}"}
+	_, _ = ht.h3Transport.Dial(ctxNoReplacer, "127.0.0.1:0", tlsCfg2, nil)
+	if tlsCfg2.ServerName != "h3envhost.example.com" {
+		t.Errorf("got h3 tlsCfg.ServerName %q, want %q", tlsCfg2.ServerName, "h3envhost.example.com")
+	}
+
+	// 3. Context with invalid replacer type
+	ctxInvalidReplacer := context.WithValue(context.Background(), caddy.ReplacerCtxKey, 12345)
+	tlsCfg3 := &tls.Config{ServerName: "{env.TEST_H3_HOST}"}
+	_, _ = ht.h3Transport.Dial(ctxInvalidReplacer, "127.0.0.1:0", tlsCfg3, nil)
+	if tlsCfg3.ServerName != "h3envhost.example.com" {
+		t.Errorf("got h3 tlsCfg.ServerName %q, want %q", tlsCfg3.ServerName, "h3envhost.example.com")
 	}
 }
