@@ -1,6 +1,7 @@
 package caddytls
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -356,16 +357,16 @@ func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
 		if publication.Configs == nil {
 			// by default, publish all configs
 			for _, configs := range t.EncryptedClientHello.configs {
-				echCfgList = append(echCfgList, configs...)
 				for _, c := range configs {
+					echCfgList = append(echCfgList, c.Clone())
 					configIDs = append(configIDs, c.ConfigID)
 				}
 			}
 		} else {
 			for _, cfgOuterName := range publication.Configs {
 				if cfgList, ok := t.EncryptedClientHello.configs[cfgOuterName]; ok {
-					echCfgList = append(echCfgList, cfgList...)
 					for _, c := range cfgList {
+						echCfgList = append(echCfgList, c.Clone())
 						configIDs = append(configIDs, c.ConfigID)
 					}
 				}
@@ -505,6 +506,29 @@ func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
 					if err := t.ctx.Storage().Store(t.ctx, echMetaKey(cfg.ConfigID), metaBytes); err != nil {
 						return fmt.Errorf("storing updated ECH config metadata: %v", err)
 					}
+
+					t.EncryptedClientHello.configsMu.Lock()
+					found := false
+					if cfgs, ok := t.EncryptedClientHello.configs[cfg.RawPublicName]; ok {
+						for i, mainCfg := range cfgs {
+							if mainCfg.ConfigID == cfg.ConfigID {
+								t.EncryptedClientHello.configs[cfg.RawPublicName][i].meta = cfg.meta.Clone()
+								found = true
+								break
+							}
+						}
+					}
+					if !found {
+						for publicName, cfgs := range t.EncryptedClientHello.configs {
+							for i, mainCfg := range cfgs {
+								if mainCfg.ConfigID == cfg.ConfigID {
+									t.EncryptedClientHello.configs[publicName][i].meta = cfg.meta.Clone()
+									break
+								}
+							}
+						}
+					}
+					t.EncryptedClientHello.configsMu.Unlock()
 				}
 			} else {
 				logger.Error("all domains failed to publish ECH configuration list (see earlier errors)",
@@ -1187,6 +1211,30 @@ type echConfigMeta struct {
 	Publications publicationHistory `json:"publications"`
 }
 
+func (meta echConfigMeta) Clone() echConfigMeta {
+	cloned := meta
+	cloned.Publications = meta.Publications.Clone()
+	return cloned
+}
+
+func (cfg echConfig) Clone() echConfig {
+	cloned := cfg
+	cloned.meta = cfg.meta.Clone()
+	if cfg.CipherSuites != nil {
+		cloned.CipherSuites = append([]hpkeSymmetricCipherSuite(nil), cfg.CipherSuites...)
+	}
+	if cfg.RawExtensions != nil {
+		cloned.RawExtensions = bytes.Clone(cfg.RawExtensions)
+	}
+	if cfg.configBin != nil {
+		cloned.configBin = bytes.Clone(cfg.configBin)
+	}
+	if cfg.privKeyBin != nil {
+		cloned.privKeyBin = bytes.Clone(cfg.privKeyBin)
+	}
+	return cloned
+}
+
 func echMetaKey(configID uint8) string {
 	return path.Join(echConfigsKey, strconv.Itoa(int(configID)), "meta.json")
 }
@@ -1194,6 +1242,25 @@ func echMetaKey(configID uint8) string {
 // publicationHistory is a map of publisher key to
 // map of inner name to timestamp
 type publicationHistory map[string]map[string]time.Time
+
+func (ph publicationHistory) Clone() publicationHistory {
+	if ph == nil {
+		return nil
+	}
+	cloned := make(publicationHistory, len(ph))
+	for pubKey, innerMap := range ph {
+		if innerMap == nil {
+			cloned[pubKey] = nil
+			continue
+		}
+		innerCloned := make(map[string]time.Time, len(innerMap))
+		for k, v := range innerMap {
+			innerCloned[k] = v
+		}
+		cloned[pubKey] = innerCloned
+	}
+	return cloned
+}
 
 // echStorageLockName is the name of the storage lock to sync ECH updates.
 const echStorageLockName = "ech_rotation"
