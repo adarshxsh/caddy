@@ -154,15 +154,15 @@ func (s *SessionTicketService) stop() {
 	}
 }
 
-// register sets the session ticket keys on cfg
+// Register sets the session ticket keys on cfg
 // and keeps them updated. Any values registered
 // must be unregistered, or they will not be
 // garbage-collected. s.start() must have been
 // called first. If session tickets are disabled
 // or if ticket key rotation is disabled, this
 // function is a no-op.
-func (s *SessionTicketService) register(cfg *tls.Config) {
-	if s.Disabled || s.DisableRotation {
+func (s *SessionTicketService) Register(cfg *tls.Config) {
+	if s == nil || s.mu == nil || s.Disabled || s.DisableRotation {
 		return
 	}
 	s.mu.Lock()
@@ -171,12 +171,12 @@ func (s *SessionTicketService) register(cfg *tls.Config) {
 	s.mu.Unlock()
 }
 
-// unregister stops session key management on cfg and
+// Unregister stops session key management on cfg and
 // removes the internal stored reference to cfg. If
 // session tickets are disabled or if ticket key rotation
 // is disabled, this function is a no-op.
-func (s *SessionTicketService) unregister(cfg *tls.Config) {
-	if s.Disabled || s.DisableRotation {
+func (s *SessionTicketService) Unregister(cfg *tls.Config) {
+	if s == nil || s.mu == nil || s.Disabled || s.DisableRotation {
 		return
 	}
 	s.mu.Lock()

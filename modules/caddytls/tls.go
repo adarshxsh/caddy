@@ -474,6 +474,22 @@ func (t *TLS) Stop() error {
 	return nil
 }
 
+// Register registers cfg for session ticket key rotation with the TLS app's
+// SessionTicketService, if configured.
+func (t *TLS) Register(cfg *tls.Config) {
+	if t != nil && t.SessionTickets != nil {
+		t.SessionTickets.Register(cfg)
+	}
+}
+
+// Unregister stops session ticket key rotation for cfg with the TLS app's
+// SessionTicketService, if configured.
+func (t *TLS) Unregister(cfg *tls.Config) {
+	if t != nil && t.SessionTickets != nil {
+		t.SessionTickets.Unregister(cfg)
+	}
+}
+
 // Cleanup frees up resources allocated during Provision.
 func (t *TLS) Cleanup() error {
 	// stop the session ticket rotation goroutine
