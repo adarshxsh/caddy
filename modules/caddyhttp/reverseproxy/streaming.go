@@ -616,23 +616,32 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 
 func (m *maxLatencyWriter) delayedFlush() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !m.flushPending { // if stop was called but AfterFunc already started this goroutine
 		m.logger.Debug("delayed flush is not pending")
+		m.mu.Unlock()
 		return
 	}
 	m.logger.Debug("delayed flush")
+	m.flushPending = false
+	m.mu.Unlock()
+
 	//nolint:errcheck
 	m.flush()
-	m.flushPending = false
 }
 
 func (m *maxLatencyWriter) stop() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	doFlush := m.flushPending
 	m.flushPending = false
 	if m.t != nil {
 		m.t.Stop()
+	}
+	m.mu.Unlock()
+
+	if doFlush {
+		m.logger.Debug("final flush")
+		//nolint:errcheck
+		m.flush()
 	}
 }
 
