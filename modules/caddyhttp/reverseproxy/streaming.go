@@ -57,6 +57,63 @@ func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+func (rwc h2ReadWriteCloser) SetWriteDeadline(t time.Time) error {
+	//nolint:bodyclose
+	return http.NewResponseController(rwc.ResponseWriter).SetWriteDeadline(t)
+}
+
+func (rwc h2ReadWriteCloser) SetReadDeadline(t time.Time) error {
+	if s, ok := rwc.ReadCloser.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return s.SetReadDeadline(t)
+	}
+	if s, ok := rwc.ReadCloser.(interface{ SetDeadline(time.Time) error }); ok {
+		return s.SetDeadline(t)
+	}
+	//nolint:bodyclose
+	return http.NewResponseController(rwc.ResponseWriter).SetReadDeadline(t)
+}
+
+func (rwc h2ReadWriteCloser) SetDeadline(t time.Time) error {
+	rErr := rwc.SetReadDeadline(t)
+	wErr := rwc.SetWriteDeadline(t)
+	if rErr != nil && !errors.Is(rErr, http.ErrNotSupported) {
+		return rErr
+	}
+	if wErr != nil && !errors.Is(wErr, http.ErrNotSupported) {
+		return wErr
+	}
+	return nil
+}
+
+func (rwc h2ReadWriteCloser) Close() error {
+	err := rwc.ReadCloser.Close()
+
+	//nolint:bodyclose
+	_ = http.NewResponseController(rwc.ResponseWriter).Flush()
+
+	rw := rwc.ResponseWriter
+	for rw != nil {
+		if c, ok := rw.(io.Closer); ok {
+			if cErr := c.Close(); cErr != nil && err == nil {
+				err = cErr
+			}
+			break
+		}
+		if c, ok := rw.(interface{ CloseWrite() error }); ok {
+			if cErr := c.CloseWrite(); cErr != nil && err == nil {
+				err = cErr
+			}
+			break
+		}
+		if u, ok := rw.(interface{ Unwrap() http.ResponseWriter }); ok {
+			rw = u.Unwrap()
+		} else {
+			break
+		}
+	}
+	return err
+}
+
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
@@ -203,6 +260,10 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	deleteBackConn := h.registerConnection(backConn, gracefulClose(backConn, true))
 	defer deleteFrontConn()
 	defer deleteBackConn()
+	defer func() {
+		setDeadlineImmediate(conn)
+		setDeadlineImmediate(backConn)
+	}()
 
 	spc := switchProtocolCopier{
 		user:       conn,
@@ -235,6 +296,30 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
 			c.Write(zap.Time("timeout", time))
 		}
+	case <-req.Context().Done():
+		if c := logger.Check(zapcore.DebugLevel, "request context canceled"); c != nil {
+			c.Write(zap.Error(req.Context().Err()))
+		}
+	}
+
+	setDeadlineImmediate(conn)
+	setDeadlineImmediate(backConn)
+}
+
+func setDeadlineImmediate(c io.ReadWriteCloser) {
+	if c == nil {
+		return
+	}
+	now := time.Now()
+	if sd, ok := c.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = sd.SetDeadline(now)
+		return
+	}
+	if srd, ok := c.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = srd.SetReadDeadline(now)
+	}
+	if swd, ok := c.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = swd.SetWriteDeadline(now)
 	}
 }
 
