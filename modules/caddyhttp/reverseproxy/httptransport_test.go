@@ -131,6 +131,21 @@ func TestHTTPTransport_DialTLSContext_ProxyProtocol(t *testing.T) {
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	defer cancel()
 
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
 	tests := []struct {
 		name                     string
 		tls                      *TLSConfig
@@ -193,6 +208,12 @@ func TestHTTPTransport_DialTLSContext_ProxyProtocol(t *testing.T) {
 			hasDialTLSContext := rt.DialTLSContext != nil
 			if hasDialTLSContext != tt.expectDialTLSContext {
 				t.Errorf("DialTLSContext set = %v, want %v", hasDialTLSContext, tt.expectDialTLSContext)
+			}
+
+			if hasDialTLSContext {
+				dialCtx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, caddy.NewReplacer())
+				// Executing DialTLSContext should not panic even if rt.TLSClientConfig is nil
+				_, _ = rt.DialTLSContext(dialCtx, "tcp", ln.Addr().String())
 			}
 		})
 	}
