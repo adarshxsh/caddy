@@ -40,21 +40,21 @@ import (
 
 type h2ReadWriteCloser struct {
 	io.ReadCloser
-	http.ResponseWriter
+	w *maxLatencyWriter
 }
 
 func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
-	n, err = rwc.ResponseWriter.Write(p)
-	if err != nil {
-		return 0, err
-	}
+	return rwc.w.Write(p)
+}
 
-	//nolint:bodyclose
-	err = http.NewResponseController(rwc.ResponseWriter).Flush()
-	if err != nil {
-		return 0, err
+func (rwc h2ReadWriteCloser) Close() error {
+	if rwc.w != nil {
+		rwc.w.stop()
 	}
-	return n, nil
+	if rwc.ReadCloser != nil {
+		return rwc.ReadCloser.Close()
+	}
+	return nil
 }
 
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
@@ -115,7 +115,29 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			}
 			return
 		}
-		conn = h2ReadWriteCloser{req.Body, rw}
+		flushInterval := time.Duration(h.FlushInterval)
+		if flushInterval == 0 {
+			flushInterval = 2 * time.Millisecond
+		}
+
+		var mlwLogger *zap.Logger
+		if h.VerboseLogs {
+			mlwLogger = logger.Named("max_latency_writer")
+		} else {
+			mlwLogger = zap.NewNop()
+		}
+
+		mlw := &maxLatencyWriter{
+			dst: rw,
+			//nolint:bodyclose
+			flush:   http.NewResponseController(rw).Flush,
+			latency: flushInterval,
+			logger:  mlwLogger,
+		}
+		conn = h2ReadWriteCloser{
+			ReadCloser: req.Body,
+			w:          mlw,
+		}
 		// bufio is not needed, use minimal buffer
 		brw = bufio.NewReadWriter(bufio.NewReaderSize(conn, 1), bufio.NewWriterSize(conn, 1))
 	} else {
@@ -579,28 +601,38 @@ type maxLatencyWriter struct {
 	flush   func() error
 	latency time.Duration // non-zero; negative means to flush immediately
 
-	mu           sync.Mutex // protects t, flushPending, and dst.Flush
+	mu           sync.Mutex // protects t, flushPending, dst.Flush, and err
 	t            *time.Timer
 	flushPending bool
 	logger       *zap.Logger
+	err          error
 }
 
 func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.err != nil {
+		return 0, m.err
+	}
 	n, err = m.dst.Write(p)
+	if err != nil {
+		return n, err
+	}
 	if c := m.logger.Check(zapcore.DebugLevel, "wrote bytes"); c != nil {
 		c.Write(zap.Int("n", n), zap.Error(err))
 	}
 	if m.latency < 0 {
 		m.logger.Debug("flushing immediately")
-		//nolint:errcheck
-		m.flush()
-		return n, err
+		flushErr := m.flush()
+		if flushErr != nil {
+			m.err = flushErr
+			return n, flushErr
+		}
+		return n, nil
 	}
 	if m.flushPending {
 		m.logger.Debug("delayed flush already pending")
-		return n, err
+		return n, nil
 	}
 	if m.t == nil {
 		m.t = time.AfterFunc(m.latency, m.delayedFlush)
@@ -611,7 +643,7 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 		c.Write(zap.Duration("duration", m.latency))
 	}
 	m.flushPending = true
-	return n, err
+	return n, nil
 }
 
 func (m *maxLatencyWriter) delayedFlush() {
@@ -622,8 +654,9 @@ func (m *maxLatencyWriter) delayedFlush() {
 		return
 	}
 	m.logger.Debug("delayed flush")
-	//nolint:errcheck
-	m.flush()
+	if err := m.flush(); err != nil {
+		m.err = err
+	}
 	m.flushPending = false
 }
 
