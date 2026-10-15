@@ -7,6 +7,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +83,46 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestMaxLatencyWriterStopFlushesPending(t *testing.T) {
+	var flushed int
+	mlw := &maxLatencyWriter{
+		dst: io.Discard,
+		flush: func() error {
+			flushed++
+			return nil
+		},
+		latency:      time.Hour,
+		flushPending: true,
+		logger:       zap.NewNop(),
+	}
+
+	mlw.stop()
+	if flushed != 1 {
+		t.Errorf("expected 1 flush on stop when flushPending is true, got %d", flushed)
+	}
+
+	// Stopping again should not flush a second time
+	mlw.stop()
+	if flushed != 1 {
+		t.Errorf("expected no additional flush on second stop, got %d", flushed)
+	}
+}
+
+func TestHandlerCopyResponseWithFlushInterval(t *testing.T) {
+	h := Handler{}
+	recorder := httptest.NewRecorder()
+	src := strings.NewReader("hello trailing bytes")
+
+	err := h.copyResponse(recorder, src, 10*time.Minute, caddy.Log())
+	if err != nil {
+		t.Fatalf("copyResponse failed: %v", err)
+	}
+
+	if !recorder.Flushed {
+		t.Errorf("expected recorder to be flushed upon completion of copyResponse")
+	}
+	if got := recorder.Body.String(); got != "hello trailing bytes" {
+		t.Errorf("expected body %q, got %q", "hello trailing bytes", got)
+	}
+}
