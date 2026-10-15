@@ -191,6 +191,9 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	// We need to make sure the client connection messages (i.e. to upstream)
 	// are masked, so we need to know whether the connection is considered the
 	// server or the client side of the proxy.
+	conn = newLockedReadWriteCloser(conn)
+	backConn = newLockedReadWriteCloser(backConn)
+
 	gracefulClose := func(conn io.ReadWriteCloser, isClient bool) func() error {
 		if isWebsocket(req) {
 			return func() error {
@@ -679,3 +682,27 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+// lockedReadWriteCloser wraps an io.ReadWriteCloser and serializes
+// Write calls using a mutex. Read and Close calls are passed through
+// without locking to avoid blocking full-duplex reading operations.
+type lockedReadWriteCloser struct {
+	io.ReadWriteCloser
+	wmu sync.Mutex
+}
+
+func newLockedReadWriteCloser(rwc io.ReadWriteCloser) io.ReadWriteCloser {
+	if rwc == nil {
+		return nil
+	}
+	if _, ok := rwc.(*lockedReadWriteCloser); ok {
+		return rwc
+	}
+	return &lockedReadWriteCloser{ReadWriteCloser: rwc}
+}
+
+func (l *lockedReadWriteCloser) Write(p []byte) (int, error) {
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	return l.ReadWriteCloser.Write(p)
+}
