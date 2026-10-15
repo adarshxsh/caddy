@@ -937,6 +937,13 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 		}
 	}
 
+	if !trusted && clientIP == "" {
+		req.Header.Del("X-Forwarded-For")
+		req.Header.Del("X-Forwarded-Proto")
+		req.Header.Del("X-Forwarded-Host")
+		return nil
+	}
+
 	// If we aren't the first proxy, and the proxy is trusted,
 	// retain prior X-Forwarded-For information as a comma+space
 	// separated list and fold multiple headers into one.
