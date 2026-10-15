@@ -143,22 +143,16 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 	}
 
-	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
-	backConnCloseCh := make(chan struct{})
-	go func() {
-		// Ensure that the cancellation of a request closes the backend.
-		// See issue https://golang.org/issue/35559.
-		select {
-		case <-req.Context().Done():
-		case <-backConnCloseCh:
-		}
-		backConn.Close()
-	}()
-	defer close(backConnCloseCh)
-
 	start := time.Now()
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+			backConn.Close()
+		})
+	}
+	defer closeBoth()
 	defer func() {
-		conn.Close()
 		if c := logger.Check(zapcore.DebugLevel, "connection closed"); c != nil {
 			c.Write(zap.Duration("duration", time.Since(start)))
 		}
@@ -219,21 +213,40 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		timeoutc = timer.C
 	}
 
-	// when a stream timeout is encountered, no error will be read from errc
-	// a buffer size of 2 will allow both the read and write goroutines to send the error and exit
-	// see: https://github.com/caddyserver/caddy/issues/7418
 	errc := make(chan error, 2)
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+
+	ctxDone := req.Context().Done()
+	completed := 0
+	var firstErr error
+
+	for completed < 2 {
+		select {
+		case err := <-errc:
+			completed++
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+					if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+						c.Write(zap.Error(err))
+					}
+				}
+				closeBoth()
+			}
+		case time := <-timeoutc:
+			if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", time))
+			}
+			closeBoth()
+			timeoutc = nil
+		case <-ctxDone:
+			if c := logger.Check(zapcore.DebugLevel, "request context canceled"); c != nil {
+				c.Write(zap.Error(req.Context().Err()))
+			}
+			closeBoth()
+			ctxDone = nil
 		}
 	}
 }
@@ -636,6 +649,10 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
@@ -646,12 +663,22 @@ type switchProtocolCopier struct {
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	if err == nil {
+		if cw, ok := c.user.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	if err == nil {
+		if cw, ok := c.backend.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	errc <- err
 	c.wg.Done()
 }
