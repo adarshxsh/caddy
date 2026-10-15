@@ -293,9 +293,10 @@ func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInter
 		mlw := &maxLatencyWriter{
 			dst: dst,
 			//nolint:bodyclose
-			flush:   http.NewResponseController(dst).Flush,
-			latency: flushInterval,
-			logger:  mlwLogger,
+			flush:     http.NewResponseController(dst).Flush,
+			latency:   flushInterval,
+			lastFlush: time.Now(),
+			logger:    mlwLogger,
 		}
 		defer mlw.stop()
 
@@ -579,9 +580,10 @@ type maxLatencyWriter struct {
 	flush   func() error
 	latency time.Duration // non-zero; negative means to flush immediately
 
-	mu           sync.Mutex // protects t, flushPending, and dst.Flush
+	mu           sync.Mutex // protects t, flushPending, lastFlush, and dst.Flush
 	t            *time.Timer
 	flushPending bool
+	lastFlush    time.Time
 	logger       *zap.Logger
 }
 
@@ -596,6 +598,21 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 		m.logger.Debug("flushing immediately")
 		//nolint:errcheck
 		m.flush()
+		m.lastFlush = time.Now()
+		return n, err
+	}
+	now := time.Now()
+	if now.Sub(m.lastFlush) >= m.latency {
+		m.logger.Debug("flushing immediately after interval")
+		//nolint:errcheck
+		m.flush()
+		m.lastFlush = now
+		if m.flushPending {
+			if m.t != nil {
+				m.t.Stop()
+			}
+			m.flushPending = false
+		}
 		return n, err
 	}
 	if m.flushPending {
@@ -624,6 +641,7 @@ func (m *maxLatencyWriter) delayedFlush() {
 	m.logger.Debug("delayed flush")
 	//nolint:errcheck
 	m.flush()
+	m.lastFlush = time.Now()
 	m.flushPending = false
 }
 
