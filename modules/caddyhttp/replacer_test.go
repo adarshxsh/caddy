@@ -296,3 +296,37 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkHTTPReplacer(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+	ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+	req = req.WithContext(ctx)
+	res := httptest.NewRecorder()
+
+	b.Run("creation", func(b *testing.B) {
+		for b.Loop() {
+			reqCopy := *req
+			_ = NewTestReplacer(&reqCopy)
+		}
+	})
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	b.Run("variable lookup", func(b *testing.B) {
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.method")
+			_, _ = repl.GetString("http.request.host")
+			_, _ = repl.GetString("http.request.uri.path")
+			_, _ = repl.GetString("http.request.remote.host")
+		}
+	})
+
+	b.Run("replace all", func(b *testing.B) {
+		for b.Loop() {
+			repl.ReplaceAll("{http.request.method} {http.request.host}{http.request.uri.path}", "")
+		}
+	})
+}
