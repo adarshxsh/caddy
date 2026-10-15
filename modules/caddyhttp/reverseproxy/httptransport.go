@@ -432,7 +432,12 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				}
 
 				// but add our own handshake logic
-				tlsConfig := rt.TLSClientConfig.Clone()
+				var tlsConfig *tls.Config
+				if rt.TLSClientConfig != nil {
+					tlsConfig = rt.TLSClientConfig.Clone()
+				} else {
+					tlsConfig = new(tls.Config)
+				}
 				if serverNameHasPlaceholder {
 					repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 					tlsConfig.ServerName = repl.ReplaceAll(tlsConfig.ServerName, "")
