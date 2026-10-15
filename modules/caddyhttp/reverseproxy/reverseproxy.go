@@ -827,11 +827,12 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 		// that we support trailers. (We do, but we don't go out of our way to
 		// advertise that unless the incoming client request thought it was worth
 		// mentioning.)
-		if h == "Te" && httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
+		if h == "Te" && httpguts.HeaderValuesContainsToken(getHeaderValues(req.Header, "Te"), "trailers") {
+			deleteHeader(req.Header, "Te")
 			req.Header.Set("Te", "trailers")
 			continue
 		}
-		req.Header.Del(h)
+		deleteHeader(req.Header, h)
 	}
 
 	// After stripping all the hop-by-hop connection headers above, add back any
@@ -1226,7 +1227,7 @@ func (h *Handler) finalizeResponse(
 	removeConnectionHeaders(res.Header)
 
 	for _, h := range hopHeaders {
-		res.Header.Del(h)
+		deleteHeader(res.Header, h)
 	}
 
 	// delete our Server header and use Via instead (see #6275)
@@ -1575,23 +1576,50 @@ func lastHeaderValue(h http.Header, field string) (value string, ok bool, omit b
 	return values[len(values)-1], true, false
 }
 
+// deleteHeader deletes all header entries in h where the key
+// matches key case-insensitively.
+func deleteHeader(h http.Header, key string) {
+	for k := range h {
+		if strings.EqualFold(k, key) {
+			delete(h, k)
+		}
+	}
+}
+
+// getHeaderValues returns all values for header keys in h
+// that match key case-insensitively.
+func getHeaderValues(h http.Header, key string) []string {
+	var vals []string
+	for k, vv := range h {
+		if strings.EqualFold(k, key) {
+			vals = append(vals, vv...)
+		}
+	}
+	return vals
+}
+
 func upgradeType(h http.Header) string {
-	if !httpguts.HeaderValuesContainsToken(h["Connection"], "Upgrade") {
+	if !httpguts.HeaderValuesContainsToken(getHeaderValues(h, "Connection"), "Upgrade") {
 		return ""
 	}
-	return strings.ToLower(h.Get("Upgrade"))
+	vals := getHeaderValues(h, "Upgrade")
+	if len(vals) == 0 {
+		return ""
+	}
+	return strings.ToLower(vals[0])
 }
 
 // removeConnectionHeaders removes hop-by-hop headers listed in the "Connection" header of h.
 // See RFC 7230, section 6.1
 func removeConnectionHeaders(h http.Header) {
-	for _, f := range h["Connection"] {
+	for _, f := range getHeaderValues(h, "Connection") {
 		for sf := range strings.SplitSeq(f, ",") {
 			if sf = textproto.TrimString(sf); sf != "" {
-				h.Del(sf)
+				deleteHeader(h, sf)
 			}
 		}
 	}
+	deleteHeader(h, "Connection")
 }
 
 // statusError returns an error value that has a status code.
