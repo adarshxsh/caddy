@@ -296,3 +296,196 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestFastCookieLookup(t *testing.T) {
+	for i, tc := range []struct {
+		header    http.Header
+		name      string
+		expectVal string
+		expectOk  bool
+	}{
+		{
+			header:    http.Header{"Cookie": []string{"session=abc123"}},
+			name:      "session",
+			expectVal: "abc123",
+			expectOk:  true,
+		},
+		{
+			header:    http.Header{"Cookie": []string{"SESSION=abc123"}},
+			name:      "session",
+			expectVal: "abc123",
+			expectOk:  true,
+		},
+		{
+			header:    http.Header{"Cookie": []string{"a=1; b=2; c=\"3\""}},
+			name:      "c",
+			expectVal: "3",
+			expectOk:  true,
+		},
+		{
+			header:    http.Header{"Cookie": []string{"a=1; b=2", "token=xyz=="}},
+			name:      "token",
+			expectVal: "xyz==",
+			expectOk:  true,
+		},
+		{
+			header:    http.Header{"Cookie": []string{"  foo =  bar ;  baz =  qux "}},
+			name:      "baz",
+			expectVal: "qux",
+			expectOk:  true,
+		},
+		{
+			header:    http.Header{"Cookie": []string{"empty="}},
+			name:      "empty",
+			expectVal: "",
+			expectOk:  true,
+		},
+		{
+			header:    http.Header{"Cookie": []string{"empty_quoted=\"\""}},
+			name:      "empty_quoted",
+			expectVal: "",
+			expectOk:  true,
+		},
+		{
+			header:    http.Header{"Cookie": []string{"session=abc123"}},
+			name:      "missing",
+			expectVal: "",
+			expectOk:  false,
+		},
+		{
+			header:    http.Header{},
+			name:      "session",
+			expectVal: "",
+			expectOk:  false,
+		},
+	} {
+		val, ok := fastCookieLookup(tc.header, tc.name)
+		if ok != tc.expectOk || val != tc.expectVal {
+			t.Errorf("Test %d (%s): expected (%q, %t), got (%q, %t)",
+				i, tc.name, tc.expectVal, tc.expectOk, val, ok)
+		}
+	}
+
+	// Zero allocation check
+	h := http.Header{"Cookie": []string{"session=abc123; user=john; token=\"xyz\""}}
+	allocs := testing.AllocsPerRun(100, func() {
+		val, ok := fastCookieLookup(h, "user")
+		_ = val
+		_ = ok
+	})
+	if allocs != 0 {
+		t.Errorf("fastCookieLookup allocated %f objects, expected 0", allocs)
+	}
+}
+
+func TestFastHostLabelLookup(t *testing.T) {
+	for i, tc := range []struct {
+		host      string
+		idx       int
+		expectVal string
+		expectOk  bool
+	}{
+		{host: "example.com:8080", idx: 0, expectVal: "com", expectOk: true},
+		{host: "example.com:8080", idx: 1, expectVal: "example", expectOk: true},
+		{host: "example.com:8080", idx: 2, expectVal: "", expectOk: true},
+		{host: "example.com:8080", idx: -1, expectVal: "", expectOk: false},
+		{host: "sub.domain.example.com", idx: 0, expectVal: "com", expectOk: true},
+		{host: "sub.domain.example.com", idx: 1, expectVal: "example", expectOk: true},
+		{host: "sub.domain.example.com", idx: 2, expectVal: "domain", expectOk: true},
+		{host: "sub.domain.example.com", idx: 3, expectVal: "sub", expectOk: true},
+		{host: "sub.domain.example.com", idx: 4, expectVal: "", expectOk: true},
+		{host: "SUB.EXAMPLE.COM", idx: 0, expectVal: "com", expectOk: true},
+		{host: "SUB.EXAMPLE.COM", idx: 1, expectVal: "example", expectOk: true},
+		{host: "localhost", idx: 0, expectVal: "localhost", expectOk: true},
+		{host: "localhost", idx: 1, expectVal: "", expectOk: true},
+		{host: "", idx: 0, expectVal: "", expectOk: true},
+		{host: "", idx: 1, expectVal: "", expectOk: true},
+		{host: "[::1]:8080", idx: 0, expectVal: "[::1]", expectOk: true},
+	} {
+		val, ok := fastHostLabelLookup(tc.host, tc.idx)
+		if ok != tc.expectOk || val != tc.expectVal {
+			t.Errorf("Test %d (host=%q, idx=%d): expected (%q, %t), got (%q, %t)",
+				i, tc.host, tc.idx, tc.expectVal, tc.expectOk, val, ok)
+		}
+	}
+
+	// Zero allocation check for lowercase host
+	allocs := testing.AllocsPerRun(100, func() {
+		val, ok := fastHostLabelLookup("sub.domain.example.com:8080", 2)
+		_ = val
+		_ = ok
+	})
+	if allocs != 0 {
+		t.Errorf("fastHostLabelLookup allocated %f objects, expected 0", allocs)
+	}
+}
+
+func TestFastPathPartLookup(t *testing.T) {
+	for i, tc := range []struct {
+		path      string
+		idx       int
+		expectVal string
+		expectOk  bool
+	}{
+		{path: "/foo/bar/baz", idx: 0, expectVal: "foo", expectOk: true},
+		{path: "/foo/bar/baz", idx: 1, expectVal: "bar", expectOk: true},
+		{path: "/foo/bar/baz", idx: 2, expectVal: "baz", expectOk: true},
+		{path: "/foo/bar/baz", idx: 3, expectVal: "", expectOk: true},
+		{path: "/foo/bar/baz", idx: -1, expectVal: "", expectOk: false},
+		{path: "foo/bar", idx: 0, expectVal: "foo", expectOk: true},
+		{path: "foo/bar", idx: 1, expectVal: "bar", expectOk: true},
+		{path: "foo/bar", idx: 2, expectVal: "", expectOk: true},
+		{path: "/foo//bar", idx: 0, expectVal: "foo", expectOk: true},
+		{path: "/foo//bar", idx: 1, expectVal: "", expectOk: true},
+		{path: "/foo//bar", idx: 2, expectVal: "bar", expectOk: true},
+		{path: "/foo/", idx: 0, expectVal: "foo", expectOk: true},
+		{path: "/foo/", idx: 1, expectVal: "", expectOk: true},
+		{path: "/", idx: 0, expectVal: "", expectOk: true},
+		{path: "/", idx: 1, expectVal: "", expectOk: true},
+		{path: "", idx: 0, expectVal: "", expectOk: true},
+		{path: "", idx: 1, expectVal: "", expectOk: true},
+	} {
+		val, ok := fastPathPartLookup(tc.path, tc.idx)
+		if ok != tc.expectOk || val != tc.expectVal {
+			t.Errorf("Test %d (path=%q, idx=%d): expected (%q, %t), got (%q, %t)",
+				i, tc.path, tc.idx, tc.expectVal, tc.expectOk, val, ok)
+		}
+	}
+
+	// Zero allocation check
+	allocs := testing.AllocsPerRun(100, func() {
+		val, ok := fastPathPartLookup("/api/v1/users/123", 2)
+		_ = val
+		_ = ok
+	})
+	if allocs != 0 {
+		t.Errorf("fastPathPartLookup allocated %f objects, expected 0", allocs)
+	}
+}
+
+func BenchmarkFastCookieLookup(b *testing.B) {
+	h := http.Header{"Cookie": []string{"session=abc123; user=john; token=\"xyz\""}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = fastCookieLookup(h, "user")
+	}
+}
+
+func BenchmarkFastHostLabelLookup(b *testing.B) {
+	host := "sub.domain.example.com:8080"
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = fastHostLabelLookup(host, 2)
+	}
+}
+
+func BenchmarkFastPathPartLookup(b *testing.B) {
+	p := "/api/v1/users/123/profile"
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = fastPathPartLookup(p, 3)
+	}
+}
