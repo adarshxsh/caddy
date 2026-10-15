@@ -152,10 +152,12 @@ func (h CopyResponseHeadersHandler) ServeHTTP(rw http.ResponseWriter, req *http.
 	}
 
 	for field, values := range hrc.response.Header {
+		canonicalField := http.CanonicalHeaderKey(field)
+
 		// Check the include list first, skip
 		// the header if it's _not_ in this list.
 		if len(h.includeMap) > 0 {
-			if _, ok := h.includeMap[field]; !ok {
+			if _, ok := h.includeMap[canonicalField]; !ok {
 				continue
 			}
 		}
@@ -163,14 +165,14 @@ func (h CopyResponseHeadersHandler) ServeHTTP(rw http.ResponseWriter, req *http.
 		// Then, check the exclude list, skip
 		// the header if it _is_ in this list.
 		if len(h.excludeMap) > 0 {
-			if _, ok := h.excludeMap[field]; ok {
+			if _, ok := h.excludeMap[canonicalField]; ok {
 				continue
 			}
 		}
 
 		// Copy all the values for the header.
 		for _, value := range values {
-			rw.Header().Add(field, value)
+			rw.Header().Add(canonicalField, value)
 		}
 	}
 
