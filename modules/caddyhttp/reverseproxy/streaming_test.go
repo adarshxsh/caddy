@@ -49,7 +49,11 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 		bufferSize: 7,
 	}
 
-	buf := copier.buffer()
+	buf, release := copier.buffer()
+	if release != nil {
+		t.Errorf("expected nil release function for custom buffer size")
+		release()
+	}
 	if got := len(buf); got != 7 {
 		t.Fatalf("buffer len = %d, want 7", got)
 	}
@@ -67,10 +71,17 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 }
 
 func TestSwitchProtocolCopierDefaultBufferSize(t *testing.T) {
-	copier := switchProtocolCopier{}
-	buf := copier.buffer()
-	if got := len(buf); got != defaultBufferSize {
-		t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
+	for _, sz := range []int{0, defaultBufferSize} {
+		copier := switchProtocolCopier{bufferSize: sz}
+		buf, release := copier.buffer()
+		if release == nil {
+			t.Fatalf("expected non-nil release function for buffer size %d", sz)
+		}
+		if got := len(buf); got != defaultBufferSize {
+			release()
+			t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
+		}
+		release()
 	}
 }
 
