@@ -216,6 +216,14 @@ eqp31wM9il1n+guTNyxJd+FzVAH+hCZE5K+tCgVDdVFUlDEHHbS/wqb2PSIoouLV
 			expect: "tls1.3",
 		},
 		{
+			get:    "http.request.tls.used_0rtt",
+			expect: "false",
+		},
+		{
+			get:    "http.request.tls.early_data_status",
+			expect: "none",
+		},
+		{
 			get:    "http.request.tls.client.fingerprint",
 			expect: "9f57b7b497cceacc5459b76ac1c3afedbc12b300e728071f55f84168ff0f7702",
 		},
@@ -294,5 +302,30 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestHTTPVarReplacement_EarlyData(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version: tls.VersionTLS13,
+	}
+	ctx := context.WithValue(req.Context(), EarlyDataCtxKey, EarlyDataInfo{
+		Used0RTT: true,
+		Status:   "accepted",
+	})
+	req = req.WithContext(ctx)
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	used0RTT, ok := repl.GetString("http.request.tls.used_0rtt")
+	if !ok || used0RTT != "true" {
+		t.Errorf("expected http.request.tls.used_0rtt to be 'true', got %q", used0RTT)
+	}
+
+	status, ok := repl.GetString("http.request.tls.early_data_status")
+	if !ok || status != "accepted" {
+		t.Errorf("expected http.request.tls.early_data_status to be 'accepted', got %q", status)
 	}
 }

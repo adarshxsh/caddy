@@ -693,6 +693,25 @@ func (s *Server) serveHTTP3(addr caddy.NetworkAddress, tlsCfg *tls.Config) error
 		}
 	}
 
+	s.h3server.ConnContext = func(ctx context.Context, c *quic.Conn) context.Context {
+		if c != nil {
+			cs := c.ConnectionState()
+			used0RTT := cs.Used0RTT
+			status := "none"
+			if used0RTT {
+				status = "accepted"
+			} else if cs.TLS.DidResume {
+				status = "rejected_fallback_1rtt"
+			}
+			ctx = context.WithValue(ctx, EarlyDataCtxKey, EarlyDataInfo{
+				Used0RTT: used0RTT,
+				Status:   status,
+				Conn:     c,
+			})
+		}
+		return ctx
+	}
+
 	s.quicListeners = append(s.quicListeners, h3ln)
 
 	//nolint:errcheck
@@ -1208,12 +1227,56 @@ const (
 	// used to get the tls connection state in the context, if available
 	tlsConnectionStateFuncCtxKey caddy.CtxKey = "tls_connection_state_func"
 
+	// Used to store/retrieve HTTP/3 early data (0-RTT) information in context
+	EarlyDataCtxKey caddy.CtxKey = "early_data"
+
 	// For tracking whether the client is a trusted proxy
 	TrustedProxyVarKey string = "trusted_proxy"
 
 	// For tracking the real client IP (affected by trusted_proxy)
 	ClientIPVarKey string = "client_ip"
 )
+
+// EarlyDataInfo holds HTTP/3 0-RTT early data telemetry details.
+type EarlyDataInfo struct {
+	Used0RTT bool
+	Status   string
+	Conn     *quic.Conn
+}
+
+// GetEarlyDataInfo returns whether 0-RTT was used and early data status string
+// ("accepted", "rejected_fallback_1rtt", or "none") from request context.
+func GetEarlyDataInfo(ctx context.Context) (bool, string) {
+	if ctx == nil {
+		return false, "none"
+	}
+	info, ok := ctx.Value(EarlyDataCtxKey).(EarlyDataInfo)
+	if !ok {
+		return false, "none"
+	}
+	if info.Conn != nil {
+		cs := info.Conn.ConnectionState()
+		used0RTT := cs.Used0RTT
+		status := "none"
+		if used0RTT {
+			status = "accepted"
+		} else if cs.TLS.DidResume {
+			status = "rejected_fallback_1rtt"
+		}
+		return used0RTT, status
+	}
+	status := info.Status
+	if status == "" {
+		status = "none"
+	}
+	return info.Used0RTT, status
+}
+
+// GetEarlyDataStatus returns early data status string from context ("accepted", "rejected_fallback_1rtt", or "none").
+func GetEarlyDataStatus(ctx context.Context) string {
+	_, status := GetEarlyDataInfo(ctx)
+	return status
+}
 
 var networkTypesHTTP3 = map[string]string{
 	"unixgram": "unixgram",

@@ -56,7 +56,12 @@ func (r LoggableHTTPRequest) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 		enc.AddArray("transfer_encoding", internal.LoggableStringArray(r.TransferEncoding))
 	}
 	if r.TLS != nil {
-		enc.AddObject("tls", LoggableTLSConnState(*r.TLS))
+		used0RTT, earlyDataStatus := GetEarlyDataInfo(r.Context())
+		enc.AddObject("tls", LoggableTLSConnState{
+			ConnectionState: *r.TLS,
+			Used0RTT:        used0RTT,
+			EarlyDataStatus: earlyDataStatus,
+		})
 	}
 	return nil
 }
@@ -68,7 +73,11 @@ type LoggableHTTPHeader = internal.LoggableHTTPHeader
 type LoggableStringArray = internal.LoggableStringArray
 
 // LoggableTLSConnState makes a TLS connection state loggable with zap.Object().
-type LoggableTLSConnState tls.ConnectionState
+type LoggableTLSConnState struct {
+	tls.ConnectionState
+	Used0RTT        bool
+	EarlyDataStatus string
+}
 
 // MarshalLogObject satisfies the zapcore.ObjectMarshaler interface.
 func (t LoggableTLSConnState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
@@ -82,6 +91,12 @@ func (t LoggableTLSConnState) MarshalLogObject(enc zapcore.ObjectEncoder) error 
 		enc.AddString("client_common_name", t.PeerCertificates[0].Subject.CommonName)
 		enc.AddString("client_serial", t.PeerCertificates[0].SerialNumber.String())
 	}
+	status := t.EarlyDataStatus
+	if status == "" {
+		status = "none"
+	}
+	enc.AddBool("used_0rtt", t.Used0RTT)
+	enc.AddString("early_data_status", status)
 	return nil
 }
 
