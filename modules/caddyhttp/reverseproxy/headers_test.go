@@ -125,3 +125,65 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
 	}
 }
+
+func TestAddForwardedHeaders_EmptyHostUntrusted(t *testing.T) {
+	h := Handler{}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = ":8080"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "spoofed.example.com")
+
+	vars := map[string]any{
+		caddyhttp.TrustedProxyVarKey: false,
+	}
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	err := h.addForwardedHeaders(req)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "" {
+		t.Errorf("X-Forwarded-For should be deleted, got %q", got)
+	}
+	if got := req.Header.Get("X-Forwarded-Proto"); got != "" {
+		t.Errorf("X-Forwarded-Proto should be deleted, got %q", got)
+	}
+	if got := req.Header.Get("X-Forwarded-Host"); got != "" {
+		t.Errorf("X-Forwarded-Host should be deleted, got %q", got)
+	}
+}
+
+func TestAddForwardedHeaders_EmptyHostTrusted(t *testing.T) {
+	h := Handler{}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.RemoteAddr = ":8080"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Host", "original.example.com")
+
+	vars := map[string]any{
+		caddyhttp.TrustedProxyVarKey: true,
+	}
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	err := h.addForwardedHeaders(req)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "1.2.3.4" {
+		t.Errorf("X-Forwarded-For = %q, want %q", got, "1.2.3.4")
+	}
+	if got := req.Header.Get("X-Forwarded-Proto"); got != "https" {
+		t.Errorf("X-Forwarded-Proto = %q, want %q", got, "https")
+	}
+	if got := req.Header.Get("X-Forwarded-Host"); got != "original.example.com" {
+		t.Errorf("X-Forwarded-Host = %q, want %q", got, "original.example.com")
+	}
+}
