@@ -80,3 +80,53 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestLockedWriteCloser(t *testing.T) {
+	var buf bytes.Buffer
+	mock := &nopReadWriteCloser{Writer: &buf}
+	lwc := &lockedWriteCloser{ReadWriteCloser: mock}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := lwc.Write([]byte("test"))
+			if err != nil {
+				t.Errorf("unexpected write error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := buf.String(); len(got) != 40 {
+		t.Fatalf("expected length 40, got %d", len(got))
+	}
+}
+
+func TestConcurrentWriteCloseControl(t *testing.T) {
+	var buf bytes.Buffer
+	mock := &nopReadWriteCloser{Writer: &buf}
+	conn := &lockedWriteCloser{ReadWriteCloser: mock}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Goroutine 1: active stream write (simulating io.CopyBuffer)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_, _ = conn.Write([]byte("stream-data"))
+		}
+	}()
+
+	// Goroutine 2: graceful close handler write
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			_ = writeCloseControl(conn, true)
+		}
+	}()
+
+	wg.Wait()
+}
