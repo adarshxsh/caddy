@@ -143,26 +143,18 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 	}
 
-	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
-	backConnCloseCh := make(chan struct{})
-	go func() {
-		// Ensure that the cancellation of a request closes the backend.
-		// See issue https://golang.org/issue/35559.
-		select {
-		case <-req.Context().Done():
-		case <-backConnCloseCh:
-		}
-		backConn.Close()
-	}()
-	defer close(backConnCloseCh)
-
 	start := time.Now()
-	defer func() {
-		conn.Close()
-		if c := logger.Check(zapcore.DebugLevel, "connection closed"); c != nil {
-			c.Write(zap.Duration("duration", time.Since(start)))
-		}
-	}()
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+			backConn.Close()
+			if c := logger.Check(zapcore.DebugLevel, "connection closed"); c != nil {
+				c.Write(zap.Duration("duration", time.Since(start)))
+			}
+		})
+	}
+	defer closeBoth()
 
 	if err := brw.Flush(); err != nil {
 		if c := logger.Check(zapcore.DebugLevel, "response flush"); c != nil {
@@ -226,14 +218,31 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+
+	completed := 0
+	for completed < 2 {
+		select {
+		case err := <-errc:
+			if err != nil {
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				closeBoth()
+				return
+			}
+			completed++
+		case timeVal := <-timeoutc:
+			if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", timeVal))
+			}
+			closeBoth()
+			return
+		case <-req.Context().Done():
+			if c := logger.Check(zapcore.DebugLevel, "request context canceled"); c != nil {
+				c.Write(zap.Error(req.Context().Err()))
+			}
+			closeBoth()
+			return
 		}
 	}
 }
@@ -381,10 +390,19 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 // The caller should call the returned delete() function when the
 // connection is done to remove it from memory.
 func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (del func()) {
+	if h.connectionsMu == nil {
+		return func() {}
+	}
 	h.connectionsMu.Lock()
+	if h.connections == nil {
+		h.connections = make(map[io.ReadWriteCloser]openConnection)
+	}
 	h.connections[conn] = openConnection{conn, gracefulClose}
 	h.connectionsMu.Unlock()
 	return func() {
+		if h.connectionsMu == nil {
+			return
+		}
 		h.connectionsMu.Lock()
 		delete(h.connections, conn)
 		// if there is no connection left before the connections close timer fires
@@ -636,6 +654,10 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
@@ -645,15 +667,25 @@ type switchProtocolCopier struct {
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
+	defer c.wg.Done()
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	if err == nil {
+		if cw, ok := c.user.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	errc <- err
-	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
+	defer c.wg.Done()
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	if err == nil {
+		if cw, ok := c.backend.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	errc <- err
-	c.wg.Done()
 }
 
 func (c switchProtocolCopier) buffer() []byte {
