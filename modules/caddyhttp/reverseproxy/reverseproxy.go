@@ -29,6 +29,7 @@ import (
 	"net/netip"
 	"net/textproto"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -897,9 +898,9 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 		// for security. If trusted, there is no peer IP to append to
 		// X-Forwarded-For, so clientIP stays empty.
 		if !trusted {
-			req.Header.Del("X-Forwarded-For")
-			req.Header.Del("X-Forwarded-Proto")
-			req.Header.Del("X-Forwarded-Host")
+			deleteHeaderCaseInsensitive(req.Header, "X-Forwarded-For")
+			deleteHeaderCaseInsensitive(req.Header, "X-Forwarded-Proto")
+			deleteHeaderCaseInsensitive(req.Header, "X-Forwarded-Host")
 			return nil
 		}
 	} else {
@@ -913,9 +914,9 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 		if err != nil {
 			// Remove the `X-Forwarded-*` headers to avoid upstreams
 			// potentially trusting a header that came from the client
-			req.Header.Del("X-Forwarded-For")
-			req.Header.Del("X-Forwarded-Proto")
-			req.Header.Del("X-Forwarded-Host")
+			deleteHeaderCaseInsensitive(req.Header, "X-Forwarded-For")
+			deleteHeaderCaseInsensitive(req.Header, "X-Forwarded-Proto")
+			deleteHeaderCaseInsensitive(req.Header, "X-Forwarded-Host")
 			return nil
 		}
 
@@ -941,6 +942,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 	// retain prior X-Forwarded-For information as a comma+space
 	// separated list and fold multiple headers into one.
 	prior, ok, omit := allHeaderValues(req.Header, "X-Forwarded-For")
+	deleteHeaderCaseInsensitive(req.Header, "X-Forwarded-For")
 	if !omit {
 		if trusted && ok && prior != "" {
 			if clientIP != "" {
@@ -961,6 +963,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 		proto = "http"
 	}
 	prior, ok, omit = lastHeaderValue(req.Header, "X-Forwarded-Proto")
+	deleteHeaderCaseInsensitive(req.Header, "X-Forwarded-Proto")
 	if trusted && ok && prior != "" {
 		proto = prior
 	}
@@ -974,6 +977,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 	// Host themselves, so it's helpful to send the original too.
 	host := req.Host
 	prior, ok, omit = lastHeaderValue(req.Header, "X-Forwarded-Host")
+	deleteHeaderCaseInsensitive(req.Header, "X-Forwarded-Host")
 	if trusted && ok && prior != "" {
 		host = prior
 	}
@@ -1539,7 +1543,16 @@ func copyHeader(dst, src http.Header) {
 	}
 }
 
-// allHeaderValues gets all values for a given header field,
+// deleteHeaderCaseInsensitive deletes all key variants matching field case-insensitively from h.
+func deleteHeaderCaseInsensitive(h http.Header, field string) {
+	for k := range h {
+		if strings.EqualFold(k, field) {
+			delete(h, k)
+		}
+	}
+}
+
+// allHeaderValues gets all values for a given header field across all casing variants,
 // joined by a comma and space if more than one is set. If the
 // header field is nil, then the omit is true, meaning some
 // earlier logic in the server wanted to prevent this header from
@@ -1547,17 +1560,32 @@ func copyHeader(dst, src http.Header) {
 // false. Callers should still check that the value is not empty
 // (the header field may be set but have an empty value).
 func allHeaderValues(h http.Header, field string) (value string, ok bool, omit bool) {
-	values, ok := h[http.CanonicalHeaderKey(field)]
-	if ok && values == nil {
-		return "", true, true
+	var matchingKeys []string
+	for k := range h {
+		if strings.EqualFold(k, field) {
+			matchingKeys = append(matchingKeys, k)
+		}
 	}
-	if len(values) == 0 {
+	if len(matchingKeys) == 0 {
 		return "", false, false
 	}
-	return strings.Join(values, ", "), true, false
+	for _, k := range matchingKeys {
+		if h[k] == nil {
+			return "", true, true
+		}
+	}
+	sort.Strings(matchingKeys)
+	var allVals []string
+	for _, k := range matchingKeys {
+		allVals = append(allVals, h[k]...)
+	}
+	if len(allVals) == 0 {
+		return "", false, false
+	}
+	return strings.Join(allVals, ", "), true, false
 }
 
-// lastHeaderValue gets the last value for a given header field
+// lastHeaderValue gets the last value for a given header field across all casing variants
 // if more than one is set. If the header field is nil, then
 // the omit is true, meaning some earlier logic in the server
 // wanted to prevent this header from getting written at all.
@@ -1565,14 +1593,29 @@ func allHeaderValues(h http.Header, field string) (value string, ok bool, omit b
 // still check that the value is not empty (the header field
 // may be set but have an empty value).
 func lastHeaderValue(h http.Header, field string) (value string, ok bool, omit bool) {
-	values, ok := h[http.CanonicalHeaderKey(field)]
-	if ok && values == nil {
-		return "", true, true
+	var matchingKeys []string
+	for k := range h {
+		if strings.EqualFold(k, field) {
+			matchingKeys = append(matchingKeys, k)
+		}
 	}
-	if len(values) == 0 {
+	if len(matchingKeys) == 0 {
 		return "", false, false
 	}
-	return values[len(values)-1], true, false
+	for _, k := range matchingKeys {
+		if h[k] == nil {
+			return "", true, true
+		}
+	}
+	sort.Strings(matchingKeys)
+	var allVals []string
+	for _, k := range matchingKeys {
+		allVals = append(allVals, h[k]...)
+	}
+	if len(allVals) == 0 {
+		return "", false, false
+	}
+	return allVals[len(allVals)-1], true, false
 }
 
 func upgradeType(h http.Header) string {
