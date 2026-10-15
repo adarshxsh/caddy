@@ -530,3 +530,120 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+type customStringer struct {
+	text string
+}
+
+func (cs customStringer) String() string {
+	return cs.text
+}
+
+type customStruct struct {
+	Foo string
+	Bar int
+}
+
+func TestReplacerTypedSetters(t *testing.T) {
+	rep := NewReplacer()
+
+	rep.SetString("strVar", "hello world")
+	rep.SetInt("intVar", 12345)
+	rep.SetInt64("int64Var", 9223372036854775807)
+	rep.SetBool("boolVarTrue", true)
+	rep.SetBool("boolVarFalse", false)
+
+	// Check Get
+	if val, ok := rep.Get("strVar"); !ok || val != "hello world" {
+		t.Errorf("Expected 'hello world', got %v (ok=%v)", val, ok)
+	}
+	if val, ok := rep.Get("intVar"); !ok || val != 12345 {
+		t.Errorf("Expected 12345, got %v (ok=%v)", val, ok)
+	}
+	if val, ok := rep.Get("int64Var"); !ok || val != int64(9223372036854775807) {
+		t.Errorf("Expected 9223372036854775807, got %v (ok=%v)", val, ok)
+	}
+	if val, ok := rep.Get("boolVarTrue"); !ok || val != true {
+		t.Errorf("Expected true, got %v (ok=%v)", val, ok)
+	}
+	if val, ok := rep.Get("boolVarFalse"); !ok || val != false {
+		t.Errorf("Expected false, got %v (ok=%v)", val, ok)
+	}
+
+	// Check ReplaceAll
+	input := "str={strVar} int={intVar} int64={int64Var} bool1={boolVarTrue} bool2={boolVarFalse}"
+	expected := "str=hello world int=12345 int64=9223372036854775807 bool1=true bool2=false"
+	actual := rep.ReplaceAll(input, "")
+	if actual != expected {
+		t.Errorf("Expected '%s', got '%s'", expected, actual)
+	}
+}
+
+func TestReplacerDirectFormattingPrimitiveTypes(t *testing.T) {
+	rep := NewReplacer()
+
+	rep.Set("str", "test string")
+	rep.Set("bytes", []byte("byte slice"))
+	rep.Set("runes", []rune("rune slice"))
+	rep.Set("byteVal", byte('X'))
+	rep.Set("intVal", -42)
+	rep.Set("int32Val", int32(320))
+	rep.Set("int64Val", int64(-6400))
+	rep.Set("uintVal", uint(99))
+	rep.Set("uint32Val", uint32(3200))
+	rep.Set("uint64Val", uint64(64000))
+	rep.Set("float32Val", float32(3.14))
+	rep.Set("float64Val", float64(2.71828))
+	rep.Set("boolVal", true)
+	rep.Set("stringer", customStringer{text: "stringer output"})
+	rep.Set("emptyStringer", customStringer{text: ""})
+	rep.Set("errVal", fmt.Errorf("error message"))
+	rep.Set("nilVal", nil)
+	rep.Set("structVal", customStruct{Foo: "abc", Bar: 7})
+
+	testCases := []struct {
+		input    string
+		expected string
+	}{
+		{"{str}", "test string"},
+		{"{bytes}", "byte slice"},
+		{"{runes}", "rune slice"},
+		{"{byteVal}", "X"},
+		{"{intVal}", "-42"},
+		{"{int32Val}", "320"},
+		{"{int64Val}", "-6400"},
+		{"{uintVal}", "99"},
+		{"{uint32Val}", "3200"},
+		{"{uint64Val}", "64000"},
+		{"{float32Val}", "3.14"},
+		{"{float64Val}", "2.71828"},
+		{"{boolVal}", "true"},
+		{"{stringer}", "stringer output"},
+		{"{errVal}", "error message"},
+		{"{structVal}", "{Foo:abc Bar:7}"},
+	}
+
+	for i, tc := range testCases {
+		actual := rep.ReplaceAll(tc.input, "")
+		if actual != tc.expected {
+			t.Errorf("Test case %d (%s): expected '%s', got '%s'", i, tc.input, tc.expected, actual)
+		}
+	}
+
+	// Test ReplaceOrErr with errOnEmpty
+	_, err := rep.ReplaceOrErr("{nilVal}", true, false)
+	if err == nil {
+		t.Errorf("Expected error for nilVal with errOnEmpty=true, got nil")
+	}
+
+	_, err = rep.ReplaceOrErr("{emptyStringer}", true, false)
+	if err == nil {
+		t.Errorf("Expected error for emptyStringer with errOnEmpty=true, got nil")
+	}
+
+	// Test ReplaceOrErr with unknown placeholder
+	_, err = rep.ReplaceOrErr("{nonExistentKey}", false, true)
+	if err == nil {
+		t.Errorf("Expected error for nonExistentKey with errOnUnknown=true, got nil")
+	}
+}

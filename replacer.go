@@ -95,6 +95,26 @@ func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Unlock()
 }
 
+// SetString sets a custom variable to a string value.
+func (r *Replacer) SetString(variable, value string) {
+	r.Set(variable, value)
+}
+
+// SetInt sets a custom variable to an int value.
+func (r *Replacer) SetInt(variable string, value int) {
+	r.Set(variable, value)
+}
+
+// SetInt64 sets a custom variable to an int64 value.
+func (r *Replacer) SetInt64(variable string, value int64) {
+	r.Set(variable, value)
+}
+
+// SetBool sets a custom variable to a bool value.
+func (r *Replacer) SetBool(variable string, value bool) {
+	r.Set(variable, value)
+}
+
 // Get gets a value from the replacer. It returns
 // the value and whether the variable was known.
 func (r *Replacer) Get(variable string) (any, bool) {
@@ -259,20 +279,15 @@ scan:
 			}
 		}
 
-		// convert val to a string as efficiently as possible
-		valStr := ToString(val)
-
-		// write the value; if it's empty, either return
+		// write val to string builder directly; if it's empty, either return
 		// an error or write a default value
-		if valStr == "" {
+		if appendValue(&sb, val) {
 			if errOnEmpty {
 				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
 					string(phOpen), key, string(phClose))
 			} else if empty != "" {
 				sb.WriteString(empty)
 			}
-		} else {
-			sb.WriteString(valStr)
 		}
 
 		// advance cursor to end of placeholder
@@ -327,6 +342,106 @@ func ToString(val any) string {
 		return "false"
 	default:
 		return fmt.Sprintf("%+v", v)
+	}
+}
+
+// appendValue writes val into sb directly using stack buffers and strconv functions.
+// It returns true if the value was empty.
+func appendValue(sb *strings.Builder, val any) bool {
+	switch v := val.(type) {
+	case nil:
+		return true
+	case string:
+		if len(v) == 0 {
+			return true
+		}
+		sb.WriteString(v)
+		return false
+	case []byte:
+		if len(v) == 0 {
+			return true
+		}
+		sb.Write(v)
+		return false
+	case []rune:
+		if len(v) == 0 {
+			return true
+		}
+		for _, r := range v {
+			sb.WriteRune(r)
+		}
+		return false
+	case byte:
+		sb.WriteByte(v)
+		return false
+	case int:
+		var buf [32]byte
+		b := strconv.AppendInt(buf[:0], int64(v), 10)
+		sb.Write(b)
+		return false
+	case int32:
+		var buf [32]byte
+		b := strconv.AppendInt(buf[:0], int64(v), 10)
+		sb.Write(b)
+		return false
+	case int64:
+		var buf [32]byte
+		b := strconv.AppendInt(buf[:0], v, 10)
+		sb.Write(b)
+		return false
+	case uint:
+		var buf [32]byte
+		b := strconv.AppendUint(buf[:0], uint64(v), 10)
+		sb.Write(b)
+		return false
+	case uint32:
+		var buf [32]byte
+		b := strconv.AppendUint(buf[:0], uint64(v), 10)
+		sb.Write(b)
+		return false
+	case uint64:
+		var buf [32]byte
+		b := strconv.AppendUint(buf[:0], v, 10)
+		sb.Write(b)
+		return false
+	case float32:
+		var buf [32]byte
+		b := strconv.AppendFloat(buf[:0], float64(v), 'f', -1, 32)
+		sb.Write(b)
+		return false
+	case float64:
+		var buf [32]byte
+		b := strconv.AppendFloat(buf[:0], v, 'f', -1, 64)
+		sb.Write(b)
+		return false
+	case bool:
+		if v {
+			sb.WriteString("true")
+		} else {
+			sb.WriteString("false")
+		}
+		return false
+	case fmt.Stringer:
+		str := v.String()
+		if len(str) == 0 {
+			return true
+		}
+		sb.WriteString(str)
+		return false
+	case error:
+		str := v.Error()
+		if len(str) == 0 {
+			return true
+		}
+		sb.WriteString(str)
+		return false
+	default:
+		str := fmt.Sprintf("%+v", v)
+		if len(str) == 0 {
+			return true
+		}
+		sb.WriteString(str)
+		return false
 	}
 }
 
