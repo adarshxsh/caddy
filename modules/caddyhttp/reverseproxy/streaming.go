@@ -191,6 +191,9 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	// We need to make sure the client connection messages (i.e. to upstream)
 	// are masked, so we need to know whether the connection is considered the
 	// server or the client side of the proxy.
+	conn = &lockedWriteCloser{ReadWriteCloser: conn}
+	backConn = &lockedWriteCloser{ReadWriteCloser: backConn}
+
 	gracefulClose := func(conn io.ReadWriteCloser, isClient bool) func() error {
 		if isWebsocket(req) {
 			return func() error {
@@ -565,6 +568,20 @@ func newMaskKey() [4]byte {
 func isWebsocket(r *http.Request) bool {
 	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+// lockedWriteCloser wraps an io.ReadWriteCloser and synchronizes
+// all Write calls using a mutex. This prevents concurrent write data races
+// between active stream copiers and graceful close handlers.
+type lockedWriteCloser struct {
+	io.ReadWriteCloser
+	mu sync.Mutex
+}
+
+func (lwc *lockedWriteCloser) Write(p []byte) (int, error) {
+	lwc.mu.Lock()
+	defer lwc.mu.Unlock()
+	return lwc.ReadWriteCloser.Write(p)
 }
 
 // openConnection maps an open connection to
