@@ -1,6 +1,8 @@
 package fastcgi
 
 import (
+	"context"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -8,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -354,4 +357,39 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 	for _, p := range payloads {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
 	}
+}
+
+func TestBuildEnvProxyHeader(t *testing.T) {
+	tr := Transport{
+		Root: "/var/www",
+	}
+
+	req, err := http.NewRequest("GET", "http://localhost/index.php", nil)
+	require.NoError(t, err)
+
+	req.Header.Set("Proxy", "http://evil.com:8080")
+	req.Header.Set("X-Custom-Header", "hello")
+
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, caddyhttp.OriginalRequestCtxKey, *req)
+	req = req.WithContext(ctx)
+
+	env, err := tr.buildEnv(req)
+	require.NoError(t, err)
+
+	assert.NotContains(t, env, "HTTP_PROXY", "HTTP_PROXY should not be set from request headers")
+	assert.Equal(t, "hello", env["HTTP_X_CUSTOM_HEADER"])
+
+	// Explicitly configured env vars in Transport should remain functional
+	trExplicit := Transport{
+		Root: "/var/www",
+		EnvVars: map[string]string{
+			"HTTP_PROXY": "http://safe-proxy",
+		},
+	}
+	envExplicit, err := trExplicit.buildEnv(req)
+	require.NoError(t, err)
+
+	assert.Equal(t, "http://safe-proxy", envExplicit["HTTP_PROXY"], "explicitly configured HTTP_PROXY in EnvVars should be preserved")
 }
