@@ -219,6 +219,10 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 		h.KeepAlive.MaxIdleConnsPerHost = 32 // seems about optimal, see #2805
 	}
 
+	if h.DialTimeout < 0 {
+		return nil, fmt.Errorf("dial_timeout cannot be negative: %s", time.Duration(h.DialTimeout))
+	}
+
 	// Set a relatively short default dial timeout.
 	// This is helpful to make load-balancer retries more speedy.
 	if h.DialTimeout == 0 {
