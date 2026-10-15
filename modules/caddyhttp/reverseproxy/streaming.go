@@ -26,6 +26,7 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -37,6 +38,55 @@ import (
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
+
+type deadliner interface {
+	SetDeadline(time.Time) error
+}
+
+type readDeadliner interface {
+	SetReadDeadline(time.Time) error
+}
+
+type writeDeadliner interface {
+	SetWriteDeadline(time.Time) error
+}
+
+func expireDeadlines(c any) {
+	if c == nil {
+		return
+	}
+	aPastTime := time.Unix(0, 1)
+
+	curr := c
+	for curr != nil {
+		var set bool
+		if d, ok := curr.(deadliner); ok {
+			_ = d.SetDeadline(aPastTime)
+			set = true
+		}
+		if d, ok := curr.(readDeadliner); ok {
+			_ = d.SetReadDeadline(aPastTime)
+			set = true
+		}
+		if d, ok := curr.(writeDeadliner); ok {
+			_ = d.SetWriteDeadline(aPastTime)
+			set = true
+		}
+
+		if u, ok := curr.(interface{ Unwrap() net.Conn }); ok {
+			curr = u.Unwrap()
+		} else if u, ok := curr.(interface{ Unwrap() io.ReadWriteCloser }); ok {
+			curr = u.Unwrap()
+		} else if u, ok := curr.(interface{ Unwrap() any }); ok {
+			curr = u.Unwrap()
+		} else {
+			break
+		}
+		if set && curr == nil {
+			break
+		}
+	}
+}
 
 type h2ReadWriteCloser struct {
 	io.ReadCloser
@@ -55,6 +105,47 @@ func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+func (rwc h2ReadWriteCloser) Close() error {
+	if c, ok := rwc.ReadCloser.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+func (rwc h2ReadWriteCloser) SetDeadline(t time.Time) error {
+	errR := rwc.SetReadDeadline(t)
+	errW := rwc.SetWriteDeadline(t)
+	return errors.Join(errR, errW)
+}
+
+func (rwc h2ReadWriteCloser) SetReadDeadline(t time.Time) error {
+	var errs []error
+	if d, ok := rwc.ReadCloser.(readDeadliner); ok {
+		errs = append(errs, d.SetReadDeadline(t))
+	} else if d, ok := rwc.ReadCloser.(deadliner); ok {
+		errs = append(errs, d.SetDeadline(t))
+	}
+	rcErr := http.NewResponseController(rwc.ResponseWriter).SetReadDeadline(t)
+	if rcErr != nil && !errors.Is(rcErr, http.ErrNotSupported) {
+		errs = append(errs, rcErr)
+	}
+	return errors.Join(errs...)
+}
+
+func (rwc h2ReadWriteCloser) SetWriteDeadline(t time.Time) error {
+	var errs []error
+	if d, ok := rwc.ResponseWriter.(writeDeadliner); ok {
+		errs = append(errs, d.SetWriteDeadline(t))
+	} else if d, ok := rwc.ResponseWriter.(deadliner); ok {
+		errs = append(errs, d.SetDeadline(t))
+	}
+	rcErr := http.NewResponseController(rwc.ResponseWriter).SetWriteDeadline(t)
+	if rcErr != nil && !errors.Is(rcErr, http.ErrNotSupported) {
+		errs = append(errs, rcErr)
+	}
+	return errors.Join(errs...)
 }
 
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
@@ -152,12 +243,14 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		case <-req.Context().Done():
 		case <-backConnCloseCh:
 		}
+		expireDeadlines(backConn)
 		backConn.Close()
 	}()
 	defer close(backConnCloseCh)
 
 	start := time.Now()
 	defer func() {
+		expireDeadlines(conn)
 		conn.Close()
 		if c := logger.Check(zapcore.DebugLevel, "connection closed"); c != nil {
 			c.Write(zap.Duration("duration", time.Since(start)))
@@ -236,6 +329,14 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			c.Write(zap.Time("timeout", time))
 		}
 	}
+
+	if isWebsocket(req) {
+		_ = writeCloseControl(conn, false)
+		_ = writeCloseControl(backConn, true)
+	}
+
+	expireDeadlines(conn)
+	expireDeadlines(backConn)
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
@@ -415,6 +516,7 @@ func (h *Handler) closeConnections() error {
 				err = gracefulErr
 			}
 		}
+		expireDeadlines(oc.conn)
 		closeErr := oc.conn.Close()
 		if closeErr != nil && err == nil {
 			err = closeErr
@@ -646,14 +748,28 @@ type switchProtocolCopier struct {
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
-	errc <- err
-	c.wg.Done()
+	if errc != nil {
+		select {
+		case errc <- err:
+		default:
+		}
+	}
+	if c.wg != nil {
+		c.wg.Done()
+	}
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
-	errc <- err
-	c.wg.Done()
+	if errc != nil {
+		select {
+		case errc <- err:
+		default:
+		}
+	}
+	if c.wg != nil {
+		c.wg.Done()
+	}
 }
 
 func (c switchProtocolCopier) buffer() []byte {
