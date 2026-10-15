@@ -99,6 +99,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    stream_buffer_size <size>
 //	    stream_timeout     <duration>
 //	    stream_close_delay <duration>
+//	    stream_keepalive   <duration>
 //	    verbose_logs
 //
 //	    # request manipulation
@@ -701,6 +702,23 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("bad duration value '%s': %v", d.Val(), err)
 				}
 				h.StreamCloseDelay = caddy.Duration(dur)
+			}
+
+		case "stream_keepalive":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val := d.Val()
+			if val == "off" || val == "disabled" {
+				h.StreamKeepAlive = caddy.Duration(-1)
+			} else if fi, err := strconv.Atoi(val); err == nil {
+				h.StreamKeepAlive = caddy.Duration(fi)
+			} else {
+				dur, err := caddy.ParseDuration(val)
+				if err != nil {
+					return d.Errf("bad duration value '%s': %v", val, err)
+				}
+				h.StreamKeepAlive = caddy.Duration(dur)
 			}
 
 		case "trusted_proxies":

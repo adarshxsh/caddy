@@ -186,6 +186,10 @@ type Handler struct {
 	// by the previous config closing. Default: no delay.
 	StreamCloseDelay caddy.Duration `json:"stream_close_delay,omitempty"`
 
+	// Configures post-hijack TCP keepalive probe intervals for upgraded
+	// streaming connections (e.g. WebSockets). Default: 15s.
+	StreamKeepAlive caddy.Duration `json:"stream_keepalive,omitempty"`
+
 	// If configured, rewrites the copy of the upstream request.
 	// Allows changing the request method and URI (path and query).
 	// Since the rewrite is applied to the copy, it does not persist

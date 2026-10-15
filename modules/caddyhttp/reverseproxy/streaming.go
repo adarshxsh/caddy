@@ -26,7 +26,9 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
 	"unsafe"
@@ -140,6 +142,41 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 				c.Write(zap.Error(hijackErr))
 			}
 			return
+		}
+	}
+
+	// configure post-hijack Layer-4 TCP keepalive parameters on client and backend sockets
+	keepAlivePeriod := time.Duration(h.StreamKeepAlive)
+	if h.StreamKeepAlive == 0 {
+		keepAlivePeriod = 15 * time.Second
+	}
+	if keepAlivePeriod > 0 {
+		clientTCP := extractTCPConn(conn)
+		if clientTCP == nil {
+			clientTCP = extractTCPConn(rw)
+		}
+		if clientTCP != nil {
+			if err := setTCPKeepAlive(clientTCP, keepAlivePeriod); err != nil {
+				if c := logger.Check(zapcore.DebugLevel, "failed to set client TCP keepalive"); c != nil {
+					c.Write(zap.Error(err))
+				}
+			} else {
+				if c := logger.Check(zapcore.DebugLevel, "configured client TCP keepalive"); c != nil {
+					c.Write(zap.Duration("interval", keepAlivePeriod))
+				}
+			}
+		}
+
+		if backTCP := extractTCPConn(backConn); backTCP != nil {
+			if err := setTCPKeepAlive(backTCP, keepAlivePeriod); err != nil {
+				if c := logger.Check(zapcore.DebugLevel, "failed to set backend TCP keepalive"); c != nil {
+					c.Write(zap.Error(err))
+				}
+			} else {
+				if c := logger.Check(zapcore.DebugLevel, "configured backend TCP keepalive"); c != nil {
+					c.Write(zap.Duration("interval", keepAlivePeriod))
+				}
+			}
 		}
 	}
 
@@ -679,3 +716,102 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+func setTCPKeepAlive(tcpConn *net.TCPConn, period time.Duration) error {
+	err := tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     period,
+		Interval: period,
+	})
+	if err != nil {
+		if errKA := tcpConn.SetKeepAlive(true); errKA == nil {
+			_ = tcpConn.SetKeepAlivePeriod(period)
+			return nil
+		}
+	}
+	return err
+}
+
+func extractTCPConn(c any) *net.TCPConn {
+	visited := make(map[any]bool)
+	for c != nil {
+		if visited[c] {
+			break
+		}
+		visited[c] = true
+
+		if tcp, ok := c.(*net.TCPConn); ok {
+			return tcp
+		}
+
+		switch v := c.(type) {
+		case interface{ NetConn() net.Conn }:
+			c = v.NetConn()
+		case interface{ NetConn() (net.Conn, error) }:
+			nc, err := v.NetConn()
+			if err != nil {
+				return nil
+			}
+			c = nc
+		case interface{ Conn() net.Conn }:
+			c = v.Conn()
+		case interface{ Unwrap() net.Conn }:
+			c = v.Unwrap()
+		case interface{ Unwrap() io.ReadWriteCloser }:
+			c = v.Unwrap()
+		case interface{ Unwrap() http.ResponseWriter }:
+			c = v.Unwrap()
+		case interface{ UnderlyingConn() net.Conn }:
+			c = v.UnderlyingConn()
+		case interface{ tlsNetConn() net.Conn }:
+			c = v.tlsNetConn()
+		case interface{ ClientConn() net.Conn }:
+			c = v.ClientConn()
+		case interface{ ServerConn() net.Conn }:
+			c = v.ServerConn()
+		case interface{ RawConn() net.Conn }:
+			c = v.RawConn()
+		case h2ReadWriteCloser:
+			if tcp := extractTCPConn(v.ResponseWriter); tcp != nil {
+				return tcp
+			}
+			c = v.ReadCloser
+		default:
+			val := reflect.ValueOf(c)
+			if val.Kind() == reflect.Pointer {
+				if val.IsNil() {
+					return nil
+				}
+				val = val.Elem()
+			}
+			if val.Kind() == reflect.Struct {
+				var found any
+				for i := 0; i < val.NumField(); i++ {
+					field := val.Field(i)
+					if !field.IsValid() {
+						continue
+					}
+					if field.CanInterface() {
+						if tcp, ok := field.Interface().(*net.TCPConn); ok {
+							return tcp
+						}
+						if conn, ok := field.Interface().(net.Conn); ok {
+							found = conn
+							break
+						}
+						if rw, ok := field.Interface().(http.ResponseWriter); ok {
+							found = rw
+							break
+						}
+					}
+				}
+				if found != nil {
+					c = found
+					continue
+				}
+			}
+			return nil
+		}
+	}
+	return nil
+}
