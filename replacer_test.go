@@ -523,6 +523,46 @@ func BenchmarkReplacer(b *testing.B) {
 	}
 }
 
+func TestReplacerZeroAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("foo", "bar")
+
+	inputs := []struct {
+		name string
+		fn   func() string
+	}{
+		{
+			name: "no braces",
+			fn: func() string {
+				return rep.ReplaceAll("simple string", "")
+			},
+		},
+		{
+			name: "unclosed brace",
+			fn: func() string {
+				return rep.ReplaceAll("foo{bar", "")
+			},
+		},
+		{
+			name: "unknown placeholder in ReplaceKnown",
+			fn: func() string {
+				return rep.ReplaceKnown(`{"json": "object"}`, "")
+			},
+		},
+	}
+
+	for _, tc := range inputs {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() {
+				_ = tc.fn()
+			})
+			if allocs > 0 {
+				t.Errorf("expected 0 allocations for %s, got %f", tc.name, allocs)
+			}
+		})
+	}
+}
+
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),

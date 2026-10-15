@@ -1471,12 +1471,6 @@ const (
 	idKey        = "@id"
 )
 
-var bufPool = sync.Pool{
-	New: func() any {
-		return new(bytes.Buffer)
-	},
-}
-
 // keep a reference to admin endpoint singletons while they're active
 var (
 	serverMu                            sync.Mutex
