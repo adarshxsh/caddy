@@ -26,6 +26,7 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -184,6 +185,12 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 	}
 
+	enableTCPKeepAlive(conn)
+	enableTCPKeepAlive(backConn)
+
+	userWriter := &mutexWriter{w: conn}
+	backendWriter := &mutexWriter{w: backConn}
+
 	// Ensure the hijacked client connection, and the new connection established
 	// with the backend, are both closed in the event of a server shutdown. This
 	// is done by registering them. We also try to gracefully close connections
@@ -204,11 +211,36 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
+	done := make(chan struct{})
+	defer close(done)
+
+	if isWebsocket(req) && h.WebSocketKeepAlive > 0 {
+		go func() {
+			ticker := time.NewTicker(time.Duration(h.WebSocketKeepAlive))
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if err := writePingControl(userWriter, false); err != nil {
+						return
+					}
+					if err := writePingControl(backendWriter, true); err != nil {
+						return
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
+
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         wg,
-		bufferSize: h.StreamBufferSize,
+		user:          conn,
+		backend:       backConn,
+		userWriter:    userWriter,
+		backendWriter: backendWriter,
+		wg:            wg,
+		bufferSize:    h.StreamBufferSize,
 	}
 
 	// setup the timeout if requested
@@ -636,22 +668,116 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+func writePingControl(conn io.Writer, isClient bool) error {
+	const pingMessage = 9
+	const finalBit = 1 << 7
+	const maskBit = 1 << 7
+
+	b0 := byte(pingMessage) | finalBit
+	if isClient {
+		b1 := byte(maskBit | 0)
+		key := newMaskKey()
+		buf := [6]byte{b0, b1, key[0], key[1], key[2], key[3]}
+		_, err := conn.Write(buf[:])
+		return err
+	} else {
+		b1 := byte(0)
+		buf := [2]byte{b0, b1}
+		_, err := conn.Write(buf[:])
+		return err
+	}
+}
+
+type keepAliveConfigurer interface {
+	SetKeepAliveConfig(net.KeepAliveConfig) error
+}
+
+type keepAliveSetter interface {
+	SetKeepAlive(bool) error
+}
+
+type netConner interface {
+	NetConn() net.Conn
+}
+
+type unwrapper interface {
+	Unwrap() net.Conn
+}
+
+type conner interface {
+	Conn() net.Conn
+}
+
+func enableTCPKeepAlive(conn any) {
+	if conn == nil {
+		return
+	}
+
+	cfg := net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     15 * time.Second,
+		Interval: 15 * time.Second,
+	}
+
+	curr := conn
+	for depth := 0; curr != nil && depth < 10; depth++ {
+		if ka, ok := curr.(keepAliveConfigurer); ok {
+			_ = ka.SetKeepAliveConfig(cfg)
+			return
+		}
+		if ka, ok := curr.(keepAliveSetter); ok {
+			_ = ka.SetKeepAlive(true)
+		}
+
+		if nc, ok := curr.(netConner); ok {
+			curr = nc.NetConn()
+		} else if uw, ok := curr.(unwrapper); ok {
+			curr = uw.Unwrap()
+		} else if cn, ok := curr.(conner); ok {
+			curr = cn.Conn()
+		} else {
+			break
+		}
+	}
+}
+
+type mutexWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (mw *mutexWriter) Write(p []byte) (int, error) {
+	mw.mu.Lock()
+	defer mw.mu.Unlock()
+	return mw.w.Write(p)
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
 	user, backend io.ReadWriteCloser
+	userWriter    io.Writer
+	backendWriter io.Writer
 	wg            *sync.WaitGroup
 	bufferSize    int
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	dst := c.userWriter
+	if dst == nil {
+		dst = c.user
+	}
+	_, err := io.CopyBuffer(dst, c.backend, c.buffer())
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	dst := c.backendWriter
+	if dst == nil {
+		dst = c.backend
+	}
+	_, err := io.CopyBuffer(dst, c.user, c.buffer())
 	errc <- err
 	c.wg.Done()
 }
