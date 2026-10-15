@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +81,56 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestMaxLatencyWriterStopFlushesPending(t *testing.T) {
+	var flushed bool
+	mlw := &maxLatencyWriter{
+		dst: bytes.NewBuffer(nil),
+		flush: func() error {
+			flushed = true
+			return nil
+		},
+		latency: 10 * time.Minute,
+		logger:  caddy.Log(),
+	}
+
+	mlw.flushPending = true
+	mlw.stop()
+
+	if !flushed {
+		t.Error("expected stop() to flush pending data, but it did not")
+	}
+	if mlw.flushPending {
+		t.Error("expected flushPending to be false after stop()")
+	}
+}
+
+type flushCountingRecorder struct {
+	*httptest.ResponseRecorder
+	flushCount int
+}
+
+func (f *flushCountingRecorder) Flush() {
+	f.flushCount++
+	f.ResponseRecorder.Flush()
+}
+
+func TestCopyResponseWithFlushIntervalFlushesTrailingData(t *testing.T) {
+	h := Handler{}
+	rec := &flushCountingRecorder{ResponseRecorder: httptest.NewRecorder()}
+	src := strings.NewReader("hello trailing world")
+
+	// Use long flush interval so timer won't fire during test
+	err := h.copyResponse(rec, src, 10*time.Minute, caddy.Log())
+	if err != nil {
+		t.Fatalf("copyResponse error: %v", err)
+	}
+
+	if rec.Body.String() != "hello trailing world" {
+		t.Errorf("got %q, want %q", rec.Body.String(), "hello trailing world")
+	}
+
+	if rec.flushCount == 0 {
+		t.Error("expected Flush() to be called upon copyResponse completion, but flushCount was 0")
+	}
+}
