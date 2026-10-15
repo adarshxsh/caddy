@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	weakrand "math/rand/v2"
 	"net"
 	"net/http"
@@ -35,7 +36,6 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
 
 	"github.com/caddyserver/caddy/v2"
@@ -352,17 +352,6 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			}
 		}
 
-		// if read/write timeouts are configured and this is a TCP connection,
-		// enforce the timeouts by wrapping the connection with our own type
-		if tcpConn, ok := conn.(*net.TCPConn); ok && (h.ReadTimeout > 0 || h.WriteTimeout > 0) {
-			conn = &tcpRWTimeoutConn{
-				TCPConn:      tcpConn,
-				readTimeout:  time.Duration(h.ReadTimeout),
-				writeTimeout: time.Duration(h.WriteTimeout),
-				logger:       caddyCtx.Logger(),
-			}
-		}
-
 		return conn, nil
 	}
 
@@ -637,12 +626,51 @@ func (h *HTTPTransport) RequestHeaderOps() *headers.HeaderOps {
 func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	h.SetScheme(req)
 
-	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
-	if h.h3Transport != nil {
-		return h.h3Transport.RoundTrip(req)
+	if h.WriteTimeout > 0 && req.Body != nil && req.Body != http.NoBody {
+		req.Body = &requestBodyWrapper{
+			ReadCloser: req.Body,
+			timeout:    time.Duration(h.WriteTimeout),
+			ctx:        req.Context(),
+		}
+		if req.GetBody != nil {
+			origGetBody := req.GetBody
+			req.GetBody = func() (io.ReadCloser, error) {
+				body, err := origGetBody()
+				if err != nil || body == nil || body == http.NoBody {
+					return body, err
+				}
+				return &requestBodyWrapper{
+					ReadCloser: body,
+					timeout:    time.Duration(h.WriteTimeout),
+					ctx:        req.Context(),
+				}, nil
+			}
+		}
 	}
 
-	return h.Transport.RoundTrip(req)
+	var resp *http.Response
+	var err error
+
+	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
+	if h.h3Transport != nil {
+		resp, err = h.h3Transport.RoundTrip(req)
+	} else {
+		resp, err = h.Transport.RoundTrip(req)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if h.ReadTimeout > 0 && resp != nil && resp.Body != nil {
+		resp.Body = &responseBodyWrapper{
+			ReadCloser: resp.Body,
+			timeout:    time.Duration(h.ReadTimeout),
+			ctx:        req.Context(),
+		}
+	}
+
+	return resp, nil
 }
 
 // SetScheme ensures that the outbound request req
@@ -921,38 +949,115 @@ type KeepAlive struct {
 	IdleConnTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 }
 
-// tcpRWTimeoutConn enforces read/write timeouts for a TCP connection.
-// If it fails to set deadlines, the error is logged but does not abort
-// the read/write attempt (ignoring the error is consistent with what
-// the standard library does: https://github.com/golang/go/blob/c5da4fb7ac5cb7434b41fc9a1df3bee66c7f1a4d/src/net/http/server.go#L981-L986)
-type tcpRWTimeoutConn struct {
-	*net.TCPConn
-	readTimeout, writeTimeout time.Duration
-	logger                    *zap.Logger
+type streamTimeoutError struct {
+	message string
 }
 
-func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
-	if c.readTimeout > 0 {
-		err := c.TCPConn.SetReadDeadline(time.Now().Add(c.readTimeout))
-		if err != nil {
-			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
-				ce.Write(zap.Error(err))
-			}
-		}
+func (e *streamTimeoutError) Error() string {
+	if e.message != "" {
+		return e.message
 	}
-	return c.TCPConn.Read(b)
+	return "i/o timeout"
 }
 
-func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
-	if c.writeTimeout > 0 {
-		err := c.TCPConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-		if err != nil {
-			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
-				ce.Write(zap.Error(err))
-			}
-		}
+func (e *streamTimeoutError) Timeout() bool {
+	return true
+}
+
+func (e *streamTimeoutError) Temporary() bool {
+	return true
+}
+
+func (e *streamTimeoutError) Is(target error) bool {
+	return target == os.ErrDeadlineExceeded
+}
+
+type requestBodyWrapper struct {
+	io.ReadCloser
+	timeout time.Duration
+	ctx     context.Context
+}
+
+func (w *requestBodyWrapper) Read(p []byte) (int, error) {
+	if w.timeout <= 0 || len(p) == 0 {
+		return w.ReadCloser.Read(p)
 	}
-	return c.TCPConn.Write(b)
+
+	buf := make([]byte, len(p))
+	type readRes struct {
+		n   int
+		err error
+	}
+	ch := make(chan readRes, 1)
+	go func() {
+		n, err := w.ReadCloser.Read(buf)
+		ch <- readRes{n, err}
+	}()
+
+	timer := time.NewTimer(w.timeout)
+	defer timer.Stop()
+
+	select {
+	case res := <-ch:
+		if res.n > 0 {
+			copy(p[:res.n], buf[:res.n])
+		}
+		return res.n, res.err
+	case <-timer.C:
+		_ = w.ReadCloser.Close()
+		return 0, &streamTimeoutError{message: "request body read timeout exceeded"}
+	case <-w.ctx.Done():
+		_ = w.ReadCloser.Close()
+		return 0, w.ctx.Err()
+	}
+}
+
+func (w *requestBodyWrapper) Close() error {
+	return w.ReadCloser.Close()
+}
+
+type responseBodyWrapper struct {
+	io.ReadCloser
+	timeout time.Duration
+	ctx     context.Context
+}
+
+func (w *responseBodyWrapper) Read(p []byte) (int, error) {
+	if w.timeout <= 0 || len(p) == 0 {
+		return w.ReadCloser.Read(p)
+	}
+
+	buf := make([]byte, len(p))
+	type readRes struct {
+		n   int
+		err error
+	}
+	ch := make(chan readRes, 1)
+	go func() {
+		n, err := w.ReadCloser.Read(buf)
+		ch <- readRes{n, err}
+	}()
+
+	timer := time.NewTimer(w.timeout)
+	defer timer.Stop()
+
+	select {
+	case res := <-ch:
+		if res.n > 0 {
+			copy(p[:res.n], buf[:res.n])
+		}
+		return res.n, res.err
+	case <-timer.C:
+		_ = w.ReadCloser.Close()
+		return 0, &streamTimeoutError{message: "response body read timeout exceeded"}
+	case <-w.ctx.Done():
+		_ = w.ReadCloser.Close()
+		return 0, w.ctx.Err()
+	}
+}
+
+func (w *responseBodyWrapper) Close() error {
+	return w.ReadCloser.Close()
 }
 
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
