@@ -35,6 +35,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http/httpguts"
@@ -1271,6 +1273,14 @@ func (h *Handler) finalizeResponse(
 		}
 	}
 	if err != nil {
+		if code, ok := extractQUICErrorCode(err); ok {
+			if streamer := unwrapHTTPStreamer(rw); streamer != nil {
+				if stream := streamer.HTTPStream(); stream != nil {
+					stream.CancelWrite(code)
+					stream.CancelRead(code)
+				}
+			}
+		}
 		// we're streaming the response and we've already written headers, so
 		// there's nothing an error handler can do to recover at this point;
 		// we'll just log the error and abort the stream here and panic just as
@@ -1874,3 +1884,42 @@ var (
 	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 )
+
+func extractQUICErrorCode(err error) (quic.StreamErrorCode, bool) {
+	if err == nil {
+		return 0, false
+	}
+	var (
+		se  *quic.StreamError
+		h3e *http3.Error
+		ae  *quic.ApplicationError
+	)
+	if errors.As(err, &se) {
+		return se.ErrorCode, true
+	}
+	if errors.As(err, &h3e) {
+		return quic.StreamErrorCode(h3e.ErrorCode), true
+	}
+	if errors.As(err, &ae) {
+		return quic.StreamErrorCode(ae.ErrorCode), true
+	}
+	return 0, false
+}
+
+func unwrapHTTPStreamer(rw http.ResponseWriter) http3.HTTPStreamer {
+	for cur := rw; cur != nil; {
+		if streamer, ok := cur.(http3.HTTPStreamer); ok {
+			return streamer
+		}
+		u, ok := cur.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		next := u.Unwrap()
+		if next == cur {
+			break
+		}
+		cur = next
+	}
+	return nil
+}
