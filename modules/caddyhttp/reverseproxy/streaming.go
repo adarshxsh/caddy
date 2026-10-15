@@ -28,6 +28,7 @@ import (
 	"mime"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -184,6 +185,12 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 	}
 
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+
+	conn = activityRWC{ReadWriteCloser: conn, lastActivity: &lastActivity}
+	backConn = activityRWC{ReadWriteCloser: backConn, lastActivity: &lastActivity}
+
 	// Ensure the hijacked client connection, and the new connection established
 	// with the backend, are both closed in the event of a server shutdown. This
 	// is done by registering them. We also try to gracefully close connections
@@ -211,14 +218,6 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		bufferSize: h.StreamBufferSize,
 	}
 
-	// setup the timeout if requested
-	var timeoutc <-chan time.Time
-	if h.StreamTimeout > 0 {
-		timer := time.NewTimer(time.Duration(h.StreamTimeout))
-		defer timer.Stop()
-		timeoutc = timer.C
-	}
-
 	// when a stream timeout is encountered, no error will be read from errc
 	// a buffer size of 2 will allow both the read and write goroutines to send the error and exit
 	// see: https://github.com/caddyserver/caddy/issues/7418
@@ -226,16 +225,62 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
+
+	if h.StreamTimeout > 0 {
+		streamTimeout := time.Duration(h.StreamTimeout)
+		timer := time.NewTimer(streamTimeout)
+		defer timer.Stop()
+
+		for {
+			select {
+			case err := <-errc:
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				return
+			case t := <-timer.C:
+				last := time.Unix(0, lastActivity.Load())
+				elapsed := time.Since(last)
+				remaining := streamTimeout - elapsed
+				if remaining > 0 {
+					timer.Reset(remaining)
+				} else {
+					if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+						c.Write(zap.Time("timeout", t))
+					}
+					return
+				}
+			}
+		}
+	} else {
+		err := <-errc
 		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
 			c.Write(zap.Error(err))
 		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
-		}
 	}
+}
+
+// activityRWC wraps an io.ReadWriteCloser and updates an atomic timestamp
+// on any Read or Write operation that transfers data.
+type activityRWC struct {
+	io.ReadWriteCloser
+	lastActivity *atomic.Int64
+}
+
+func (a activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 {
+		a.lastActivity.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (a activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 {
+		a.lastActivity.Store(time.Now().UnixNano())
+	}
+	return n, err
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
