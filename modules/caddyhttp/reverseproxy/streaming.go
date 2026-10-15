@@ -26,7 +26,9 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
 	"unsafe"
@@ -203,6 +205,8 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	deleteBackConn := h.registerConnection(backConn, gracefulClose(backConn, true))
 	defer deleteFrontConn()
 	defer deleteBackConn()
+
+	disableConnectionTimeouts(res.Body)
 
 	spc := switchProtocolCopier{
 		user:       conn,
@@ -679,3 +683,88 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+func disableConnectionTimeouts(conn any) {
+	if conn == nil {
+		return
+	}
+	visited := make(map[uintptr]bool)
+	queue := []any{conn}
+
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		if curr == nil {
+			continue
+		}
+
+		val := reflect.ValueOf(curr)
+		if val.Kind() == reflect.Ptr {
+			if val.IsNil() {
+				continue
+			}
+			ptr := val.Pointer()
+			if visited[ptr] {
+				continue
+			}
+			visited[ptr] = true
+		}
+
+		if dt, ok := curr.(interface{ DisableTimeouts() }); ok {
+			dt.DisableTimeouts()
+		}
+
+		// Try standard interface unwrappers first
+		var nexts []any
+		switch v := curr.(type) {
+		case interface{ NetConn() net.Conn }:
+			if nc := v.NetConn(); nc != nil {
+				nexts = append(nexts, nc)
+			}
+		case interface{ Unwrap() net.Conn }:
+			if un := v.Unwrap(); un != nil {
+				nexts = append(nexts, un)
+			}
+		case interface{ Unwrap() io.ReadWriteCloser }:
+			if un := v.Unwrap(); un != nil {
+				nexts = append(nexts, un)
+			}
+		case interface{ Unwrap() any }:
+			if un := v.Unwrap(); un != nil {
+				nexts = append(nexts, un)
+			}
+		}
+
+		if len(nexts) > 0 {
+			queue = append(queue, nexts...)
+			continue
+		}
+
+		// Inspect struct fields via reflection
+		for val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				break
+			}
+			val = val.Elem()
+		}
+		if val.Kind() == reflect.Struct {
+			for i := 0; i < val.NumField(); i++ {
+				field := val.Field(i)
+				if !field.IsValid() {
+					continue
+				}
+				var item any
+				if field.CanInterface() {
+					item = field.Interface()
+				} else if field.CanAddr() {
+					item = reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Interface()
+				}
+				if item != nil {
+					queue = append(queue, item)
+				}
+			}
+		}
+	}
+}
+

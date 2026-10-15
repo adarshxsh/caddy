@@ -955,6 +955,25 @@ func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
 	return c.TCPConn.Write(b)
 }
 
+func (c *tcpRWTimeoutConn) DisableTimeouts() {
+	c.readTimeout = 0
+	c.writeTimeout = 0
+	if err := c.TCPConn.SetReadDeadline(time.Time{}); err != nil {
+		if c.logger != nil {
+			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to clear read deadline"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+	}
+	if err := c.TCPConn.SetWriteDeadline(time.Time{}); err != nil {
+		if c.logger != nil {
+			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to clear write deadline"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+	}
+}
+
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
 func decodeBase64DERCert(certStr string) (*x509.Certificate, error) {
 	// decode base64
