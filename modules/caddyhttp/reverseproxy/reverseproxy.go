@@ -1249,8 +1249,7 @@ func (h *Handler) finalizeResponse(
 
 	// The "Trailer" header isn't included in the Transport's response,
 	// at least for *http.Transport. Build it up from Trailer.
-	announcedTrailers := len(res.Trailer)
-	if announcedTrailers > 0 {
+	if len(res.Trailer) > 0 {
 		trailerKeys := make([]string, 0, len(res.Trailer))
 		for k := range res.Trailer {
 			trailerKeys = append(trailerKeys, k)
@@ -1294,11 +1293,6 @@ func (h *Handler) finalizeResponse(
 	// total duration spent proxying, including writing response body
 	repl.Set("http.reverse_proxy.upstream.duration", time.Since(start))
 	repl.Set("http.reverse_proxy.upstream.duration_ms", time.Since(start).Seconds()*1e3)
-
-	if len(res.Trailer) == announcedTrailers {
-		copyHeader(rw.Header(), res.Trailer)
-		return nil
-	}
 
 	for k, vv := range res.Trailer {
 		k = http.TrailerPrefix + k
