@@ -26,6 +26,7 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -84,6 +85,8 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		logger.Error("internal error: 101 switching protocols response with non-writable body")
 		return
 	}
+
+	deactivateConnectionTimeouts(backConn)
 
 	// write header first, response headers should not be counted in size
 	// like the rest of handler chain.
@@ -679,3 +682,29 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+// deactivateConnectionTimeouts unwraps conn to find any underlying connections
+// (such as tcpRWTimeoutConn) and deactivates per-operation read/write timeouts.
+func deactivateConnectionTimeouts(conn any) {
+	curr := conn
+	for i := 0; curr != nil && i < 10; i++ {
+		if d, ok := curr.(interface{ DisableTimeouts() error }); ok {
+			_ = d.DisableTimeouts()
+		} else if d, ok := curr.(interface{ DisableTimeouts() }); ok {
+			d.DisableTimeouts()
+		}
+
+		switch u := curr.(type) {
+		case interface{ NetConn() net.Conn }:
+			curr = u.NetConn()
+		case interface{ Unwrap() net.Conn }:
+			curr = u.Unwrap()
+		case interface{ Unwrap() io.ReadWriteCloser }:
+			curr = u.Unwrap()
+		case interface{ Unwrap() any }:
+			curr = u.Unwrap()
+		default:
+			curr = nil
+		}
+	}
+}

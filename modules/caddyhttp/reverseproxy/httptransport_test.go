@@ -8,6 +8,9 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -278,4 +281,65 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTCPRWTimeoutConn_DisableTimeouts(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srvConn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer srvConn.Close()
+		// Wait longer than the initial timeout before writing data
+		time.Sleep(100 * time.Millisecond)
+		_, _ = srvConn.Write([]byte("hello"))
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	tcpConn, ok := clientConn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("expected *net.TCPConn, got %T", clientConn)
+	}
+
+	tc := &tcpRWTimeoutConn{
+		TCPConn: tcpConn,
+		logger:  zap.NewNop(),
+	}
+	tc.readTimeout.Store(int64(30 * time.Millisecond))
+	tc.writeTimeout.Store(int64(30 * time.Millisecond))
+
+	// Disable timeouts before the read happens
+	err = tc.DisableTimeouts()
+	if err != nil {
+		t.Fatalf("DisableTimeouts failed: %v", err)
+	}
+
+	if tc.readTimeout.Load() != 0 || tc.writeTimeout.Load() != 0 {
+		t.Fatalf("expected timeouts to be 0, got read=%v write=%v", tc.readTimeout.Load(), tc.writeTimeout.Load())
+	}
+
+	// Read should succeed because deadline was cleared and readTimeout is 0
+	buf := make([]byte, 10)
+	n, err := tc.Read(buf)
+	if err != nil {
+		t.Fatalf("Read failed after DisableTimeouts: %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("got %q, want %q", string(buf[:n]), "hello")
+	}
+
+	<-done
 }
