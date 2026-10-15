@@ -296,3 +296,51 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLazyUUIDReplacer(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	repl := caddy.NewReplacer()
+	req = PrepareRequest(req, repl, nil, nil)
+
+	// Verify "uuid" context var is initially nil before replacement
+	if uuidVal := GetVar(req.Context(), "uuid"); uuidVal != nil {
+		t.Fatalf("expected uuid var to be nil initially, got %v", uuidVal)
+	}
+
+	// First evaluation of http.request.uuid
+	val1, ok1 := repl.GetString("http.request.uuid")
+	if !ok1 || val1 == "" {
+		t.Fatalf("expected valid uuid string, got %q (ok=%t)", val1, ok1)
+	}
+
+	// Verify "uuid" context var is now set
+	uuidVal := GetVar(req.Context(), "uuid")
+	if uuidVal == nil {
+		t.Fatalf("expected uuid var to be set in context after evaluation")
+	}
+
+	// Second evaluation of http.request.uuid must return identical cached string
+	val2, ok2 := repl.GetString("http.request.uuid")
+	if !ok2 || val2 != val1 {
+		t.Fatalf("expected cached uuid %q, got %q (ok=%t)", val1, val2, ok2)
+	}
+
+	// Check access log extra field
+	extra, ok := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields)
+	if !ok || extra == nil {
+		t.Fatalf("expected ExtraLogFields in context")
+	}
+}
+
+func BenchmarkAddHTTPVarsToReplacer(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, w)
+	}
+}
+

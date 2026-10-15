@@ -413,7 +413,7 @@ func TestReplacerNew(t *testing.T) {
 			value:    "envtest",
 		},
 	} {
-		if val, ok := repl.providers[0].replace(tc.variable); ok {
+		if val, ok := repl.providers[0].Replace(tc.variable); ok {
 			if val != tc.value {
 				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
 			}
@@ -440,7 +440,7 @@ func TestReplacerNew(t *testing.T) {
 			value:    "foo" + getEOL(),
 		},
 	} {
-		if val, ok := repl.providers[1].replace(tc.variable); ok {
+		if val, ok := repl.providers[1].Replace(tc.variable); ok {
 			if val != tc.value {
 				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
 			}
