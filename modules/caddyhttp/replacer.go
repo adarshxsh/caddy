@@ -420,7 +420,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 		return nil, false
 	}
 
-	field := strings.ToLower(key[len(reqTLSReplPrefix):])
+	field := toLowerASCII(key[len(reqTLSReplPrefix):])
 
 	if strings.HasPrefix(field, "client.") {
 		cert := getTLSPeerCert(req.TLS)
@@ -433,8 +433,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 			// the client presented a cert. We also do not return true here
 			// because we probably should remain accurate about whether a
 			// placeholder is, in fact, known or not.
-			// (This allocation may be slightly inefficient.)
-			cert = new(x509.Certificate)
+			cert = emptyCert
 		}
 
 		// subject alternate names (SANs)
@@ -585,6 +584,32 @@ func (rid *requestID) String() string {
 	}
 	return rid.value
 }
+
+// toLowerASCII returns a lowercased copy of s for ASCII characters.
+// It avoids heap allocation if s contains no ASCII uppercase letters.
+func toLowerASCII(s string) string {
+	hasUpper := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			hasUpper = true
+			break
+		}
+	}
+	if !hasUpper {
+		return s
+	}
+	b := []byte(s)
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+var emptyCert = new(x509.Certificate)
 
 const (
 	reqCookieReplPrefix      = "http.request.cookie."

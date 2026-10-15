@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -294,5 +295,86 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestToLowerASCII(t *testing.T) {
+	for _, tc := range []struct {
+		input    string
+		expected string
+	}{
+		{"version", "version"},
+		{"client.subject", "client.subject"},
+		{"CLIENT.SUBJECT", "client.subject"},
+		{"Client.Subject", "client.subject"},
+		{"client.san.dns_names.0", "client.san.dns_names.0"},
+		{"", ""},
+	} {
+		actual := toLowerASCII(tc.input)
+		if actual != tc.expected {
+			t.Errorf("toLowerASCII(%q) = %q, want %q", tc.input, actual, tc.expected)
+		}
+	}
+}
+
+func TestReqTLSReplacement_NoClientCert(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		ServerName:  "example.com",
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+	}
+
+	for _, tc := range []struct {
+		key      string
+		expected any
+		found    bool
+	}{
+		{"http.request.tls.version", "tls1.3", true},
+		{"http.request.tls.server_name", "example.com", true},
+		{"http.request.tls.client.subject", emptyCert.Subject, true},
+		{"http.request.tls.CLIENT.SUBJECT", emptyCert.Subject, true},
+		{"http.request.tls.client.san.dns_names.0", nil, true},
+	} {
+		val, ok := getReqTLSReplacement(req, tc.key)
+		if ok != tc.found {
+			t.Errorf("key=%s: expected found=%t, got %t", tc.key, tc.found, ok)
+		}
+		if !reflect.DeepEqual(val, tc.expected) {
+			t.Errorf("key=%s: expected val=%v, got %v", tc.key, tc.expected, val)
+		}
+	}
+}
+
+func BenchmarkToLowerASCII(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = toLowerASCII("version")
+	}
+}
+
+func BenchmarkReqTLSReplacement(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		ServerName:  "example.com",
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+	}
+
+	keys := []string{
+		"http.request.tls.version",
+		"http.request.tls.server_name",
+		"http.request.tls.client.subject",
+		"http.request.tls.client.san.dns_names.0",
+	}
+
+	for _, key := range keys {
+		b.Run(key, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _ = getReqTLSReplacement(req, key)
+			}
+		})
 	}
 }
