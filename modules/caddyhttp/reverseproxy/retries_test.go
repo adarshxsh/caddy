@@ -3,6 +3,7 @@ package reverseproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -783,5 +784,150 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	expectedBody := "hello world"
 	if rec.Body.String() != expectedBody {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
+	}
+}
+
+func TestDialErrorUnwrap(t *testing.T) {
+	innerErr := errors.New("connection refused")
+	dialErr := NewDialError(innerErr)
+
+	if !errors.Is(dialErr, innerErr) {
+		t.Errorf("errors.Is failed to find inner error in DialError")
+	}
+
+	var targetDialErr DialError
+	wrapped := fmt.Errorf("outer error: %w", dialErr)
+	if !errors.As(wrapped, &targetDialErr) {
+		t.Errorf("errors.As failed to extract DialError from wrapped error")
+	}
+
+	if unwrapped := errors.Unwrap(dialErr); unwrapped != innerErr {
+		t.Errorf("Unwrap() = %v, want %v", unwrapped, innerErr)
+	}
+}
+
+type mockTimeoutErr struct{}
+
+func (mockTimeoutErr) Error() string   { return "dial tcp timeout" }
+func (mockTimeoutErr) Timeout() bool   { return true }
+func (mockTimeoutErr) Temporary() bool { return true }
+
+func TestStatusErrorGatewayTimeout(t *testing.T) {
+	timeoutErr := mockTimeoutErr{}
+	dialErr := NewDialError(timeoutErr)
+	wrappedErr := fmt.Errorf("transport dial failure: %w", dialErr)
+
+	err := statusError(wrappedErr)
+	var handlerErr caddyhttp.HandlerError
+	if !errors.As(err, &handlerErr) {
+		t.Fatalf("statusError did not return a HandlerError")
+	}
+
+	if handlerErr.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("StatusCode = %d, want %d (504)", handlerErr.StatusCode, http.StatusGatewayTimeout)
+	}
+}
+
+type mockFastCGITransport struct {
+	attempts int
+}
+
+func (m *mockFastCGITransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	m.attempts++
+	if m.attempts == 1 {
+		return nil, NewDialError(errors.New("dialing backend: connection refused"))
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("fastcgi ok")),
+	}
+	return resp, nil
+}
+
+func TestFastCGIDialErrorRetry(t *testing.T) {
+	tr := &mockFastCGITransport{}
+	handler := &Handler{
+		logger:    zap.NewNop(),
+		Transport: tr,
+		Upstreams: []*Upstream{
+			{Host: new(Host), Dial: "127.0.0.1:9000"},
+			{Host: new(Host), Dial: "127.0.0.1:9001"},
+		},
+		LoadBalancing: &LoadBalancing{
+			Retries:         1,
+			SelectionPolicy: &RoundRobinSelection{},
+		},
+	}
+
+	bodyReader := newCloseOnCloseReader("post payload")
+	req := httptest.NewRequest("POST", "http://localhost/", bodyReader)
+	req.Body = bodyReader
+	req = prepareTestRequest(req)
+	rec := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("ServeHTTP error: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if tr.attempts != 2 {
+		t.Errorf("attempts = %d, want 2", tr.attempts)
+	}
+}
+
+type mockTLSDialErrorTransport struct {
+	attempts int
+}
+
+func (m *mockTLSDialErrorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	m.attempts++
+	if m.attempts == 1 {
+		return nil, NewDialError(errors.New("TLS handshake timeout"))
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("tls ok")),
+	}
+	return resp, nil
+}
+
+func TestHTTPTransportTLSHandshakeDialErrorRetry(t *testing.T) {
+	tr := &mockTLSDialErrorTransport{}
+	handler := &Handler{
+		logger:    zap.NewNop(),
+		Transport: tr,
+		Upstreams: []*Upstream{
+			{Host: new(Host), Dial: "127.0.0.1:8443"},
+			{Host: new(Host), Dial: "127.0.0.1:8444"},
+		},
+		LoadBalancing: &LoadBalancing{
+			Retries:         1,
+			SelectionPolicy: &RoundRobinSelection{},
+		},
+	}
+
+	bodyReader := newCloseOnCloseReader("post payload tls")
+	req := httptest.NewRequest("POST", "https://localhost/", bodyReader)
+	req.Body = bodyReader
+	req = prepareTestRequest(req)
+	rec := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("ServeHTTP error: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if tr.attempts != 2 {
+		t.Errorf("attempts = %d, want 2", tr.attempts)
 	}
 }
