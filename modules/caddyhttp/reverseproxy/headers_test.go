@@ -2,8 +2,12 @@ package reverseproxy
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"golang.org/x/net/http/httpguts"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -123,5 +127,138 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestDeleteHeader(t *testing.T) {
+	h := http.Header{
+		"Connection":        []string{"close"},
+		"connection":        []string{"keep-alive"},
+		"CONNECTION":        []string{"upgrade"},
+		"Transfer-Encoding": []string{"chunked"},
+		"keep-alive":        []string{"timeout=5"},
+	}
+
+	deleteHeader(h, "Connection")
+
+	for k := range h {
+		if strings.EqualFold(k, "Connection") {
+			t.Errorf("expected header %q to be deleted, but found key %q", "Connection", k)
+		}
+	}
+}
+
+func TestGetHeaderValues(t *testing.T) {
+	h := http.Header{
+		"Connection": []string{"close"},
+		"connection": []string{"keep-alive"},
+		"CONNECTION": []string{"upgrade"},
+		"Other":      []string{"val"},
+	}
+
+	vals := getHeaderValues(h, "Connection")
+	if len(vals) != 3 {
+		t.Fatalf("expected 3 values, got %d: %v", len(vals), vals)
+	}
+
+	expected := map[string]bool{"close": true, "keep-alive": true, "upgrade": true}
+	for _, v := range vals {
+		if !expected[v] {
+			t.Errorf("unexpected value %q in getHeaderValues result", v)
+		}
+	}
+}
+
+func TestRemoveConnectionHeadersCaseInsensitive(t *testing.T) {
+	h := http.Header{
+		"connection": []string{"X-Foo, X-Bar"},
+		"CONNECTION": []string{"X-Baz"},
+		"x-foo":      []string{"1"},
+		"X-BAR":      []string{"2"},
+		"X-Baz":      []string{"3"},
+		"keep-alive": []string{"timeout=5"},
+	}
+
+	removeConnectionHeaders(h)
+
+	for k := range h {
+		if strings.EqualFold(k, "Connection") || strings.EqualFold(k, "X-Foo") || strings.EqualFold(k, "X-Bar") || strings.EqualFold(k, "X-Baz") {
+			t.Errorf("expected header key %q to be removed, but key %q remains", k, k)
+		}
+	}
+
+	vals := getHeaderValues(h, "keep-alive")
+	if len(vals) == 0 || vals[0] != "timeout=5" {
+		t.Errorf("expected keep-alive header to remain intact, got %v", vals)
+	}
+}
+
+func TestUpgradeTypeCaseInsensitive(t *testing.T) {
+	h := http.Header{
+		"connection": []string{"upgrade"},
+		"upgrade":    []string{"websocket"},
+	}
+
+	if got := upgradeType(h); got != "websocket" {
+		t.Errorf("upgradeType = %q, want %q", got, "websocket")
+	}
+}
+
+func TestHopByHopHeaderPurgingCaseInsensitive(t *testing.T) {
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	req.Header["transfer-encoding"] = []string{"chunked"}
+	req.Header["KEEP-ALIVE"] = []string{"timeout=5"}
+	req.Header["proxy-authorization"] = []string{"basic xxx"}
+	req.Header["te"] = []string{"trailers"}
+
+	// Simulate request preparation hop-by-hop purging logic
+	reqUpgradeType := upgradeType(req.Header)
+	removeConnectionHeaders(req.Header)
+
+	for _, h := range hopHeaders {
+		if h == "Te" && httpguts.HeaderValuesContainsToken(getHeaderValues(req.Header, "Te"), "trailers") {
+			deleteHeader(req.Header, "Te")
+			req.Header.Set("Te", "trailers")
+			continue
+		}
+		deleteHeader(req.Header, h)
+	}
+
+	if reqUpgradeType != "" {
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", reqUpgradeType)
+	}
+
+	if got := req.Header.Get("Te"); got != "trailers" {
+		t.Errorf("expected Te header to be 'trailers', got %q", got)
+	}
+
+	for k := range req.Header {
+		if strings.EqualFold(k, "Transfer-Encoding") || strings.EqualFold(k, "Keep-Alive") || strings.EqualFold(k, "Proxy-Authorization") {
+			t.Errorf("expected hop-by-hop header %q to be purged, found key %q", k, k)
+		}
+	}
+
+	// Test response preparation hop-by-hop purging logic
+	resHeader := http.Header{
+		"transfer-encoding": []string{"chunked"},
+		"KEEP-ALIVE":        []string{"timeout=5"},
+		"connection":        []string{"close"},
+		"X-Custom-Header":   []string{"value"},
+	}
+
+	removeConnectionHeaders(resHeader)
+	for _, h := range hopHeaders {
+		deleteHeader(resHeader, h)
+	}
+
+	for k := range resHeader {
+		if strings.EqualFold(k, "Transfer-Encoding") || strings.EqualFold(k, "Keep-Alive") || strings.EqualFold(k, "Connection") {
+			t.Errorf("expected hop-by-hop response header %q to be purged, found key %q", k, k)
+		}
+	}
+
+	if got := resHeader.Get("X-Custom-Header"); got != "value" {
+		t.Errorf("expected X-Custom-Header to remain, got %q", got)
 	}
 }
