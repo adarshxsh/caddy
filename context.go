@@ -16,6 +16,7 @@ package caddy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -685,4 +686,11 @@ func (ctx *Context) WithValue(key, value any) Context {
 // the caddyevents package, which imports the caddy package).
 type eventEmitter interface {
 	Emit(ctx Context, eventName string, data map[string]any) Event
+}
+
+// SessionTicketRegistrar is an interface for registering and unregistering TLS
+// configurations for session ticket key rotation without importing caddytls.
+type SessionTicketRegistrar interface {
+	Register(cfg *tls.Config)
+	Unregister(cfg *tls.Config)
 }

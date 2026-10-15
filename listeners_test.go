@@ -15,8 +15,11 @@
 package caddy
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/internal"
@@ -708,5 +711,82 @@ func TestSplitUnixSocketPermissionsBits(t *testing.T) {
 		if !tc.expectErr && actualFileMode.Perm().String() != tc.expectFileMode {
 			t.Errorf("Test %d: Expected perms '%s' but got '%s'", i, tc.expectFileMode, actualFileMode.Perm().String())
 		}
+	}
+}
+
+type mockSessionTicketRegistrar struct {
+	registered   map[*tls.Config]bool
+	unregistered map[*tls.Config]bool
+	mu           sync.Mutex
+}
+
+func (m *mockSessionTicketRegistrar) Register(cfg *tls.Config) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.registered == nil {
+		m.registered = make(map[*tls.Config]bool)
+	}
+	m.registered[cfg] = true
+}
+
+func (m *mockSessionTicketRegistrar) Unregister(cfg *tls.Config) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.unregistered == nil {
+		m.unregistered = make(map[*tls.Config]bool)
+	}
+	m.unregistered[cfg] = true
+}
+
+type mockTLSApp struct {
+	*mockSessionTicketRegistrar
+}
+
+func (m *mockTLSApp) Start() error { return nil }
+func (m *mockTLSApp) Stop() error  { return nil }
+
+func TestListenQUICSessionTicketRegistration(t *testing.T) {
+	mockReg := &mockSessionTicketRegistrar{}
+	mockApp := &mockTLSApp{mockSessionTicketRegistrar: mockReg}
+
+	cfg := &Config{
+		apps: map[string]App{
+			"tls": mockApp,
+		},
+	}
+	ctx, cancel := NewContext(Context{Context: context.Background(), cfg: cfg})
+	defer cancel()
+
+	na, err := ParseNetworkAddress("udp/127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ParseNetworkAddress failed: %v", err)
+	}
+
+	tlsCfg := &tls.Config{}
+	ln, err := na.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsCfg, nil, nil)
+	if err != nil {
+		t.Fatalf("ListenQUIC failed: %v", err)
+	}
+
+	mockReg.mu.Lock()
+	if len(mockReg.registered) != 1 {
+		mockReg.mu.Unlock()
+		ln.Close()
+		t.Fatalf("expected 1 registered tls.Config, got %d", len(mockReg.registered))
+	}
+	var registeredCfg *tls.Config
+	for c := range mockReg.registered {
+		registeredCfg = c
+	}
+	mockReg.mu.Unlock()
+
+	// Close the listener twice as per ListenQUIC contract to delete from listenerPool and call Destruct
+	_ = ln.Close()
+	_ = ln.Close()
+
+	mockReg.mu.Lock()
+	defer mockReg.mu.Unlock()
+	if !mockReg.unregistered[registeredCfg] {
+		t.Fatalf("expected registered tls.Config to be unregistered on listener teardown")
 	}
 }

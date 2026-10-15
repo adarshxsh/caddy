@@ -466,6 +466,15 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 			GetConfigForClient:          sqs.getConfigForClient,
 			GetEncryptedClientHelloKeys: sqs.getEncryptedClientHelloKeys,
 		}
+
+		var registrar SessionTicketRegistrar
+		if tlsApp := getTLSApp(ctx); tlsApp != nil {
+			if r, ok := tlsApp.(SessionTicketRegistrar); ok {
+				registrar = r
+				registrar.Register(quicTlsConfig)
+			}
+		}
+
 		// Require clients to verify their source address when we're handling more than 1000 handshakes per second.
 		// TODO: make tunable?
 		limiter := rate.NewLimiter(1000, 1000)
@@ -485,11 +494,21 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 			},
 		)
 		if err != nil {
+			if registrar != nil {
+				registrar.Unregister(quicTlsConfig)
+			}
 			return nil, err
 		}
 		// TODO: figure out when to close the listener and the transport
 		// using the original net.PacketConn to close them properly
-		return &sharedQuicListener{EarlyListener: earlyLn, packetConn: ln, sqs: sqs, key: lnKey}, nil
+		return &sharedQuicListener{
+			EarlyListener: earlyLn,
+			packetConn:    ln,
+			sqs:           sqs,
+			key:           lnKey,
+			quicTlsConfig: quicTlsConfig,
+			registrar:     registrar,
+		}, nil
 	})
 	if err != nil {
 		return nil, err
@@ -588,16 +607,40 @@ func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, co
 	return ctx, wrappedCancel
 }
 
+func getTLSApp(ctx context.Context) any {
+	if caddyCtx, ok := ctx.(Context); ok && caddyCtx.cfg != nil {
+		if app, err := caddyCtx.AppIfConfigured("tls"); err == nil && app != nil {
+			return app
+		}
+	} else if caddyCtx, ok := ctx.(*Context); ok && caddyCtx != nil && caddyCtx.cfg != nil {
+		if app, err := caddyCtx.AppIfConfigured("tls"); err == nil && app != nil {
+			return app
+		}
+	}
+	actCtx := ActiveContext()
+	if actCtx.cfg != nil {
+		if app, err := actCtx.AppIfConfigured("tls"); err == nil && app != nil {
+			return app
+		}
+	}
+	return nil
+}
+
 // sharedQuicListener is like sharedListener, but for quic.EarlyListeners.
 type sharedQuicListener struct {
 	*quic.EarlyListener
-	packetConn net.PacketConn // we have to hold these because quic-go won't close listeners it didn't create
-	sqs        *sharedQUICState
-	key        string
+	packetConn    net.PacketConn // we have to hold these because quic-go won't close listeners it didn't create
+	sqs           *sharedQUICState
+	key           string
+	quicTlsConfig *tls.Config
+	registrar     SessionTicketRegistrar
 }
 
 // Destruct closes the underlying QUIC listener and its associated net.PacketConn.
 func (sql *sharedQuicListener) Destruct() error {
+	if sql.registrar != nil && sql.quicTlsConfig != nil {
+		sql.registrar.Unregister(sql.quicTlsConfig)
+	}
 	// close EarlyListener first to stop any operations being done to the net.PacketConn
 	_ = sql.EarlyListener.Close()
 	// then close the net.PacketConn

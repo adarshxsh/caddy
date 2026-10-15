@@ -325,13 +325,13 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 		cfg.SessionTicketsDisabled = tlsApp.SessionTickets.Disabled
 
 		// session ticket key rotation
-		tlsApp.SessionTickets.register(cfg)
+		tlsApp.SessionTickets.Register(cfg)
 		ctx.OnCancel(func() {
 			// do cleanup when the context is canceled because,
 			// though unlikely, it is possible that a context
 			// needing a TLS server config could exist for less
 			// than the lifetime of the whole app
-			tlsApp.SessionTickets.unregister(cfg)
+			tlsApp.SessionTickets.Unregister(cfg)
 		})
 	}
 
