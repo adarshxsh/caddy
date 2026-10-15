@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -484,6 +485,43 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	// Test zero allocations for non-placeholder strings (strings without placeholders)
+	nonPlaceholderCases := []string{
+		"simple string",
+		"string with no placeholders",
+		"another plain string without braces",
+	}
+
+	for _, input := range nonPlaceholderCases {
+		allocs := testing.AllocsPerRun(100, func() {
+			rep.ReplaceAll(input, "")
+		})
+		if allocs != 0 {
+			t.Errorf("Expected 0 allocs/op for %q, got %f", input, allocs)
+		}
+	}
+
+	// Test bounded allocations for single replacements
+	singleReplacementCases := []string{
+		"str={str}",
+		"int={int}",
+	}
+
+	for _, input := range singleReplacementCases {
+		allocs := testing.AllocsPerRun(100, func() {
+			rep.ReplaceAll(input, "")
+		})
+		if allocs > 1 {
+			t.Errorf("Expected <= 1 allocs/op for %q, got %f", input, allocs)
+		}
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
@@ -514,6 +552,18 @@ func BenchmarkReplacer(b *testing.B) {
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
+		{
+			name:  "multi-placeholder",
+			input: `str1={str} int1={int} str2={str} int2={int}`,
+		},
+		{
+			name:  "missing placeholder",
+			input: `missing1={unknown} missing2={notfound}`,
+		},
+		{
+			name:  "nested escaped placeholder",
+			input: `\{"json": \{"nested": "\{escaped\}"\}\}`,
+		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
 			for b.Loop() {
@@ -521,6 +571,55 @@ func BenchmarkReplacer(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkReplacerParallel(b *testing.B) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	b.Run("read parallel", func(b *testing.B) {
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				rep.ReplaceAll("str={str} int={int}", "")
+			}
+		})
+	})
+
+	b.Run("read write parallel", func(b *testing.B) {
+		var i uint64
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				n := atomic.AddUint64(&i, 1)
+				if n%10 == 0 {
+					rep.Set("dynamic", "value")
+				} else {
+					rep.ReplaceAll("str={str} int={int} dyn={dynamic}", "")
+				}
+			}
+		})
+	})
+}
+
+func BenchmarkReplacerInstantiation(b *testing.B) {
+	b.Run("NewReplacer", func(b *testing.B) {
+		for b.Loop() {
+			_ = NewReplacer()
+		}
+	})
+
+	b.Run("NewEmptyReplacer", func(b *testing.B) {
+		for b.Loop() {
+			_ = NewEmptyReplacer()
+		}
+	})
+
+	rep := NewReplacer()
+	b.Run("WithoutFile", func(b *testing.B) {
+		for b.Loop() {
+			_ = rep.WithoutFile()
+		}
+	})
 }
 
 func testReplacer() Replacer {
