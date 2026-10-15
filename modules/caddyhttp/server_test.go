@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -575,4 +576,90 @@ func TestServer_DetermineTrustedProxy_MatchRightMostUntrustedFirst(t *testing.T)
 
 	assert.True(t, trusted)
 	assert.Equal(t, clientIP, "90.100.110.120")
+}
+
+func TestEarlyDataInfo(t *testing.T) {
+	// Test nil context
+	used, status := GetEarlyDataInfo(nil)
+	assert.False(t, used)
+	assert.Equal(t, "none", status)
+
+	// Test accepted early data
+	ctxAccepted := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataInfo{
+		Used0RTT: true,
+		Status:   "accepted",
+	})
+	used, status = GetEarlyDataInfo(ctxAccepted)
+	assert.True(t, used)
+	assert.Equal(t, "accepted", status)
+	assert.Equal(t, "accepted", GetEarlyDataStatus(ctxAccepted))
+
+	// Test rejected 1-RTT fallback early data
+	ctxFallback := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataInfo{
+		Used0RTT: false,
+		Status:   "rejected_fallback_1rtt",
+	})
+	used, status = GetEarlyDataInfo(ctxFallback)
+	assert.False(t, used)
+	assert.Equal(t, "rejected_fallback_1rtt", status)
+	assert.Equal(t, "rejected_fallback_1rtt", GetEarlyDataStatus(ctxFallback))
+
+	// Test empty status default to none
+	ctxEmpty := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataInfo{})
+	used, status = GetEarlyDataInfo(ctxEmpty)
+	assert.False(t, used)
+	assert.Equal(t, "none", status)
+}
+
+func TestLoggableHTTPRequest_EarlyData(t *testing.T) {
+	// 1. Accepted 0-RTT
+	ctxAccepted := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataInfo{
+		Used0RTT: true,
+		Status:   "accepted",
+	})
+	req1 := httptest.NewRequest(http.MethodGet, "https://example.com/", nil).WithContext(ctxAccepted)
+	req1.TLS = &tls.ConnectionState{
+		Version:           tls.VersionTLS13,
+		HandshakeComplete: true,
+		ServerName:        "example.com",
+	}
+
+	buf1 := bytes.Buffer{}
+	logger1 := testLogger(buf1.Write)
+	logger1.Info("test", zap.Object("request", LoggableHTTPRequest{Request: req1}))
+	assert.Contains(t, buf1.String(), `"used_0rtt":true`)
+	assert.Contains(t, buf1.String(), `"early_data_status":"accepted"`)
+
+	// 2. Rejected 1-RTT Fallback
+	ctxFallback := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataInfo{
+		Used0RTT: false,
+		Status:   "rejected_fallback_1rtt",
+	})
+	req2 := httptest.NewRequest(http.MethodGet, "https://example.com/", nil).WithContext(ctxFallback)
+	req2.TLS = &tls.ConnectionState{
+		Version:           tls.VersionTLS13,
+		DidResume:         true,
+		HandshakeComplete: true,
+		ServerName:        "example.com",
+	}
+
+	buf2 := bytes.Buffer{}
+	logger2 := testLogger(buf2.Write)
+	logger2.Info("test", zap.Object("request", LoggableHTTPRequest{Request: req2}))
+	assert.Contains(t, buf2.String(), `"used_0rtt":false`)
+	assert.Contains(t, buf2.String(), `"early_data_status":"rejected_fallback_1rtt"`)
+
+	// 3. Regular TLS (none)
+	req3 := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req3.TLS = &tls.ConnectionState{
+		Version:           tls.VersionTLS13,
+		HandshakeComplete: true,
+		ServerName:        "example.com",
+	}
+
+	buf3 := bytes.Buffer{}
+	logger3 := testLogger(buf3.Write)
+	logger3.Info("test", zap.Object("request", LoggableHTTPRequest{Request: req3}))
+	assert.Contains(t, buf3.String(), `"used_0rtt":false`)
+	assert.Contains(t, buf3.String(), `"early_data_status":"none"`)
 }
