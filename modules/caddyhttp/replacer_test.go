@@ -22,6 +22,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -294,5 +296,208 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestCanonicalizeMIMEHeaderKeyInPlace(t *testing.T) {
+	testKeys := []string{
+		"user-agent",
+		"content-type",
+		"x-forwarded-for",
+		"accept-encoding",
+		"authorization",
+		"sec-websocket-key",
+		"strict-transport-security",
+		"A-B-C-D-E-F",
+		"x-custom_header-test",
+		"Host",
+		"cookie",
+	}
+
+	for _, rawKey := range testKeys {
+		expected := textproto.CanonicalMIMEHeaderKey(rawKey)
+		buf := make([]byte, len(rawKey))
+		canonicalizeMIMEHeaderKeyInPlace(buf, rawKey)
+		got := string(buf)
+		if got != expected {
+			t.Errorf("canonicalizeMIMEHeaderKeyInPlace(%q): got %q, expected %q", rawKey, got, expected)
+		}
+	}
+}
+
+func TestQueryParamParsing(t *testing.T) {
+	for i, tc := range []struct {
+		rawQuery string
+		paramKey string
+		expect   string
+	}{
+		{rawQuery: "a=1&b=2", paramKey: "a", expect: "1"},
+		{rawQuery: "a=1&b=2", paramKey: "b", expect: "2"},
+		{rawQuery: "a=1&b=2", paramKey: "c", expect: ""},
+		{rawQuery: "a=1&a=2&a=3", paramKey: "a", expect: "1,2,3"},
+		{rawQuery: "a=hello%20world&b=foo+bar", paramKey: "a", expect: "hello world"},
+		{rawQuery: "a=hello%20world&b=foo+bar", paramKey: "b", expect: "foo bar"},
+		{rawQuery: "foo%20bar=baz", paramKey: "foo bar", expect: "baz"},
+		{rawQuery: "a=1;b=2", paramKey: "a", expect: "1"},
+		{rawQuery: "a=1;b=2", paramKey: "b", expect: "2"},
+		{rawQuery: "a=&b=2", paramKey: "a", expect: ""},
+		{rawQuery: "a&b=2", paramKey: "a", expect: ""},
+		{rawQuery: "", paramKey: "a", expect: ""},
+	} {
+		req, _ := http.NewRequest(http.MethodGet, "/test?"+tc.rawQuery, nil)
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		val, ok := repl.GetString("http.request.uri.query." + tc.paramKey)
+		if !ok {
+			t.Errorf("Test %d: expected to recognize placeholder http.request.uri.query.%s", i, tc.paramKey)
+		}
+		if val != tc.expect {
+			t.Errorf("Test %d: expected query param %q to be %q, got %q", i, tc.paramKey, tc.expect, val)
+		}
+	}
+}
+
+func TestHeaderReplacer(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("User-Agent", "Caddy/v2")
+	req.Header.Add("Accept", "text/html")
+	req.Header.Add("Accept", "application/json")
+
+	longHeaderName := "X-Very-Long-Header-Name-That-Exceeds-The-64-Byte-Stack-Buffer-Capacity-Limit-For-Testing"
+	req.Header.Set(longHeaderName, "long-value")
+
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "application/json")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, rec)
+
+	// Canonical case request header
+	if val, ok := repl.GetString("http.request.header.User-Agent"); !ok || val != "Caddy/v2" {
+		t.Errorf("expected User-Agent to be 'Caddy/v2', got %q (ok=%t)", val, ok)
+	}
+
+	// Lowercase request header
+	if val, ok := repl.GetString("http.request.header.user-agent"); !ok || val != "Caddy/v2" {
+		t.Errorf("expected user-agent to be 'Caddy/v2', got %q (ok=%t)", val, ok)
+	}
+
+	// Multi-value request header
+	if val, ok := repl.GetString("http.request.header.Accept"); !ok || val != "text/html,application/json" {
+		t.Errorf("expected Accept to be 'text/html,application/json', got %q (ok=%t)", val, ok)
+	}
+
+	// Long header exceeding stack buffer
+	if val, ok := repl.GetString("http.request.header." + longHeaderName); !ok || val != "long-value" {
+		t.Errorf("expected long header to be 'long-value', got %q (ok=%t)", val, ok)
+	}
+
+	// Lowercase long header
+	if val, ok := repl.GetString("http.request.header." + strings.ToLower(longHeaderName)); !ok || val != "long-value" {
+		t.Errorf("expected lowercase long header to be 'long-value', got %q (ok=%t)", val, ok)
+	}
+
+	// Response header
+	if val, ok := repl.GetString("http.response.header.Content-Type"); !ok || val != "application/json" {
+		t.Errorf("expected response Content-Type to be 'application/json', got %q (ok=%t)", val, ok)
+	}
+
+	// Missing header
+	if val, ok := repl.GetString("http.request.header.X-Non-Existent"); !ok || val != "" {
+		t.Errorf("expected missing header to be '', got %q (ok=%t)", val, ok)
+	}
+}
+
+func BenchmarkQueryParamReplacerSingleValue(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/test?api_key=12345&user=john", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.uri.query.api_key")
+	}
+}
+
+func BenchmarkParseURLQueryParamDirect(b *testing.B) {
+	rawQuery := "api_key=12345&user=john"
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = parseURLQueryParam(rawQuery, "api_key")
+	}
+}
+
+func BenchmarkGetMIMEHeaderValueCanonicalDirect(b *testing.B) {
+	h := make(http.Header)
+	h.Set("User-Agent", "Mozilla/5.0")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = getMIMEHeaderValue(h, "User-Agent")
+	}
+}
+
+func BenchmarkGetMIMEHeaderValueNonCanonicalDirect(b *testing.B) {
+	h := make(http.Header)
+	h.Set("User-Agent", "Mozilla/5.0")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = getMIMEHeaderValue(h, "user-agent")
+	}
+}
+
+func BenchmarkQueryParamReplacerMultiValue(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/test?tag=go&tag=caddy&tag=http", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.uri.query.tag")
+	}
+}
+
+func BenchmarkHeaderReplacerCanonical(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.header.User-Agent")
+	}
+}
+
+func BenchmarkHeaderReplacerNonCanonicalStack(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.header.user-agent")
+	}
+}
+
+func BenchmarkHeaderReplacerFallbackLong(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	longHeaderName := "X-Very-Long-Header-Name-That-Exceeds-The-64-Byte-Stack-Buffer-Capacity-Limit-For-Testing"
+	req.Header.Set(longHeaderName, "value")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.header." + strings.ToLower(longHeaderName))
 	}
 }

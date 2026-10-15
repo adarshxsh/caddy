@@ -63,19 +63,24 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 		if req != nil {
 			// query string parameters
 			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
-				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
+				paramKey := key[len(reqURIQueryReplPrefix):]
+				rawQuery := ""
+				if req.URL != nil {
+					rawQuery = req.URL.RawQuery
+				}
+				val, _ := parseURLQueryParam(rawQuery, paramKey)
 				// always return true, since the query param might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return val, true
 			}
 
 			// request header fields
 			if strings.HasPrefix(key, reqHeaderReplPrefix) {
 				field := key[len(reqHeaderReplPrefix):]
-				vals := req.Header[textproto.CanonicalMIMEHeaderKey(field)]
+				val := getMIMEHeaderValue(req.Header, field)
 				// always return true, since the header field might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return val, true
 			}
 
 			// cookies
@@ -385,10 +390,10 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// response header fields
 			if strings.HasPrefix(key, respHeaderReplPrefix) {
 				field := key[len(respHeaderReplPrefix):]
-				vals := w.Header()[textproto.CanonicalMIMEHeaderKey(field)]
+				val := getMIMEHeaderValue(w.Header(), field)
 				// always return true, since the header field might
 				// be present only in some responses
-				return strings.Join(vals, ","), true
+				return val, true
 			}
 		}
 
@@ -597,3 +602,135 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+func parseURLQueryParam(rawQuery, paramKey string) (string, bool) {
+	if rawQuery == "" {
+		return "", true
+	}
+
+	var firstVal string
+	var vals []string
+	count := 0
+
+	query := rawQuery
+	for query != "" {
+		var pair string
+		i := strings.IndexAny(query, "&;")
+		if i >= 0 {
+			pair = query[:i]
+			query = query[i+1:]
+		} else {
+			pair = query
+			query = ""
+		}
+		if pair == "" {
+			continue
+		}
+
+		k, v, _ := strings.Cut(pair, "=")
+
+		if matchQueryKey(k, paramKey) {
+			unescapedV := v
+			if strings.ContainsAny(v, "%+") {
+				if u, err := url.QueryUnescape(v); err == nil {
+					unescapedV = u
+				}
+			}
+			if count == 0 {
+				firstVal = unescapedV
+				count = 1
+			} else if count == 1 {
+				vals = []string{firstVal, unescapedV}
+				count = 2
+			} else {
+				vals = append(vals, unescapedV)
+				count++
+			}
+		}
+	}
+
+	if count == 0 {
+		return "", true
+	}
+	if count == 1 {
+		return firstVal, true
+	}
+	return strings.Join(vals, ","), true
+}
+
+func matchQueryKey(rawKey, targetKey string) bool {
+	if rawKey == targetKey {
+		return true
+	}
+	if strings.ContainsAny(rawKey, "%+") {
+		if unescapedK, err := url.QueryUnescape(rawKey); err == nil && unescapedK == targetKey {
+			return true
+		}
+	}
+	if strings.ContainsAny(targetKey, "%+") {
+		if unescapedTargetKey, err := url.QueryUnescape(targetKey); err == nil && rawKey == unescapedTargetKey {
+			return true
+		}
+	}
+	return false
+}
+
+func getMIMEHeaderValue(h http.Header, field string) string {
+	if h == nil || field == "" {
+		return ""
+	}
+
+	// Direct fast-path map lookup first
+	if vals, ok := h[field]; ok {
+		if len(vals) == 1 {
+			return vals[0]
+		}
+		if len(vals) > 1 {
+			return strings.Join(vals, ",")
+		}
+		return ""
+	}
+
+	// Stack-buffered canonicalization fallback for standard header names
+	if len(field) <= 64 {
+		var buf [64]byte
+		canonicalizeMIMEHeaderKeyInPlace(buf[:len(field)], field)
+		if vals, ok := h[string(buf[:len(field)])]; ok {
+			if len(vals) == 1 {
+				return vals[0]
+			}
+			if len(vals) > 1 {
+				return strings.Join(vals, ",")
+			}
+			return ""
+		}
+		return ""
+	}
+
+	// Heap fallback for headers exceeding stack buffer capacity
+	canonicalKey := textproto.CanonicalMIMEHeaderKey(field)
+	if vals, ok := h[canonicalKey]; ok {
+		if len(vals) == 1 {
+			return vals[0]
+		}
+		if len(vals) > 1 {
+			return strings.Join(vals, ",")
+		}
+		return ""
+	}
+	return ""
+}
+
+func canonicalizeMIMEHeaderKeyInPlace(dst []byte, s string) {
+	upper := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if upper && 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		} else if !upper && 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		dst[i] = c
+		upper = c == '-'
+	}
+}
