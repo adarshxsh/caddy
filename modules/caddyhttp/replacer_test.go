@@ -296,3 +296,46 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkHTTPReplacer(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+	ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+	req = req.WithContext(ctx)
+	res := httptest.NewRecorder()
+
+	b.Run("Setup", func(b *testing.B) {
+		for b.Loop() {
+			repl := caddy.NewReplacer()
+			addHTTPVarsToReplacer(repl, req, res)
+		}
+	})
+
+	b.Run("Resolution", func(b *testing.B) {
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, res)
+
+		b.Run("Method", func(b *testing.B) {
+			for b.Loop() {
+				_, _ = repl.GetString("http.request.method")
+			}
+		})
+		b.Run("URI", func(b *testing.B) {
+			for b.Loop() {
+				_, _ = repl.GetString("http.request.uri")
+			}
+		})
+		b.Run("Host", func(b *testing.B) {
+			for b.Loop() {
+				_, _ = repl.GetString("http.request.host")
+			}
+		})
+		b.Run("Header", func(b *testing.B) {
+			for b.Loop() {
+				_, _ = repl.GetString("http.request.header.User-Agent")
+			}
+		})
+	})
+}
+

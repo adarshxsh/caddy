@@ -484,43 +484,155 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
-func BenchmarkReplacer(b *testing.B) {
-	type testCase struct {
-		name, input, empty string
-	}
+var globalReplacer *Replacer
 
+func TestReplacerAllocations(t *testing.T) {
 	rep := testReplacer()
 	rep.Set("str", "a string")
-	rep.Set("int", 123.456)
+	emptyRep := NewEmptyReplacer()
 
-	for _, bm := range []testCase{
+	tests := []struct {
+		name         string
+		targetAllocs float64
+		fn           func()
+	}{
 		{
-			name:  "no placeholder",
-			input: `simple string`,
+			name:         "Get",
+			targetAllocs: 0,
+			fn: func() {
+				_, _ = rep.Get("str")
+			},
 		},
 		{
-			name:  "string replacement",
-			input: `str={str}`,
+			name:         "Set",
+			targetAllocs: 0,
+			fn: func() {
+				rep.Set("str", "a string")
+			},
 		},
 		{
-			name:  "int replacement",
-			input: `int={int}`,
+			name:         "ReplaceAll",
+			targetAllocs: 1,
+			fn: func() {
+				_ = rep.ReplaceAll("str={str}", "")
+			},
 		},
 		{
-			name:  "placeholder",
-			input: `{"json": "object"}`,
+			name:         "NewReplacer",
+			targetAllocs: 5,
+			fn: func() {
+				globalReplacer = NewReplacer()
+			},
 		},
 		{
-			name:  "escaped placeholder",
-			input: `\{"json": \{"nested": "{bar}"\}\}`,
+			name:         "WithoutFile",
+			targetAllocs: 2,
+			fn: func() {
+				globalReplacer = emptyRep.WithoutFile()
+			},
 		},
-	} {
-		b.Run(bm.name, func(b *testing.B) {
-			for b.Loop() {
-				rep.ReplaceAll(bm.input, bm.empty)
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, tc.fn)
+			if allocs != tc.targetAllocs {
+				t.Errorf("expected %v allocations, got %v", tc.targetAllocs, allocs)
 			}
 		})
 	}
+}
+
+func BenchmarkReplacer(b *testing.B) {
+	b.Run("SinglePlaceholder", func(b *testing.B) {
+		rep := testReplacer()
+		rep.Set("str", "a string")
+		rep.Set("int", 123.456)
+
+		b.Run("string", func(b *testing.B) {
+			for b.Loop() {
+				rep.ReplaceAll("str={str}", "")
+			}
+		})
+		b.Run("numeric", func(b *testing.B) {
+			for b.Loop() {
+				rep.ReplaceAll("int={int}", "")
+			}
+		})
+	})
+
+	b.Run("MultiPlaceholder", func(b *testing.B) {
+		rep := testReplacer()
+		rep.Set("str", "a string")
+		rep.Set("int", 123456)
+		rep.Set("float", 123.456)
+		rep.Set("bool", true)
+
+		b.Run("2", func(b *testing.B) {
+			input := "str={str} int={int}"
+			for b.Loop() {
+				rep.ReplaceAll(input, "")
+			}
+		})
+		b.Run("5", func(b *testing.B) {
+			input := "str={str} int={int} float={float} bool={bool} str2={str}"
+			for b.Loop() {
+				rep.ReplaceAll(input, "")
+			}
+		})
+		b.Run("10", func(b *testing.B) {
+			input := "p1={str} p2={int} p3={float} p4={bool} p5={str} p6={int} p7={float} p8={bool} p9={str} p10={int}"
+			for b.Loop() {
+				rep.ReplaceAll(input, "")
+			}
+		})
+	})
+
+	b.Run("Concurrent", func(b *testing.B) {
+		rep := testReplacer()
+		rep.Set("str", "a string")
+
+		b.Run("Get", func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					_, _ = rep.Get("str")
+				}
+			})
+		})
+		b.Run("Set", func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					rep.Set("str", "a string")
+				}
+			})
+		})
+		b.Run("ReplaceAll", func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					rep.ReplaceAll("str={str}", "")
+				}
+			})
+		})
+	})
+
+	b.Run("Instantiation", func(b *testing.B) {
+		b.Run("NewReplacer", func(b *testing.B) {
+			for b.Loop() {
+				_ = NewReplacer()
+			}
+		})
+		b.Run("NewEmptyReplacer", func(b *testing.B) {
+			for b.Loop() {
+				_ = NewEmptyReplacer()
+			}
+		})
+		b.Run("WithoutFile", func(b *testing.B) {
+			rep := NewReplacer()
+			for b.Loop() {
+				_ = rep.WithoutFile()
+			}
+		})
+	})
 }
 
 func testReplacer() Replacer {
