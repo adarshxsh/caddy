@@ -81,12 +81,8 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// cookies
 			if strings.HasPrefix(key, reqCookieReplPrefix) {
 				name := key[len(reqCookieReplPrefix):]
-				for _, cookie := range req.Cookies() {
-					if strings.EqualFold(name, cookie.Name) {
-						// always return true, since the cookie might
-						// be present only in some requests
-						return cookie.Value, true
-					}
+				if val, ok := getCookieValue(req, name); ok {
+					return val, true
 				}
 			}
 
@@ -323,52 +319,34 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil {
 					reqHost = req.Host // OK; assume there was no port
 				}
-				hostLabels := strings.Split(reqHost, ".")
-				if idx >= len(hostLabels) {
-					return "", true
-				}
-				return strings.ToLower(hostLabels[len(hostLabels)-idx-1]), true
+				return getHostLabel(reqHost, idx)
 			}
 
 			// path parts
 			if strings.HasPrefix(key, reqURIPathReplPrefix) {
 				idxStr := key[len(reqURIPathReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
-				if err != nil {
+				if err != nil || idx < 0 {
 					return "", false
 				}
-				pathParts := strings.Split(req.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
-				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
+				if req.URL == nil {
 					return "", true
 				}
-				return pathParts[idx], true
+				return getPathSegment(req.URL.Path, idx)
 			}
 
 			// orig uri path parts
 			if strings.HasPrefix(key, reqOrigURIPathReplPrefix) {
 				idxStr := key[len(reqOrigURIPathReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
-				if err != nil {
+				if err != nil || idx < 0 {
 					return "", false
 				}
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				pathParts := strings.Split(or.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
-				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
+				if or.URL == nil {
 					return "", true
 				}
-				return pathParts[idx], true
+				return getPathSegment(or.URL.Path, idx)
 			}
 
 			// middleware variables
@@ -597,3 +575,121 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+func getCookieValue(req *http.Request, name string) (string, bool) {
+	if req == nil || req.Header == nil {
+		return "", false
+	}
+	for _, line := range req.Header["Cookie"] {
+		for len(line) > 0 {
+			var part string
+			if semi := strings.IndexByte(line, ';'); semi >= 0 {
+				part = line[:semi]
+				line = line[semi+1:]
+			} else {
+				part = line
+				line = ""
+			}
+			part = trimCookieSpace(part)
+			if part == "" {
+				continue
+			}
+			var attr, val string
+			if eq := strings.IndexByte(part, '='); eq >= 0 {
+				attr = trimCookieSpace(part[:eq])
+				val = trimCookieSpace(part[eq+1:])
+			} else {
+				attr = part
+				val = ""
+			}
+			if len(val) > 1 && val[0] == '"' && val[len(val)-1] == '"' {
+				val = val[1 : len(val)-1]
+			}
+			if strings.EqualFold(attr, name) {
+				return val, true
+			}
+		}
+	}
+	return "", false
+}
+
+func trimCookieSpace(s string) string {
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\r' || s[0] == '\n') {
+		s = s[1:]
+	}
+	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t' || s[len(s)-1] == '\r' || s[len(s)-1] == '\n') {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+func getHostLabel(reqHost string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	end := len(reqHost)
+	currentLabelIdx := 0
+	for end >= 0 {
+		dotIdx := strings.LastIndexByte(reqHost[:end], '.')
+		var label string
+		if dotIdx < 0 {
+			label = reqHost[:end]
+		} else {
+			label = reqHost[dotIdx+1 : end]
+		}
+		if currentLabelIdx == idx {
+			return toLowerASCII(label), true
+		}
+		if dotIdx < 0 {
+			break
+		}
+		currentLabelIdx++
+		end = dotIdx
+	}
+	return "", true
+}
+
+func toLowerASCII(s string) string {
+	hasUpper := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			hasUpper = true
+			break
+		}
+	}
+	if !hasUpper {
+		return s
+	}
+	return strings.ToLower(s)
+}
+
+func getPathSegment(pathStr string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	s := pathStr
+	if strings.HasPrefix(s, "/") {
+		s = s[1:]
+	}
+	currentIdx := 0
+	start := 0
+	for {
+		nextSlash := strings.IndexByte(s[start:], '/')
+		if nextSlash < 0 {
+			if s == "" && start == 0 {
+				return "", true
+			}
+			if currentIdx == idx {
+				return s[start:], true
+			}
+			return "", true
+		}
+		segmentEnd := start + nextSlash
+		if currentIdx == idx {
+			return s[start:segmentEnd], true
+		}
+		currentIdx++
+		start = segmentEnd + 1
+	}
+}
