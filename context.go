@@ -686,3 +686,22 @@ func (ctx *Context) WithValue(key, value any) Context {
 type eventEmitter interface {
 	Emit(ctx Context, eventName string, data map[string]any) Event
 }
+
+// SetActiveContextForTest sets currentCtx for testing purposes.
+func SetActiveContextForTest(ctx Context) {
+	currentCtxMu.Lock()
+	currentCtx = ctx
+	currentCtxMu.Unlock()
+}
+
+// NewContextWithAppsForTest creates a Context with pre-populated apps for testing.
+func NewContextWithAppsForTest(apps map[string]App) Context {
+	return Context{
+		Context: context.Background(),
+		cfg: &Config{
+			apps: apps,
+		},
+	}
+}
+
+
