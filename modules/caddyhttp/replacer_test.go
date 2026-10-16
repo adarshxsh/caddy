@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -294,5 +295,105 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestLowerASCII(t *testing.T) {
+	tests := []struct {
+		input  string
+		expect string
+	}{
+		{"version", "version"},
+		{"client.fingerprint", "client.fingerprint"},
+		{"Client.Fingerprint", "client.fingerprint"},
+		{"CLIENT.SAN.DNS_NAMES.0", "client.san.dns_names.0"},
+		{"a" + strings.Repeat("B", 63), "a" + strings.Repeat("b", 63)},
+		{"a" + strings.Repeat("B", 64), "a" + strings.Repeat("b", 64)},
+		{"client.ünicode", "client.ünicode"},
+	}
+
+	for _, tc := range tests {
+		got := lowerASCII(tc.input)
+		if got != tc.expect {
+			t.Errorf("lowerASCII(%q) = %q; want %q", tc.input, got, tc.expect)
+		}
+	}
+}
+
+func TestHTTPVarReplacementNoClientCert(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+		ServerName:  "example.com",
+	}
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	val, ok := repl.GetString("http.request.tls.client.fingerprint")
+	if !ok {
+		t.Errorf("Expected placeholder to be recognized, but was not")
+	}
+	if val == "" {
+		t.Errorf("Expected fingerprint string, got empty string")
+	}
+
+	valVersion, okVersion := repl.GetString("http.request.tls.version")
+	if !okVersion || valVersion != "tls1.3" {
+		t.Errorf("Expected tls1.3, got %q (ok=%t)", valVersion, okVersion)
+	}
+}
+
+func TestReqTLSReplacementAllocations(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+		ServerName:  "example.com",
+	}
+
+	// Placeholders that have zero heap allocations when evaluated
+	zeroAllocKeys := []string{
+		"http.request.tls.resumed",
+		"http.request.tls.proto_mutual",
+		"http.request.tls.ech",
+		"http.request.tls.client.public_key",
+		"http.request.tls.client.public_key_sha256",
+	}
+
+	for _, k := range zeroAllocKeys {
+		allocs := testing.AllocsPerRun(100, func() {
+			getReqTLSReplacement(req, k)
+		})
+		if allocs != 0 {
+			t.Errorf("Key %q: expected 0 allocations, got %f", k, allocs)
+		}
+	}
+}
+
+func BenchmarkReqTLSReplacementNoClientCert(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+		ServerName:  "example.com",
+	}
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		getReqTLSReplacement(req, "http.request.tls.resumed")
+		getReqTLSReplacement(req, "http.request.tls.proto_mutual")
+		getReqTLSReplacement(req, "http.request.tls.client.public_key")
 	}
 }
