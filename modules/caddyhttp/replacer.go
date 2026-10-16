@@ -63,19 +63,15 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 		if req != nil {
 			// query string parameters
 			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
-				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
-				// always return true, since the query param might
-				// be present only in some requests
-				return strings.Join(vals, ","), true
+				if req.URL == nil {
+					return "", true
+				}
+				return getURLQuery(req.URL.RawQuery, key[len(reqURIQueryReplPrefix):])
 			}
 
 			// request header fields
 			if strings.HasPrefix(key, reqHeaderReplPrefix) {
-				field := key[len(reqHeaderReplPrefix):]
-				vals := req.Header[textproto.CanonicalMIMEHeaderKey(field)]
-				// always return true, since the header field might
-				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return getHeader(req.Header, key[len(reqHeaderReplPrefix):])
 			}
 
 			// cookies
@@ -384,11 +380,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 		if w != nil {
 			// response header fields
 			if strings.HasPrefix(key, respHeaderReplPrefix) {
-				field := key[len(respHeaderReplPrefix):]
-				vals := w.Header()[textproto.CanonicalMIMEHeaderKey(field)]
-				// always return true, since the header field might
-				// be present only in some responses
-				return strings.Join(vals, ","), true
+				return getHeader(w.Header(), key[len(respHeaderReplPrefix):])
 			}
 		}
 
@@ -584,6 +576,75 @@ func (rid *requestID) String() string {
 		}
 	}
 	return rid.value
+}
+
+func getHeader(h http.Header, key string) (string, bool) {
+	if h == nil {
+		return "", true
+	}
+	vals, ok := h[key]
+	if !ok {
+		vals = h[textproto.CanonicalMIMEHeaderKey(key)]
+	}
+	switch len(vals) {
+	case 0:
+		return "", true
+	case 1:
+		return vals[0], true
+	default:
+		return strings.Join(vals, ","), true
+	}
+}
+
+func getURLQuery(rawQuery, targetKey string) (string, bool) {
+	if rawQuery == "" {
+		return "", true
+	}
+
+	var firstVal string
+	var otherVals []string
+	found := false
+
+	query := rawQuery
+	for query != "" {
+		var keyVal string
+		keyVal, query, _ = strings.Cut(query, "&")
+		if keyVal == "" {
+			continue
+		}
+
+		rawK, rawV, _ := strings.Cut(keyVal, "=")
+
+		k, err := url.QueryUnescape(rawK)
+		if err != nil {
+			continue
+		}
+
+		if k == targetKey {
+			v, err := url.QueryUnescape(rawV)
+			if err != nil {
+				continue
+			}
+			if !found {
+				firstVal = v
+				found = true
+			} else {
+				if otherVals == nil {
+					otherVals = []string{firstVal, v}
+				} else {
+					otherVals = append(otherVals, v)
+				}
+			}
+		}
+	}
+
+	if !found {
+		return "", true
+	}
+	if otherVals == nil {
+		return firstVal, true
+	}
+	return strings.Join(otherVals, ","), true
 }
 
 const (
