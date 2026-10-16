@@ -239,7 +239,6 @@ func TestReplacerSet(t *testing.T) {
 
 func TestReplacerReplaceKnown(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		providers: []replacementProvider{
 			// split our possible vars to two functions (to test if both functions are called)
 			ReplacerFunc(func(key string) (val any, ok bool) {
@@ -312,7 +311,6 @@ func TestReplacerReplaceKnown(t *testing.T) {
 
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		static: map[string]any{
 			"key1": "val1",
 			"key2": "val2",
@@ -526,7 +524,49 @@ func BenchmarkReplacer(b *testing.B) {
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
-		static:    make(map[string]any),
-		mapMutex:  &sync.RWMutex{},
+	}
+}
+
+func TestReplacerLazyInit(t *testing.T) {
+	repl := NewReplacer()
+	if repl.static != nil {
+		t.Errorf("Expected repl.static to be nil initially, but got non-nil map")
+	}
+
+	// Verify operations on uninitialized static map are safe
+	if val, ok := repl.fromStatic("nonexistent"); ok || val != nil {
+		t.Errorf("Expected (nil, false) from uninitialized static map, got (%v, %v)", val, ok)
+	}
+
+	repl.Delete("nonexistent")
+	repl.DeleteByPrefix("nonexistent")
+
+	if repl.static != nil {
+		t.Errorf("Expected repl.static to remain nil after Delete/DeleteByPrefix")
+	}
+
+	// Verify Set lazily initializes static map
+	repl.Set("key1", "val1")
+	if repl.static == nil {
+		t.Fatalf("Expected repl.static to be initialized after Set")
+	}
+	if val, ok := repl.Get("key1"); !ok || val != "val1" {
+		t.Errorf("Expected 'val1', got '%v' (found: %v)", val, ok)
+	}
+
+	// Verify concurrent Set calls on a new Replacer
+	cRepl := NewReplacer()
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			cRepl.Set(fmt.Sprintf("key_%d", id), id)
+		}(i)
+	}
+	wg.Wait()
+
+	if len(cRepl.static) != 50 {
+		t.Errorf("Expected 50 keys in static map after concurrent Set calls, got %d", len(cRepl.static))
 	}
 }
