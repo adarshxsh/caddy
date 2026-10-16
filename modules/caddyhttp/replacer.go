@@ -420,7 +420,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 		return nil, false
 	}
 
-	field := strings.ToLower(key[len(reqTLSReplPrefix):])
+	field := lowerASCII(key[len(reqTLSReplPrefix):])
 
 	if strings.HasPrefix(field, "client.") {
 		cert := getTLSPeerCert(req.TLS)
@@ -433,8 +433,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 			// the client presented a cert. We also do not return true here
 			// because we probably should remain accurate about whether a
 			// placeholder is, in fact, known or not.
-			// (This allocation may be slightly inefficient.)
-			cert = new(x509.Certificate)
+			cert = dummyCert
 		}
 
 		// subject alternate names (SANs)
@@ -597,3 +596,38 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+var dummyCert = new(x509.Certificate)
+
+// lowerASCII returns lowercased s. If s is ASCII and up to 64 bytes,
+// it avoids slice heap allocations by checking if s is already lowercase
+// or using a stack buffer.
+func lowerASCII(s string) string {
+	if len(s) > 64 {
+		return strings.ToLower(s)
+	}
+
+	hasUpper := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			hasUpper = true
+		} else if c >= 0x80 {
+			return strings.ToLower(s)
+		}
+	}
+
+	if !hasUpper {
+		return s
+	}
+
+	var buf [64]byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		buf[i] = c
+	}
+	return string(buf[:len(s)])
+}
