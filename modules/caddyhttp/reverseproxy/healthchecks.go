@@ -452,8 +452,12 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, networ
 	repl.Set("http.reverse_proxy.active.target_upstream", networkAddr)
 	for key, vals := range h.HealthChecks.Active.Headers {
 		key = repl.ReplaceAll(key, "")
-		if key == "Host" {
-			req.Host = repl.ReplaceAll(h.HealthChecks.Active.Headers.Get(key), "")
+		if strings.EqualFold(key, "Host") {
+			val := h.HealthChecks.Active.Headers.Get(key)
+			if val == "" && len(vals) > 0 {
+				val = vals[0]
+			}
+			req.Host = repl.ReplaceAll(val, "")
 			continue
 		}
 		for _, val := range vals {
