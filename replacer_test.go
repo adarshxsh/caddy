@@ -15,10 +15,12 @@
 package caddy
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -529,4 +531,84 @@ func testReplacer() Replacer {
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
 	}
+}
+
+func TestReplacerZeroAllocationsNonChanging(t *testing.T) {
+	rep := testReplacer()
+
+	// Non-changing string with unknown placeholder (ReplaceKnown)
+	input := "static text with {unknown} placeholder"
+	allocs := testing.AllocsPerRun(100, func() {
+		res := rep.ReplaceKnown(input, "")
+		if res != input {
+			t.Fatalf("expected '%s', got '%s'", input, res)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("expected 0 allocs for non-changing ReplaceKnown, got %f", allocs)
+	}
+
+	// Non-changing string without braces
+	inputNoBraces := "static text without any braces"
+	allocs = testing.AllocsPerRun(100, func() {
+		res := rep.ReplaceAll(inputNoBraces, "")
+		if res != inputNoBraces {
+			t.Fatalf("expected '%s', got '%s'", inputNoBraces, res)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("expected 0 allocs for string without braces, got %f", allocs)
+	}
+}
+
+func TestReplacerMaxBufSizeGuardrail(t *testing.T) {
+	rep := NewEmptyReplacer()
+	// Create placeholder that expands to over 64KB
+	largeValue := strings.Repeat("A", 70*1024)
+	rep.Set("large", largeValue)
+
+	input := "prefix {large} suffix"
+	res := rep.ReplaceAll(input, "")
+	if len(res) < 70*1024 {
+		t.Fatalf("expected result length > 70KB, got %d", len(res))
+	}
+
+	// Check that any buffer remaining in or returned to bufPool has Cap <= maxBufSize
+	for i := 0; i < 100; i++ {
+		b := bufPool.Get().(*bytes.Buffer)
+		if b.Cap() > maxBufSize {
+			t.Errorf("found buffer with Cap %d exceeding maxBufSize %d in bufPool", b.Cap(), maxBufSize)
+		}
+	}
+}
+
+func TestReplacerConcurrentPoolUsage(t *testing.T) {
+	rep := NewEmptyReplacer()
+	rep.Set("user", "alice")
+	rep.Set("role", "admin")
+
+	var wg sync.WaitGroup
+	const goroutines = 50
+	const iterations = 1000
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				out := rep.ReplaceAll("user={user}&role={role}&static=value", "")
+				expected := "user=alice&role=admin&static=value"
+				if out != expected {
+					t.Errorf("expected '%s', got '%s'", expected, out)
+				}
+
+				outKnown := rep.ReplaceKnown("user={user}&unknown={unrecognized}", "")
+				expectedKnown := "user=alice&unknown={unrecognized}"
+				if outKnown != expectedKnown {
+					t.Errorf("expected '%s', got '%s'", expectedKnown, outKnown)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

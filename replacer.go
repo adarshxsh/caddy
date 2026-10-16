@@ -180,14 +180,28 @@ func (r *Replacer) replace(input, empty string,
 		return input, nil
 	}
 
-	var sb strings.Builder
-
-	// it is reasonable to assume that the output
-	// will be approximately as long as the input
-	sb.Grow(len(input))
+	var buf *bytes.Buffer
+	defer func() {
+		if buf != nil {
+			if buf.Cap() <= maxBufSize {
+				buf.Reset()
+				bufPool.Put(buf)
+			}
+		}
+	}()
 
 	// iterate the input to find each placeholder
 	var lastWriteCursor int
+
+	writeUpTo := func(endIdx int) {
+		if buf == nil {
+			buf = bufPool.Get().(*bytes.Buffer)
+			buf.Grow(len(input))
+			buf.WriteString(input[:endIdx])
+		} else {
+			buf.WriteString(input[lastWriteCursor:endIdx])
+		}
+	}
 
 	// fail fast if too many placeholders are unclosed
 	var unclosedCount int
@@ -196,7 +210,7 @@ scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
-			sb.WriteString(input[lastWriteCursor : i-1])
+			writeUpTo(i - 1)
 			lastWriteCursor = i
 			continue
 		}
@@ -229,9 +243,6 @@ scan:
 			end += nextEnd + 1
 		}
 
-		// write the substring from the last cursor to this point
-		sb.WriteString(input[lastWriteCursor:i])
-
 		// trim opening bracket
 		key := input[i+1 : end]
 
@@ -245,7 +256,10 @@ scan:
 			} else if !treatUnknownAsEmpty {
 				// if treatUnknownAsEmpty is true, we'll handle an empty
 				// val later; so only continue otherwise
-				lastWriteCursor = i
+				if buf != nil {
+					buf.WriteString(input[lastWriteCursor : i+1])
+					lastWriteCursor = i + 1
+				}
 				continue
 			}
 		}
@@ -259,6 +273,9 @@ scan:
 			}
 		}
 
+		// write the substring from the last cursor to this point
+		writeUpTo(i)
+
 		// convert val to a string as efficiently as possible
 		valStr := ToString(val)
 
@@ -269,10 +286,10 @@ scan:
 				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
 					string(phOpen), key, string(phClose))
 			} else if empty != "" {
-				sb.WriteString(empty)
+				buf.WriteString(empty)
 			}
 		} else {
-			sb.WriteString(valStr)
+			buf.WriteString(valStr)
 		}
 
 		// advance cursor to end of placeholder
@@ -280,10 +297,14 @@ scan:
 		lastWriteCursor = i + 1
 	}
 
-	// flush any unwritten remainder
-	sb.WriteString(input[lastWriteCursor:])
+	if buf == nil {
+		return input, nil
+	}
 
-	return sb.String(), nil
+	// flush any unwritten remainder
+	buf.WriteString(input[lastWriteCursor:])
+
+	return buf.String(), nil
 }
 
 // ToString returns val as a string, as efficiently as possible.
@@ -440,6 +461,8 @@ func readFileIntoBuffer(filename string, size int) ([]byte, error) {
 // will actually be the replacement, or an error. Note
 // that errors are sometimes ignored by replacers.
 type ReplacementFunc func(variable string, val any) (any, error)
+
+const maxBufSize = 64 * 1024
 
 // nowFunc is a variable so tests can change it
 // in order to obtain a deterministic time.
