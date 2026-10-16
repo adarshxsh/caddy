@@ -296,3 +296,213 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestCookieLookups(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Add("Cookie", "session=xyz123; USER=alice; quoted=\"hello world\"")
+	req.Header.Add("Cookie", "extra=val2")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	tests := []struct {
+		key      string
+		expected string
+		found    bool
+	}{
+		{"http.request.cookie.session", "xyz123", true},
+		{"http.request.cookie.USER", "alice", true},
+		{"http.request.cookie.user", "alice", true}, // case-insensitive match
+		{"http.request.cookie.quoted", "hello world", true},
+		{"http.request.cookie.extra", "val2", true},
+		{"http.request.cookie.nonexistent", "", false},
+	}
+
+	for _, tc := range tests {
+		val, ok := repl.GetString(tc.key)
+		if ok != tc.found {
+			t.Errorf("key %s: expected found=%t, got %t", tc.key, tc.found, ok)
+		}
+		if val != tc.expected {
+			t.Errorf("key %s: expected %q, got %q", tc.key, tc.expected, val)
+		}
+	}
+}
+
+func TestHostLabelLookups(t *testing.T) {
+	tests := []struct {
+		host     string
+		key      string
+		expected string
+		found    bool
+	}{
+		{"sub.dev.EXAMPLE.com:8080", "http.request.host.labels.0", "com", true},
+		{"sub.dev.EXAMPLE.com:8080", "http.request.host.labels.1", "example", true},
+		{"sub.dev.EXAMPLE.com:8080", "http.request.host.labels.2", "dev", true},
+		{"sub.dev.EXAMPLE.com:8080", "http.request.host.labels.3", "sub", true},
+		{"sub.dev.EXAMPLE.com:8080", "http.request.host.labels.4", "", true},
+		{"localhost", "http.request.host.labels.0", "localhost", true},
+		{"localhost", "http.request.host.labels.1", "", true},
+		{"example.com.", "http.request.host.labels.0", "", true},
+		{"example.com.", "http.request.host.labels.1", "com", true},
+		{"example.com.", "http.request.host.labels.2", "example", true},
+		{"example.com", "http.request.host.labels.invalid", "", false},
+		{"example.com", "http.request.host.labels.-1", "", false},
+	}
+
+	for _, tc := range tests {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = tc.host
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		val, ok := repl.GetString(tc.key)
+		if ok != tc.found {
+			t.Errorf("host %q key %s: expected found=%t, got %t", tc.host, tc.key, tc.found, ok)
+		}
+		if val != tc.expected {
+			t.Errorf("host %q key %s: expected %q, got %q", tc.host, tc.key, tc.expected, val)
+		}
+	}
+}
+
+func TestPathSegmentLookups(t *testing.T) {
+	tests := []struct {
+		path     string
+		key      string
+		expected string
+		found    bool
+	}{
+		{"/foo/bar/baz", "http.request.uri.path.0", "foo", true},
+		{"/foo/bar/baz", "http.request.uri.path.1", "bar", true},
+		{"/foo/bar/baz", "http.request.uri.path.2", "baz", true},
+		{"/foo/bar/baz", "http.request.uri.path.3", "", true},
+		{"//a//b/", "http.request.uri.path.0", "", true},
+		{"//a//b/", "http.request.uri.path.1", "a", true},
+		{"//a//b/", "http.request.uri.path.2", "", true},
+		{"//a//b/", "http.request.uri.path.3", "b", true},
+		{"//a//b/", "http.request.uri.path.4", "", true},
+		{"//a//b/", "http.request.uri.path.5", "", true},
+		{"/", "http.request.uri.path.0", "", true},
+		{"/", "http.request.uri.path.1", "", true},
+		{"", "http.request.uri.path.0", "", true},
+		{"/foo/bar", "http.request.uri.path.abc", "", false},
+		{"/foo/bar", "http.request.uri.path.-1", "", false},
+		{"/foo/bar", "http.request.orig_uri.path.0", "foo", true},
+		{"/foo/bar", "http.request.orig_uri.path.1", "bar", true},
+	}
+
+	for _, tc := range tests {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.URL.Path = tc.path
+		if tc.key == "http.request.orig_uri.path.0" || tc.key == "http.request.orig_uri.path.1" {
+			ctx := context.WithValue(req.Context(), OriginalRequestCtxKey, *req)
+			req = req.WithContext(ctx)
+		}
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		val, ok := repl.GetString(tc.key)
+		if ok != tc.found {
+			t.Errorf("path %q key %s: expected found=%t, got %t", tc.path, tc.key, tc.found, ok)
+		}
+		if val != tc.expected {
+			t.Errorf("path %q key %s: expected %q, got %q", tc.path, tc.key, tc.expected, val)
+		}
+	}
+}
+
+func BenchmarkCookieLookup(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Add("Cookie", "session=xyz123; user=alice; token=secret123; theme=dark")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.cookie.token")
+	}
+}
+
+func BenchmarkCookieValueDirect(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Add("Cookie", "session=xyz123; user=alice; token=secret123; theme=dark")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = getCookieValue(req, "token")
+	}
+}
+
+func BenchmarkHostLabelLookup(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "sub.api.example.com:8080"
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.host.labels.1")
+	}
+}
+
+func BenchmarkHostLabelDirect(b *testing.B) {
+	reqHost := "sub.api.example.com:8080"
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = getHostLabel(reqHost, 1)
+	}
+}
+
+func BenchmarkPathSegmentLookup(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/123/profile", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.uri.path.2")
+	}
+}
+
+func BenchmarkPathSegmentDirect(b *testing.B) {
+	pathStr := "/api/v1/users/123/profile"
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = getPathSegment(pathStr, 2)
+	}
+}
+
+func TestZeroAllocCheck(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/123/profile", nil)
+	req.Host = "sub.api.example.com:8080"
+	req.Header.Add("Cookie", "session=xyz123; user=alice; token=secret123")
+
+	cookieDirectAllocs := testing.AllocsPerRun(100, func() {
+		_, _ = getCookieValue(req, "user")
+	})
+	if cookieDirectAllocs > 0 {
+		t.Errorf("getCookieValue allocated %f objects, expected 0", cookieDirectAllocs)
+	}
+
+	hostDirectAllocs := testing.AllocsPerRun(100, func() {
+		_, _ = getHostLabel(req.Host, 2)
+	})
+	if hostDirectAllocs > 0 {
+		t.Errorf("getHostLabel allocated %f objects, expected 0", hostDirectAllocs)
+	}
+
+	pathDirectAllocs := testing.AllocsPerRun(100, func() {
+		_, _ = getPathSegment(req.URL.Path, 2)
+	})
+	if pathDirectAllocs > 0 {
+		t.Errorf("getPathSegment allocated %f objects, expected 0", pathDirectAllocs)
+	}
+}
