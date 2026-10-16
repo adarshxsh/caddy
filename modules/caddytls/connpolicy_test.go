@@ -20,7 +20,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -360,4 +362,235 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetEncryptedClientHelloKeys_Isolation(t *testing.T) {
+	ech := &ECH{
+		configsMu: new(sync.RWMutex),
+		configs: map[string][]echConfig{
+			"example.com": {
+				{
+					configBin:  []byte("original_config"),
+					privKeyBin: []byte("original_key"),
+				},
+			},
+		},
+	}
+	ech.updateKeyList()
+
+	cfg := &caddy.Config{
+		AppsRaw: caddy.ModuleMap{
+			"tls": json.RawMessage(`{"encrypted_client_hello":{"configs":[{"public_name":"example.com"}]}}`),
+		},
+	}
+
+	ctx, err := caddy.ProvisionContext(cfg)
+	if err != nil {
+		t.Fatalf("ProvisionContext error: %v", err)
+	}
+
+	loadedTLS, err := ctx.App("tls")
+	if err != nil {
+		t.Fatalf("failed to load TLS app: %v", err)
+	}
+	appTLS := loadedTLS.(*TLS)
+	appTLS.EncryptedClientHello = ech
+
+	policies := ConnectionPolicies{&ConnectionPolicy{}}
+	tlsCfg := policies.TLSConfig(ctx)
+
+	if tlsCfg.GetEncryptedClientHelloKeys == nil {
+		t.Fatal("expected GetEncryptedClientHelloKeys to be non-nil")
+	}
+
+	keys1, err := tlsCfg.GetEncryptedClientHelloKeys(nil)
+	if err != nil {
+		t.Fatalf("GetEncryptedClientHelloKeys error: %v", err)
+	}
+	if len(keys1) != 1 {
+		t.Fatalf("expected 1 key, got %d", len(keys1))
+	}
+	if string(keys1[0].Config) != "original_config" || string(keys1[0].PrivateKey) != "original_key" {
+		t.Fatalf("unexpected key content: config=%s, key=%s", keys1[0].Config, keys1[0].PrivateKey)
+	}
+
+	// Mutate returned key slice elements and buffers
+	keys1[0].Config[0] = 'X'
+	keys1[0].PrivateKey[0] = 'Y'
+	keys1[0].SendAsRetry = false
+	keys1 = append(keys1, tls.EncryptedClientHelloKey{Config: []byte("extra")})
+
+	// Fetch keys again and check internal stdlibReady state directly
+	ech.configsMu.RLock()
+	internalConfig := string(ech.stdlibReady[0].Config)
+	internalKey := string(ech.stdlibReady[0].PrivateKey)
+	internalRetry := ech.stdlibReady[0].SendAsRetry
+	internalLen := len(ech.stdlibReady)
+	ech.configsMu.RUnlock()
+
+	if internalConfig != "original_config" {
+		t.Errorf("internal config was mutated: got %s, want original_config", internalConfig)
+	}
+	if internalKey != "original_key" {
+		t.Errorf("internal key was mutated: got %s, want original_key", internalKey)
+	}
+	if !internalRetry {
+		t.Errorf("internal SendAsRetry was mutated: got false, want true")
+	}
+	if internalLen != 1 {
+		t.Errorf("internal stdlibReady length was mutated: got %d, want 1", internalLen)
+	}
+
+	keys2, err := tlsCfg.GetEncryptedClientHelloKeys(nil)
+	if err != nil {
+		t.Fatalf("GetEncryptedClientHelloKeys second call error: %v", err)
+	}
+	if string(keys2[0].Config) != "original_config" || string(keys2[0].PrivateKey) != "original_key" {
+		t.Errorf("subsequent call returned mutated buffers: config=%s, key=%s", keys2[0].Config, keys2[0].PrivateKey)
+	}
+}
+
+func TestGetEncryptedClientHelloKeys_EdgeCases(t *testing.T) {
+	// Case 1: empty stdlibReady
+	ech := &ECH{
+		configsMu: new(sync.RWMutex),
+		configs:   map[string][]echConfig{"example.com": {}},
+	}
+	ech.updateKeyList()
+
+	cfg := &caddy.Config{
+		AppsRaw: caddy.ModuleMap{
+			"tls": json.RawMessage(`{"encrypted_client_hello":{"configs":[{"public_name":"example.com"}]}}`),
+		},
+	}
+	ctx, err := caddy.ProvisionContext(cfg)
+	if err != nil {
+		t.Fatalf("ProvisionContext error: %v", err)
+	}
+
+	loadedTLS, err := ctx.App("tls")
+	if err != nil {
+		t.Fatalf("failed to load TLS app: %v", err)
+	}
+	appTLS := loadedTLS.(*TLS)
+	appTLS.EncryptedClientHello = ech
+
+	policies := ConnectionPolicies{&ConnectionPolicy{}}
+	tlsCfg := policies.TLSConfig(ctx)
+
+	keys, err := tlsCfg.GetEncryptedClientHelloKeys(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if keys != nil {
+		t.Fatalf("expected nil keys for empty stdlibReady, got %v", keys)
+	}
+
+	// Case 2: nil EncryptedClientHello
+	appTLS.EncryptedClientHello = nil
+	keys, err = tlsCfg.GetEncryptedClientHelloKeys(nil)
+	if err != nil {
+		t.Fatalf("unexpected error for nil EncryptedClientHello: %v", err)
+	}
+	if keys != nil {
+		t.Fatalf("expected nil keys for nil EncryptedClientHello, got %v", keys)
+	}
+}
+
+func TestGetEncryptedClientHelloKeys_Concurrency(t *testing.T) {
+	ech := &ECH{
+		configsMu: new(sync.RWMutex),
+		configs: map[string][]echConfig{
+			"example.com": {
+				{
+					configBin:  []byte("config_initial"),
+					privKeyBin: []byte("key_initial"),
+				},
+			},
+		},
+	}
+	ech.updateKeyList()
+
+	cfg := &caddy.Config{
+		AppsRaw: caddy.ModuleMap{
+			"tls": json.RawMessage(`{"encrypted_client_hello":{"configs":[{"public_name":"example.com"}]}}`),
+		},
+	}
+	ctx, err := caddy.ProvisionContext(cfg)
+	if err != nil {
+		t.Fatalf("ProvisionContext error: %v", err)
+	}
+
+	loadedTLS, err := ctx.App("tls")
+	if err != nil {
+		t.Fatalf("failed to load TLS app: %v", err)
+	}
+	appTLS := loadedTLS.(*TLS)
+	appTLS.EncryptedClientHello = ech
+
+	policies := ConnectionPolicies{&ConnectionPolicy{}}
+	tlsCfg := policies.TLSConfig(ctx)
+
+	var wg sync.WaitGroup
+	stopCh := make(chan struct{})
+
+	// Writer goroutine: simulates key rotations/updates in ech
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+				i++
+				ech.configsMu.Lock()
+				ech.configs["example.com"] = []echConfig{
+					{
+						configBin:  []byte(fmt.Sprintf("config_%d", i)),
+						privKeyBin: []byte(fmt.Sprintf("key_%d", i)),
+					},
+				}
+				ech.updateKeyList()
+				ech.configsMu.Unlock()
+				time.Sleep(10 * time.Microsecond)
+			}
+		}
+	}()
+
+	// Reader goroutines: simulate concurrent handshake key retrievals
+	const numReaders = 10
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+					keys, err := tlsCfg.GetEncryptedClientHelloKeys(nil)
+					if err != nil {
+						t.Errorf("GetEncryptedClientHelloKeys error: %v", err)
+						return
+					}
+					if len(keys) > 0 {
+						// Mutate read keys to test isolation under concurrency
+						if len(keys[0].Config) > 0 {
+							keys[0].Config[0] = 'A'
+						}
+						if len(keys[0].PrivateKey) > 0 {
+							keys[0].PrivateKey[0] = 'B'
+						}
+					}
+					time.Sleep(5 * time.Microsecond)
+				}
+			}
+		}()
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	close(stopCh)
+	wg.Wait()
 }
