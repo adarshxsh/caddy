@@ -88,6 +88,15 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 	r.providers = append(r.providers, mapFunc)
 }
 
+// MapProvider adds provider to the list of value providers.
+// provider will be executed only at replace-time.
+func (r *Replacer) MapProvider(provider ReplacementProvider) {
+	if provider == nil {
+		return
+	}
+	r.providers = append(r.providers, providerAdapter{provider})
+}
+
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
@@ -338,6 +347,22 @@ type ReplacerFunc func(key string) (any, bool)
 
 func (f ReplacerFunc) replace(key string) (any, bool) {
 	return f(key)
+}
+
+// ReplacementProvider is a type that can provide replacements
+// for placeholders.
+type ReplacementProvider interface {
+	Replace(key string) (any, bool)
+}
+
+// providerAdapter wraps a ReplacementProvider to implement the internal
+// replacementProvider interface.
+type providerAdapter struct {
+	provider ReplacementProvider
+}
+
+func (a providerAdapter) replace(key string) (any, bool) {
+	return a.provider.Replace(key)
 }
 
 // replacementProvider is a type that can provide replacements

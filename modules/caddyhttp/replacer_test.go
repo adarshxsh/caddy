@@ -296,3 +296,80 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLazyRequestUUID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Before accessing uuid placeholder, uuid variable should be nil in context
+	if idVal := GetVar(req.Context(), "uuid"); idVal != nil {
+		t.Fatalf("Expected uuid context variable to be nil before access, got %v", idVal)
+	}
+
+	// Access http.request.uuid placeholder
+	uuidStr1, found1 := repl.GetString("http.request.uuid")
+	if !found1 || uuidStr1 == "" {
+		t.Fatalf("Expected valid uuid string, got %q (found=%t)", uuidStr1, found1)
+	}
+
+	// Context variable "uuid" should now be populated
+	idVal := GetVar(req.Context(), "uuid")
+	if idVal == nil {
+		t.Fatalf("Expected uuid context variable to be set after access, got nil")
+	}
+
+	// Second access should return the same cached UUID
+	uuidStr2, found2 := repl.GetString("http.request.uuid")
+	if !found2 || uuidStr2 != uuidStr1 {
+		t.Fatalf("Expected cached uuid %q, got %q (found=%t)", uuidStr1, uuidStr2, found2)
+	}
+}
+
+func TestLazyVarsUUID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Access http.vars.uuid placeholder first
+	uuidStr1, found1 := repl.GetString("http.vars.uuid")
+	if !found1 || uuidStr1 == "" {
+		t.Fatalf("Expected valid uuid string, got %q (found=%t)", uuidStr1, found1)
+	}
+
+	// Access http.request.uuid placeholder second
+	uuidStr2, found2 := repl.GetString("http.request.uuid")
+	if !found2 || uuidStr2 != uuidStr1 {
+		t.Fatalf("Expected matching uuid %q, got %q (found=%t)", uuidStr1, uuidStr2, found2)
+	}
+}
+
+func TestAddHTTPVarsToReplacer(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Confirm requestID is not allocated during setup
+	if idVal := GetVar(req.Context(), "uuid"); idVal != nil {
+		t.Fatalf("Expected uuid to be nil during request setup, got %v", idVal)
+	}
+
+	// Confirm start_time is set
+	if startTime := GetVar(req.Context(), "start_time"); startTime == nil {
+		t.Fatalf("Expected start_time to be set during request setup")
+	}
+}
+
+

@@ -530,3 +530,23 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+type dummyMapProvider struct{}
+
+func (d dummyMapProvider) Replace(key string) (any, bool) {
+	if key == "test.map_provider" {
+		return "hello_provider", true
+	}
+	return nil, false
+}
+
+func TestReplacerMapProvider(t *testing.T) {
+	rep := NewReplacer()
+	rep.MapProvider(dummyMapProvider{})
+
+	val, ok := rep.GetString("test.map_provider")
+	if !ok || val != "hello_provider" {
+		t.Errorf("Expected 'hello_provider', got %q (ok=%t)", val, ok)
+	}
+}
+
