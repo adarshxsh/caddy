@@ -33,7 +33,7 @@ import (
 // NewReplacer returns a new Replacer.
 func NewReplacer() *Replacer {
 	rep := &Replacer{
-		static:   make(map[string]any),
+		static:   make(map[string]replacementValue),
 		mapMutex: &sync.RWMutex{},
 	}
 	rep.providers = []replacementProvider{
@@ -48,7 +48,7 @@ func NewReplacer() *Replacer {
 // without the global default replacements.
 func NewEmptyReplacer() *Replacer {
 	rep := &Replacer{
-		static:   make(map[string]any),
+		static:   make(map[string]replacementValue),
 		mapMutex: &sync.RWMutex{},
 	}
 	rep.providers = []replacementProvider{
@@ -62,8 +62,77 @@ func NewEmptyReplacer() *Replacer {
 // use NewReplacer to make one.
 type Replacer struct {
 	providers []replacementProvider
-	static    map[string]any
+	static    map[string]replacementValue
 	mapMutex  *sync.RWMutex
+}
+
+type valueType uint8
+
+const (
+	typeAny valueType = iota
+	typeString
+	typeInt
+	typeFloat
+	typeBool
+	typeBytes
+)
+
+type replacementValue struct {
+	valType  valueType
+	strVal   string
+	intVal   int64
+	floatVal float64
+	boolVal  bool
+	bytesVal []byte
+	anyVal   any
+}
+
+func makeReplacementValue(val any) replacementValue {
+	switch v := val.(type) {
+	case replacementValue:
+		return v
+	case string:
+		return replacementValue{valType: typeString, strVal: v}
+	case int:
+		return replacementValue{valType: typeInt, intVal: int64(v)}
+	case int32:
+		return replacementValue{valType: typeInt, intVal: int64(v)}
+	case int64:
+		return replacementValue{valType: typeInt, intVal: v}
+	case float32:
+		return replacementValue{valType: typeFloat, floatVal: float64(v)}
+	case float64:
+		return replacementValue{valType: typeFloat, floatVal: v}
+	case bool:
+		return replacementValue{valType: typeBool, boolVal: v}
+	case []byte:
+		return replacementValue{valType: typeBytes, bytesVal: v}
+	default:
+		return replacementValue{valType: typeAny, anyVal: v}
+	}
+}
+
+func (v replacementValue) Value() any {
+	switch v.valType {
+	case typeString:
+		return v.strVal
+	case typeInt:
+		return v.intVal
+	case typeFloat:
+		return v.floatVal
+	case typeBool:
+		return v.boolVal
+	case typeBytes:
+		return v.bytesVal
+	default:
+		return v.anyVal
+	}
+}
+
+func (v replacementValue) String() string {
+	var sb strings.Builder
+	AppendValue(&sb, v)
+	return sb.String()
 }
 
 // WithoutFile returns a copy of the current Replacer
@@ -72,7 +141,7 @@ type Replacer struct {
 //
 // EXPERIMENTAL: Subject to change or removal.
 func (r *Replacer) WithoutFile() *Replacer {
-	rep := &Replacer{static: r.static}
+	rep := &Replacer{static: r.static, mapMutex: r.mapMutex}
 	for _, v := range r.providers {
 		if _, ok := v.(fileReplacementProvider); ok {
 			continue
@@ -91,7 +160,42 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
-	r.static[variable] = value
+	r.static[variable] = makeReplacementValue(value)
+	r.mapMutex.Unlock()
+}
+
+// SetString sets a custom variable to a static string value.
+func (r *Replacer) SetString(variable, value string) {
+	r.mapMutex.Lock()
+	r.static[variable] = replacementValue{valType: typeString, strVal: value}
+	r.mapMutex.Unlock()
+}
+
+// SetInt sets a custom variable to a static int64 value.
+func (r *Replacer) SetInt(variable string, value int64) {
+	r.mapMutex.Lock()
+	r.static[variable] = replacementValue{valType: typeInt, intVal: value}
+	r.mapMutex.Unlock()
+}
+
+// SetBool sets a custom variable to a static bool value.
+func (r *Replacer) SetBool(variable string, value bool) {
+	r.mapMutex.Lock()
+	r.static[variable] = replacementValue{valType: typeBool, boolVal: value}
+	r.mapMutex.Unlock()
+}
+
+// SetFloat sets a custom variable to a static float64 value.
+func (r *Replacer) SetFloat(variable string, value float64) {
+	r.mapMutex.Lock()
+	r.static[variable] = replacementValue{valType: typeFloat, floatVal: value}
+	r.mapMutex.Unlock()
+}
+
+// SetBytes sets a custom variable to a static byte slice value.
+func (r *Replacer) SetBytes(variable string, value []byte) {
+	r.mapMutex.Lock()
+	r.static[variable] = replacementValue{valType: typeBytes, bytesVal: value}
 	r.mapMutex.Unlock()
 }
 
@@ -100,6 +204,9 @@ func (r *Replacer) Set(variable string, value any) {
 func (r *Replacer) Get(variable string) (any, bool) {
 	for _, mapFunc := range r.providers {
 		if val, ok := mapFunc.replace(variable); ok {
+			if rv, isRV := val.(replacementValue); isRV {
+				return rv.Value(), true
+			}
 			return val, true
 		}
 	}
@@ -260,19 +367,18 @@ scan:
 		}
 
 		// convert val to a string as efficiently as possible
-		valStr := ToString(val)
+		startLen := sb.Len()
+		AppendValue(&sb, val)
 
 		// write the value; if it's empty, either return
 		// an error or write a default value
-		if valStr == "" {
+		if sb.Len() == startLen {
 			if errOnEmpty {
 				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
 					string(phOpen), key, string(phClose))
 			} else if empty != "" {
 				sb.WriteString(empty)
 			}
-		} else {
-			sb.WriteString(valStr)
 		}
 
 		// advance cursor to end of placeholder
@@ -286,48 +392,88 @@ scan:
 	return sb.String(), nil
 }
 
+// AppendValue appends val to sb as efficiently as possible with zero allocations for primitive types.
+func AppendValue(sb *strings.Builder, val any) {
+	switch v := val.(type) {
+	case nil:
+		return
+	case replacementValue:
+		switch v.valType {
+		case typeString:
+			sb.WriteString(v.strVal)
+		case typeInt:
+			var buf [32]byte
+			sb.Write(strconv.AppendInt(buf[:0], v.intVal, 10))
+		case typeFloat:
+			var buf [64]byte
+			sb.Write(strconv.AppendFloat(buf[:0], v.floatVal, 'f', -1, 64))
+		case typeBool:
+			if v.boolVal {
+				sb.WriteString("true")
+			} else {
+				sb.WriteString("false")
+			}
+		case typeBytes:
+			sb.Write(v.bytesVal)
+		default:
+			AppendValue(sb, v.anyVal)
+		}
+	case string:
+		sb.WriteString(v)
+	case fmt.Stringer:
+		sb.WriteString(v.String())
+	case error:
+		sb.WriteString(v.Error())
+	case byte:
+		sb.WriteByte(v)
+	case []byte:
+		sb.Write(v)
+	case []rune:
+		sb.WriteString(string(v))
+	case int:
+		var buf [32]byte
+		sb.Write(strconv.AppendInt(buf[:0], int64(v), 10))
+	case int32:
+		var buf [32]byte
+		sb.Write(strconv.AppendInt(buf[:0], int64(v), 10))
+	case int64:
+		var buf [32]byte
+		sb.Write(strconv.AppendInt(buf[:0], v, 10))
+	case uint:
+		var buf [32]byte
+		sb.Write(strconv.AppendUint(buf[:0], uint64(v), 10))
+	case uint32:
+		var buf [32]byte
+		sb.Write(strconv.AppendUint(buf[:0], uint64(v), 10))
+	case uint64:
+		var buf [32]byte
+		sb.Write(strconv.AppendUint(buf[:0], v, 10))
+	case float32:
+		var buf [64]byte
+		sb.Write(strconv.AppendFloat(buf[:0], float64(v), 'f', -1, 32))
+	case float64:
+		var buf [64]byte
+		sb.Write(strconv.AppendFloat(buf[:0], v, 'f', -1, 64))
+	case bool:
+		if v {
+			sb.WriteString("true")
+		} else {
+			sb.WriteString("false")
+		}
+	default:
+		fmt.Fprintf(sb, "%+v", v)
+	}
+}
+
 // ToString returns val as a string, as efficiently as possible.
 // EXPERIMENTAL: may be changed or removed later.
 func ToString(val any) string {
-	switch v := val.(type) {
-	case nil:
-		return ""
-	case string:
-		return v
-	case fmt.Stringer:
-		return v.String()
-	case error:
-		return v.Error()
-	case byte:
-		return string(v)
-	case []byte:
-		return string(v)
-	case []rune:
-		return string(v)
-	case int:
-		return strconv.Itoa(v)
-	case int32:
-		return strconv.Itoa(int(v))
-	case int64:
-		return strconv.Itoa(int(v))
-	case uint:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint32:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint64:
-		return strconv.FormatUint(v, 10)
-	case float32:
-		return strconv.FormatFloat(float64(v), 'f', -1, 32)
-	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
-	case bool:
-		if v {
-			return "true"
-		}
-		return "false"
-	default:
-		return fmt.Sprintf("%+v", v)
+	if s, ok := val.(string); ok {
+		return s
 	}
+	var sb strings.Builder
+	AppendValue(&sb, val)
+	return sb.String()
 }
 
 // ReplacerFunc is a function that returns a replacement for the
