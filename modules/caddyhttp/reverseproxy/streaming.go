@@ -21,10 +21,10 @@ package reverseproxy
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	weakrand "math/rand/v2"
 	"mime"
 	"net/http"
 	"sync"
@@ -495,7 +495,10 @@ func writeCloseControl(conn io.Writer, isClient bool) error {
 	// When we're the client, we need to mask the message as per
 	// https://www.rfc-editor.org/rfc/rfc6455#section-5.3
 	if isClient {
-		key := newMaskKey()
+		key, err := newMaskKey()
+		if err != nil {
+			return err
+		}
 		buf = append(buf, key[:]...)
 		msgLength += len(key)
 		buf = appendMessage(buf)
@@ -554,10 +557,15 @@ func maskBytes(key [4]byte, pos int, b []byte) int {
 	return pos & 3
 }
 
-// Copied from https://github.com/gorilla/websocket/blob/v1.5.0/conn.go#L184
-func newMaskKey() [4]byte {
-	n := weakrand.Uint32()
-	return [4]byte{byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
+var randRead = rand.Read
+
+func newMaskKey() ([4]byte, error) {
+	var key [4]byte
+	_, err := randRead(key[:])
+	if err != nil {
+		return [4]byte{}, err
+	}
+	return key, nil
 }
 
 // isWebsocket returns true if r looks to be an upgrade request for WebSockets.
