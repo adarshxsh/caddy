@@ -296,3 +296,102 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHeaderAndQueryReplacer(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/test?single=val1&multi=v1&multi=v2&escaped%20key=escaped%20val&empty=&flag&plus=hello+world", nil)
+	req.Header.Set("User-Agent", "TestAgent")
+	req.Header.Add("X-Forwarded-For", "10.0.0.1")
+	req.Header.Add("X-Forwarded-For", "10.0.0.2")
+	req.Header["x-custom-case"] = []string{"customValue"}
+
+	res := httptest.NewRecorder()
+	res.Header().Set("Content-Type", "text/plain")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	tests := []struct {
+		placeholder string
+		expect      string
+	}{
+		// Query parameters
+		{"http.request.uri.query.single", "val1"},
+		{"http.request.uri.query.multi", "v1,v2"},
+		{"http.request.uri.query.escaped key", "escaped val"},
+		{"http.request.uri.query.empty", ""},
+		{"http.request.uri.query.flag", ""},
+		{"http.request.uri.query.plus", "hello world"},
+		{"http.request.uri.query.nonexistent", ""},
+
+		// Request headers
+		{"http.request.header.User-Agent", "TestAgent"},
+		{"http.request.header.user-agent", "TestAgent"},
+		{"http.request.header.X-Forwarded-For", "10.0.0.1,10.0.0.2"},
+		{"http.request.header.x-custom-case", "customValue"},
+		{"http.request.header.Nonexistent-Header", ""},
+
+		// Response headers
+		{"http.response.header.Content-Type", "text/plain"},
+		{"http.response.header.content-type", "text/plain"},
+		{"http.response.header.Nonexistent-Header", ""},
+	}
+
+	for _, tc := range tests {
+		val, ok := repl.GetString(tc.placeholder)
+		if !ok {
+			t.Errorf("Expected placeholder %q to be recognized", tc.placeholder)
+		}
+		if val != tc.expect {
+			t.Errorf("Placeholder %q: expected %q, got %q", tc.placeholder, tc.expect, val)
+		}
+	}
+}
+
+func TestHeaderAndQueryAllocations(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/test?param=value", nil)
+	req.Header.Set("User-Agent", "TestAgent")
+
+	// Direct helper allocation checks: verify zero allocations for query parameter and header lookups
+	queryAllocs := testing.AllocsPerRun(100, func() {
+		_, _ = getURLQuery(req.URL.RawQuery, "param")
+	})
+	if queryAllocs > 0 {
+		t.Errorf("Expected 0 allocations for direct single-value query lookup, got %f", queryAllocs)
+	}
+
+	headerExactAllocs := testing.AllocsPerRun(100, func() {
+		_, _ = getHeader(req.Header, "User-Agent")
+	})
+	if headerExactAllocs > 0 {
+		t.Errorf("Expected 0 allocations for direct exact match header lookup, got %f", headerExactAllocs)
+	}
+
+	headerCanonAllocs := testing.AllocsPerRun(100, func() {
+		_, _ = getHeader(req.Header, "user-agent")
+	})
+	if headerCanonAllocs > 0 {
+		t.Errorf("Expected 0 allocations for direct canonical header lookup, got %f", headerCanonAllocs)
+	}
+}
+
+func BenchmarkHeaderLookup(b *testing.B) {
+	h := http.Header{}
+	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = getHeader(h, "User-Agent")
+	}
+}
+
+func BenchmarkQueryLookup(b *testing.B) {
+	rawQuery := "foo=bar&baz=qux&api_key=1234567890abcdef&filter=active"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = getURLQuery(rawQuery, "api_key")
+	}
+}
+
