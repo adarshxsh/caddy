@@ -222,8 +222,8 @@ func TestReplacerSet(t *testing.T) {
 
 		// test if key is added
 		if val, ok := rep.static[tc.variable]; ok {
-			if val != tc.value {
-				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
+			if val.Value() != tc.value {
+				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val.Value())
 			}
 		} else {
 			t.Errorf("Expected existing key '%s' found nothing", tc.variable)
@@ -313,11 +313,11 @@ func TestReplacerReplaceKnown(t *testing.T) {
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
 		mapMutex: &sync.RWMutex{},
-		static: map[string]any{
-			"key1": "val1",
-			"key2": "val2",
-			"key3": "val3",
-			"key4": "val4",
+		static: map[string]replacementValue{
+			"key1": makeReplacementValue("val1"),
+			"key2": makeReplacementValue("val2"),
+			"key3": makeReplacementValue("val3"),
+			"key4": makeReplacementValue("val4"),
 		},
 	}
 
@@ -526,7 +526,99 @@ func BenchmarkReplacer(b *testing.B) {
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
-		static:    make(map[string]any),
+		static:    make(map[string]replacementValue),
 		mapMutex:  &sync.RWMutex{},
+	}
+}
+
+func TestReplacerTypedSetters(t *testing.T) {
+	rep := NewReplacer()
+
+	rep.SetString("str", "hello")
+	rep.SetInt("int", 42)
+	rep.SetBool("bool", true)
+	rep.SetFloat("float", 3.14)
+	rep.SetBytes("bytes", []byte("world"))
+
+	// Verify Get returns expected unboxed values
+	if val, ok := rep.Get("str"); !ok || val != "hello" {
+		t.Errorf("Get(str) = %v, %v; expected hello, true", val, ok)
+	}
+	if val, ok := rep.Get("int"); !ok || val != int64(42) {
+		t.Errorf("Get(int) = %v, %v; expected 42, true", val, ok)
+	}
+	if val, ok := rep.Get("bool"); !ok || val != true {
+		t.Errorf("Get(bool) = %v, %v; expected true, true", val, ok)
+	}
+	if val, ok := rep.Get("float"); !ok || val != 3.14 {
+		t.Errorf("Get(float) = %v, %v; expected 3.14, true", val, ok)
+	}
+	if val, ok := rep.Get("bytes"); !ok || string(val.([]byte)) != "world" {
+		t.Errorf("Get(bytes) = %v, %v; expected world, true", val, ok)
+	}
+
+	// Verify GetString returns string representations
+	if str, ok := rep.GetString("int"); !ok || str != "42" {
+		t.Errorf("GetString(int) = %v, %v; expected 42, true", str, ok)
+	}
+	if str, ok := rep.GetString("bool"); !ok || str != "true" {
+		t.Errorf("GetString(bool) = %v, %v; expected true, true", str, ok)
+	}
+
+	// Verify ReplaceAll produces identical substitutions as Set
+	input := "str={str} int={int} bool={bool} float={float} bytes={bytes}"
+	expected := "str=hello int=42 bool=true float=3.14 bytes=world"
+	actual := rep.ReplaceAll(input, "")
+	if actual != expected {
+		t.Errorf("ReplaceAll got %q, expected %q", actual, expected)
+	}
+
+	// Compare with Replacer using Set
+	repSet := NewReplacer()
+	repSet.Set("str", "hello")
+	repSet.Set("int", int64(42))
+	repSet.Set("bool", true)
+	repSet.Set("float", 3.14)
+	repSet.Set("bytes", []byte("world"))
+	actualSet := repSet.ReplaceAll(input, "")
+	if actualSet != actual {
+		t.Errorf("Typed setters result %q != Set result %q", actual, actualSet)
+	}
+}
+
+func BenchmarkReplacerAllocations(b *testing.B) {
+	rep := NewEmptyReplacer()
+	rep.SetString("str", "hello")
+	rep.SetInt("int", 12345)
+	rep.SetBool("bool", true)
+	rep.SetFloat("float", 3.14159)
+	rep.SetBytes("bytes", []byte("world"))
+
+	input := "greeting={str} num={int} flag={bool} pi={float} payload={bytes}"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = rep.ReplaceAll(input, "")
+	}
+}
+
+func BenchmarkReplacerSetTyped(b *testing.B) {
+	rep := NewEmptyReplacer()
+	bytesVal := []byte("world")
+	rep.SetString("str", "hello")
+	rep.SetInt("int", 12345)
+	rep.SetBool("bool", true)
+	rep.SetFloat("float", 3.14159)
+	rep.SetBytes("bytes", bytesVal)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rep.SetString("str", "hello")
+		rep.SetInt("int", 12345)
+		rep.SetBool("bool", true)
+		rep.SetFloat("float", 3.14159)
+		rep.SetBytes("bytes", bytesVal)
 	}
 }
