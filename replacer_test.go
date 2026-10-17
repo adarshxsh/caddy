@@ -239,7 +239,6 @@ func TestReplacerSet(t *testing.T) {
 
 func TestReplacerReplaceKnown(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		providers: []replacementProvider{
 			// split our possible vars to two functions (to test if both functions are called)
 			ReplacerFunc(func(key string) (val any, ok bool) {
@@ -312,7 +311,6 @@ func TestReplacerReplaceKnown(t *testing.T) {
 
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		static: map[string]any{
 			"key1": "val1",
 			"key2": "val2",
@@ -527,6 +525,81 @@ func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
 		static:    make(map[string]any),
-		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestReplacerConstructorsAndCapacity(t *testing.T) {
+	repl := NewReplacer()
+	if repl == nil {
+		t.Fatal("NewReplacer returned nil")
+	}
+	if len(repl.providers) != 3 {
+		t.Errorf("Expected 3 providers in NewReplacer, got %d", len(repl.providers))
+	}
+	if cap(repl.providers) < 3 {
+		t.Errorf("Expected providers capacity >= 3 in NewReplacer, got %d", cap(repl.providers))
+	}
+
+	emptyRepl := NewEmptyReplacer()
+	if emptyRepl == nil {
+		t.Fatal("NewEmptyReplacer returned nil")
+	}
+	if len(emptyRepl.providers) != 1 {
+		t.Errorf("Expected 1 provider in NewEmptyReplacer, got %d", len(emptyRepl.providers))
+	}
+	if cap(emptyRepl.providers) < 1 {
+		t.Errorf("Expected providers capacity >= 1 in NewEmptyReplacer, got %d", cap(emptyRepl.providers))
+	}
+
+	withoutFileRepl := repl.WithoutFile()
+	if withoutFileRepl == nil {
+		t.Fatal("WithoutFile returned nil")
+	}
+	if len(withoutFileRepl.providers) != 2 {
+		t.Errorf("Expected 2 providers in WithoutFile, got %d", len(withoutFileRepl.providers))
+	}
+
+	// Verify Set and Get operate on value-embedded mapMutex without panics
+	withoutFileRepl.Set("key1", "val1")
+	if val, ok := withoutFileRepl.GetString("key1"); !ok || val != "val1" {
+		t.Errorf("Expected 'val1', got '%s' (found: %v)", val, ok)
+	}
+}
+
+func TestReplacerConcurrentOperations(t *testing.T) {
+	repl := NewReplacer()
+	var wg sync.WaitGroup
+
+	const goroutines = 20
+	const iterations = 50
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			key := fmt.Sprintf("key_%d", id)
+			prefixKey := fmt.Sprintf("pref_%d_val", id)
+
+			for j := 0; j < iterations; j++ {
+				repl.Set(key, j)
+				repl.Set(prefixKey, "prefixed")
+
+				val, ok := repl.Get(key)
+				if ok && val != nil {
+					_ = ToString(val)
+				}
+
+				_, _ = repl.GetString(prefixKey)
+
+				if j%2 == 0 {
+					repl.Delete(key)
+				} else {
+					repl.DeleteByPrefix(fmt.Sprintf("pref_%d_", id))
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
