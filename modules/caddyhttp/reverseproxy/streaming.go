@@ -219,6 +219,14 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		timeoutc = timer.C
 	}
 
+	var closeOnce sync.Once
+	closeConns := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+			backConn.Close()
+		})
+	}
+
 	// when a stream timeout is encountered, no error will be read from errc
 	// a buffer size of 2 will allow both the read and write goroutines to send the error and exit
 	// see: https://github.com/caddyserver/caddy/issues/7418
@@ -226,14 +234,24 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+
+	copiersDone := 0
+	for copiersDone < 2 {
+		select {
+		case err := <-errc:
+			copiersDone++
+			if err != nil {
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				closeConns()
+			}
+		case time := <-timeoutc:
+			if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", time))
+			}
+			closeConns()
+			timeoutc = nil
 		}
 	}
 }
@@ -381,19 +399,26 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 // The caller should call the returned delete() function when the
 // connection is done to remove it from memory.
 func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (del func()) {
+	if h.connectionsMu == nil {
+		return func() {}
+	}
 	h.connectionsMu.Lock()
-	h.connections[conn] = openConnection{conn, gracefulClose}
+	if h.connections != nil {
+		h.connections[conn] = openConnection{conn, gracefulClose}
+	}
 	h.connectionsMu.Unlock()
 	return func() {
 		h.connectionsMu.Lock()
-		delete(h.connections, conn)
-		// if there is no connection left before the connections close timer fires
-		if len(h.connections) == 0 && h.connectionsCloseTimer != nil {
-			// we release the timer that holds the reference to Handler
-			if (*h.connectionsCloseTimer).Stop() {
-				h.logger.Debug("stopped streaming connections close timer - all connections are already closed")
+		if h.connections != nil {
+			delete(h.connections, conn)
+			// if there is no connection left before the connections close timer fires
+			if len(h.connections) == 0 && h.connectionsCloseTimer != nil {
+				// we release the timer that holds the reference to Handler
+				if (*h.connectionsCloseTimer).Stop() {
+					h.logger.Debug("stopped streaming connections close timer - all connections are already closed")
+				}
+				h.connectionsCloseTimer = nil
 			}
-			h.connectionsCloseTimer = nil
 		}
 		h.connectionsMu.Unlock()
 	}
@@ -636,6 +661,10 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
@@ -646,14 +675,24 @@ type switchProtocolCopier struct {
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
-	errc <- err
+	if err == nil {
+		if cw, ok := c.user.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	c.wg.Done()
+	errc <- err
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
-	errc <- err
+	if err == nil {
+		if cw, ok := c.backend.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	c.wg.Done()
+	errc <- err
 }
 
 func (c switchProtocolCopier) buffer() []byte {
