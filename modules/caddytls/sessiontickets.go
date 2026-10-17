@@ -23,7 +23,9 @@ import (
 	"log"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -54,9 +56,16 @@ type SessionTicketService struct {
 	mu          *sync.Mutex
 }
 
+func (s *SessionTicketService) initMutex() {
+	if atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&s.mu))) == nil {
+		m := new(sync.Mutex)
+		atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&s.mu)), nil, unsafe.Pointer(m))
+	}
+}
+
 func (s *SessionTicketService) provision(ctx caddy.Context) error {
 	s.configs = make(map[*tls.Config]struct{})
-	s.mu = new(sync.Mutex)
+	s.initMutex()
 
 	// establish sane defaults
 	if s.RotationInterval == 0 {
@@ -92,17 +101,36 @@ func (s *SessionTicketService) provision(ctx caddy.Context) error {
 // stop() is called. If start() was already called, this
 // is a no-op.
 func (s *SessionTicketService) start() error {
+	if s == nil {
+		return nil
+	}
+	s.initMutex()
+
+	s.mu.Lock()
 	if s.stopChan != nil {
+		s.mu.Unlock()
 		return nil
 	}
 	s.stopChan = make(chan struct{})
+	s.mu.Unlock()
 
 	// initializing the key source gives us our
 	// initial key(s) to start with; if successful,
 	// we need to be sure to call Next() so that
 	// the key source can know when it is done
+	if s.keySource == nil {
+		s.mu.Lock()
+		close(s.stopChan)
+		s.stopChan = nil
+		s.mu.Unlock()
+		return fmt.Errorf("stek key source is nil")
+	}
 	initialKeys, err := s.keySource.Initialize(s)
 	if err != nil {
+		s.mu.Lock()
+		close(s.stopChan)
+		s.stopChan = nil
+		s.mu.Unlock()
 		return fmt.Errorf("setting STEK module configuration: %v", err)
 	}
 
@@ -126,22 +154,35 @@ func (s *SessionTicketService) stayUpdated() {
 		}
 	}()
 
+	s.initMutex()
+
+	s.mu.Lock()
+	stopChan := s.stopChan
+	s.mu.Unlock()
+
+	if stopChan == nil {
+		return
+	}
+
 	// this call is essential when Initialize()
 	// returns without error, because the stop
 	// channel is the only way the key source
 	// will know when to clean up
-	keysChan := s.keySource.Next(s.stopChan)
+	keysChan := s.keySource.Next(stopChan)
 
 	for {
 		select {
-		case newKeys := <-keysChan:
+		case newKeys, ok := <-keysChan:
+			if !ok {
+				return
+			}
 			s.mu.Lock()
 			s.currentKeys = newKeys
 			for cfg := range s.configs {
 				cfg.SetSessionTicketKeys(newKeys)
 			}
 			s.mu.Unlock()
-		case <-s.stopChan:
+		case <-stopChan:
 			return
 		}
 	}
@@ -149,8 +190,17 @@ func (s *SessionTicketService) stayUpdated() {
 
 // stop terminates the key rotation goroutine.
 func (s *SessionTicketService) stop() {
+	if s == nil {
+		return
+	}
+	s.initMutex()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.stopChan != nil {
 		close(s.stopChan)
+		s.stopChan = nil
 	}
 }
 
@@ -162,12 +212,15 @@ func (s *SessionTicketService) stop() {
 // or if ticket key rotation is disabled, this
 // function is a no-op.
 func (s *SessionTicketService) register(cfg *tls.Config) {
-	if s.Disabled || s.DisableRotation {
+	if s == nil || s.Disabled || s.DisableRotation {
 		return
 	}
+	s.initMutex()
 	s.mu.Lock()
 	cfg.SetSessionTicketKeys(s.currentKeys)
-	s.configs[cfg] = struct{}{}
+	if s.configs != nil {
+		s.configs[cfg] = struct{}{}
+	}
 	s.mu.Unlock()
 }
 
@@ -176,11 +229,14 @@ func (s *SessionTicketService) register(cfg *tls.Config) {
 // session tickets are disabled or if ticket key rotation
 // is disabled, this function is a no-op.
 func (s *SessionTicketService) unregister(cfg *tls.Config) {
-	if s.Disabled || s.DisableRotation {
+	if s == nil || s.Disabled || s.DisableRotation {
 		return
 	}
+	s.initMutex()
 	s.mu.Lock()
-	delete(s.configs, cfg)
+	if s.configs != nil {
+		delete(s.configs, cfg)
+	}
 	s.mu.Unlock()
 }
 
