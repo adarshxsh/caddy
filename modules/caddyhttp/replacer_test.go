@@ -15,10 +15,12 @@
 package caddyhttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -296,3 +298,76 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestRequestBodyPlaceholderPoolingAndCaching(t *testing.T) {
+	bodyString := "hello request body world!"
+	req := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(bytes.NewBufferString(bodyString)))
+	repl := NewTestReplacer(req)
+
+	// 1. First evaluation: should lease buffer from pool, read body, cache on context, and replace req.Body
+	val, ok := repl.GetString("http.request.body")
+	if !ok || val != bodyString {
+		t.Fatalf("expected %q, got %q (ok=%t)", bodyString, val, ok)
+	}
+
+	// Verify cached bytes in context
+	cached := GetVar(req.Context(), bodyBytesVarKey)
+	if cachedBytes, ok := cached.([]byte); !ok || string(cachedBytes) != bodyString {
+		t.Fatalf("expected context cached bytes %q, got %v", bodyString, cached)
+	}
+
+	// 2. Duplicate evaluation with base64: should reuse cached bytes from context without new I/O
+	b64Val, ok := repl.GetString("http.request.body_base64")
+	expectedB64 := "aGVsbG8gcmVxdWVzdCBib2R5IHdvcmxkIQ=="
+	if !ok || b64Val != expectedB64 {
+		t.Fatalf("expected base64 %q, got %q (ok=%t)", expectedB64, b64Val, ok)
+	}
+
+	// 3. Downstream handler reads req.Body
+	readBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read req.Body downstream: %v", err)
+	}
+	if string(readBytes) != bodyString {
+		t.Fatalf("downstream read mismatch: expected %q, got %q", bodyString, string(readBytes))
+	}
+
+	// 4. Downstream handler or server closes req.Body -> recycles buffer
+	err = req.Body.Close()
+	if err != nil {
+		t.Fatalf("unexpected error closing req.Body: %v", err)
+	}
+
+	// 5. Subsequent evaluation after Close(): should still return cached result from context
+	val2, ok2 := repl.GetString("http.request.body")
+	if !ok2 || val2 != bodyString {
+		t.Fatalf("expected %q after Close(), got %q (ok=%t)", bodyString, val2, ok2)
+	}
+}
+
+func TestRequestBodyPlaceholderNilAndEmpty(t *testing.T) {
+	// Nil body
+	reqNil := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqNil.Body = nil
+	replNil := NewTestReplacer(reqNil)
+
+	valNil, okNil := replNil.GetString("http.request.body")
+	if !okNil || valNil != "" {
+		t.Fatalf("expected empty string for nil body, got %q", valNil)
+	}
+
+	// Empty body
+	reqEmpty := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(bytes.NewReader(nil)))
+	replEmpty := NewTestReplacer(reqEmpty)
+
+	valEmpty, okEmpty := replEmpty.GetString("http.request.body")
+	if !okEmpty || valEmpty != "" {
+		t.Fatalf("expected empty string for empty body, got %q", valEmpty)
+	}
+
+	b64Empty, okB64 := replEmpty.GetString("http.request.body_base64")
+	if !okB64 || b64Empty != "" {
+		t.Fatalf("expected empty base64 string for empty body, got %q", b64Empty)
+	}
+}
+
