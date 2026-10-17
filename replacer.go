@@ -38,7 +38,7 @@ func NewReplacer() *Replacer {
 	}
 	rep.providers = []replacementProvider{
 		globalDefaultReplacementProvider{},
-		fileReplacementProvider{},
+		newFileReplacementProvider(),
 		ReplacerFunc(rep.fromStatic),
 	}
 	return rep
@@ -349,27 +349,58 @@ type replacementProvider interface {
 
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
-type fileReplacementProvider struct{}
+type fileReplacementProvider struct {
+	cache *sync.Map
+}
+
+func newFileReplacementProvider() fileReplacementProvider {
+	return fileReplacementProvider{
+		cache: new(sync.Map),
+	}
+}
 
 func (f fileReplacementProvider) replace(key string) (any, bool) {
 	if !strings.HasPrefix(key, filePrefix) {
 		return nil, false
 	}
 
+	if f.cache != nil {
+		if val, ok := f.cache.Load(key); ok {
+			return val, true
+		}
+	}
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
 	filename := key[len(filePrefix):]
 	maxSize := 1024 * 1024
-	body, err := readFileIntoBuffer(filename, maxSize)
+	err := readFileIntoBuffer(filename, maxSize, buf)
 	if err != nil {
-		wd, _ := os.Getwd()
 		Log().Error("placeholder: failed to read file",
 			zap.String("file", filename),
 			zap.String("working_dir", wd),
 			zap.Error(err))
+		if f.cache != nil {
+			f.cache.Store(key, nil)
+		}
 		return nil, true
 	}
-	body = bytes.TrimSuffix(body, []byte("\n"))
-	body = bytes.TrimSuffix(body, []byte("\r"))
-	return string(body), true
+
+	body := buf.Bytes()
+	if len(body) > 0 && body[len(body)-1] == '\n' {
+		body = body[:len(body)-1]
+	}
+	if len(body) > 0 && body[len(body)-1] == '\r' {
+		body = body[:len(body)-1]
+	}
+
+	val := string(body)
+	if f.cache != nil {
+		f.cache.Store(key, val)
+	}
+	return val, true
 }
 
 // globalDefaultReplacementProvider handles replacements
@@ -394,8 +425,6 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	case "system.os":
 		return runtime.GOOS, true
 	case "system.wd":
-		// OK if there is an error; just return empty string
-		wd, _ := os.Getwd()
 		return wd, true
 	case "system.arch":
 		return runtime.GOARCH, true
@@ -420,18 +449,20 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 }
 
 // readFileIntoBuffer reads the file at filePath into a size limited buffer.
-func readFileIntoBuffer(filename string, size int) ([]byte, error) {
+func readFileIntoBuffer(filename string, size int, buf *bytes.Buffer) error {
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer file.Close()
 
 	// io.LimitReader ensures we never read more than 'size' bytes.
-	// io.ReadAll starts with a small buffer and grows it as needed,
-	// preventing a massive 1MB allocation for small files.
-	return io.ReadAll(io.LimitReader(file, int64(size)))
+	_, err = buf.ReadFrom(io.LimitReader(file, int64(size)))
+	return err
 }
+
+var wd, wderr = os.Getwd()
+
 
 // ReplacementFunc is a function that is called when a
 // replacement is being performed. It receives the

@@ -530,3 +530,58 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestReplacerFileCaching(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "caddy_replacer_cache_test_*.txt")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	content1 := "hello world\n"
+	if _, err := tmpFile.WriteString(content1); err != nil {
+		t.Fatalf("failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	repl := NewReplacer()
+	key := "file." + tmpFile.Name()
+
+	// First evaluation: reads from disk
+	val1, ok := repl.GetString(key)
+	if !ok || val1 != "hello world" {
+		t.Fatalf("expected 'hello world', got %q (ok=%v)", val1, ok)
+	}
+
+	// Modify file on disk
+	content2 := "updated content\n"
+	if err := os.WriteFile(tmpFile.Name(), []byte(content2), 0644); err != nil {
+		t.Fatalf("failed to overwrite temp file: %v", err)
+	}
+
+	// Second evaluation on same replacer: returns cached value
+	val2, ok := repl.GetString(key)
+	if !ok || val2 != "hello world" {
+		t.Fatalf("expected cached 'hello world', got %q (ok=%v)", val2, ok)
+	}
+
+	// Evaluation on new replacer: reads updated content
+	repl2 := NewReplacer()
+	val3, ok := repl2.GetString(key)
+	if !ok || val3 != "updated content" {
+		t.Fatalf("expected updated content 'updated content', got %q (ok=%v)", val3, ok)
+	}
+}
+
+func TestReplacerSystemWd(t *testing.T) {
+	repl := NewReplacer()
+	val, ok := repl.GetString("system.wd")
+	if !ok {
+		t.Fatalf("expected system.wd to be recognized")
+	}
+	expectedWd, _ := os.Getwd()
+	if val != expectedWd {
+		t.Fatalf("expected system.wd to be %q, got %q", expectedWd, val)
+	}
+}
+

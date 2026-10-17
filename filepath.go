@@ -17,7 +17,6 @@
 package caddy
 
 import (
-	"os"
 	"path/filepath"
 )
 
@@ -35,5 +34,3 @@ func FastAbs(path string) (string, error) {
 	}
 	return filepath.Join(wd, path), nil
 }
-
-var wd, wderr = os.Getwd()
