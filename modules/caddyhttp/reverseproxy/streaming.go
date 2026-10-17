@@ -143,6 +143,11 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 	}
 
+	if isWebsocket(req) {
+		conn = &lockedReadWriteCloser{ReadWriteCloser: conn}
+		backConn = &lockedReadWriteCloser{ReadWriteCloser: backConn}
+	}
+
 	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
 	backConnCloseCh := make(chan struct{})
 	go func() {
@@ -565,6 +570,20 @@ func newMaskKey() [4]byte {
 func isWebsocket(r *http.Request) bool {
 	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+// lockedReadWriteCloser wraps an io.ReadWriteCloser with a Mutex
+// to serialize Write operations, preventing concurrent write collisions
+// and frame corruption while keeping Read and Close unblocked.
+type lockedReadWriteCloser struct {
+	io.ReadWriteCloser
+	writeMu sync.Mutex
+}
+
+func (l *lockedReadWriteCloser) Write(p []byte) (int, error) {
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
+	return l.ReadWriteCloser.Write(p)
 }
 
 // openConnection maps an open connection to
