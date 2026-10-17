@@ -15,12 +15,15 @@
 package caddy
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 )
 
 func TestReplacer(t *testing.T) {
@@ -520,6 +523,106 @@ func BenchmarkReplacer(b *testing.B) {
 				rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
+	}
+}
+
+func TestReplacerZeroAllocationsOnNoChange(t *testing.T) {
+	rep := testReplacer()
+
+	cases := []struct {
+		name    string
+		input   string
+		empty   string
+		isKnown bool
+	}{
+		{
+			name:  "unclosed open brace",
+			input: "foo{bar",
+		},
+		{
+			name:  "unmatched closing brace",
+			input: "foo}bar",
+		},
+		{
+			name:  "plain string without braces",
+			input: "simple string",
+		},
+		{
+			name:    "unknown placeholder in ReplaceKnown",
+			input:   "foo{unknown}bar",
+			isKnown: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var actual string
+			if tc.isKnown {
+				actual = rep.ReplaceKnown(tc.input, tc.empty)
+			} else {
+				actual = rep.ReplaceAll(tc.input, tc.empty)
+			}
+
+			if actual != tc.input {
+				t.Fatalf("expected '%s', got '%s'", tc.input, actual)
+			}
+
+			if unsafe.StringData(actual) != unsafe.StringData(tc.input) {
+				t.Errorf("expected string pointer to be identical to input, but was different")
+			}
+
+			allocs := testing.AllocsPerRun(100, func() {
+				if tc.isKnown {
+					_ = rep.ReplaceKnown(tc.input, tc.empty)
+				} else {
+					_ = rep.ReplaceAll(tc.input, tc.empty)
+				}
+			})
+
+			if allocs > 0 {
+				t.Errorf("expected 0 allocations for non-modifying input '%s', got %f", tc.input, allocs)
+			}
+		})
+	}
+}
+
+func TestReplacerOversizedBuffer(t *testing.T) {
+	rep := NewEmptyReplacer()
+	rep.Set("key", "value")
+
+	// Create a string larger than 64 KB
+	largeInput := strings.Repeat("a", 70*1024) + "{key}" + strings.Repeat("b", 100)
+	expected := strings.Repeat("a", 70*1024) + "value" + strings.Repeat("b", 100)
+
+	result := rep.ReplaceAll(largeInput, "")
+	if result != expected {
+		t.Fatalf("expected result length %d, got %d", len(expected), len(result))
+	}
+
+	// Verify that buffer put into pool with capacity > 64KB is not retained
+	bigBuf := new(bytes.Buffer)
+	bigBuf.Grow(70 * 1024)
+	putBuf(bigBuf)
+
+	freshBuf := getBuf(0)
+	if freshBuf.Cap() > maxBufferCapacity {
+		t.Errorf("expected pooled buffer capacity <= %d, got %d", maxBufferCapacity, freshBuf.Cap())
+	}
+	putBuf(freshBuf)
+}
+
+func TestReplacerBufferReuse(t *testing.T) {
+	rep := NewEmptyReplacer()
+	rep.Set("foo", "bar")
+
+	input := "hello {foo} world"
+	expected := "hello bar world"
+
+	for i := 0; i < 1000; i++ {
+		res := rep.ReplaceAll(input, "")
+		if res != expected {
+			t.Fatalf("iteration %d: expected '%s', got '%s'", i, expected, res)
+		}
 	}
 }
 
