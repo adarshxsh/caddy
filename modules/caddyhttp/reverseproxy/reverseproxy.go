@@ -186,6 +186,10 @@ type Handler struct {
 	// by the previous config closing. Default: no delay.
 	StreamCloseDelay caddy.Duration `json:"stream_close_delay,omitempty"`
 
+	// Configures keepalive options for upgraded bidirectional streams, including
+	// kernel TCP socket keepalives and periodic L7 WebSocket ping frames.
+	StreamKeepAlive *StreamKeepAlive `json:"stream_keepalive,omitempty"`
+
 	// If configured, rewrites the copy of the upstream request.
 	// Allows changing the request method and URI (path and query).
 	// Since the rewrite is applied to the copy, it does not persist
@@ -1624,6 +1628,16 @@ func statusError(err error) error {
 		statusCode = 499
 	}
 	return caddyhttp.Error(statusCode, err)
+}
+
+// StreamKeepAlive configures L4 TCP socket keepalives and L7 WebSocket ping heartbeats
+// for upgraded streaming connections.
+type StreamKeepAlive struct {
+	// ProbeInterval enables OS kernel TCP socket keepalives on upgraded connections.
+	ProbeInterval caddy.Duration `json:"probe_interval,omitempty"`
+
+	// PingInterval enables periodic L7 WebSocket Ping frame heartbeats during idle periods.
+	PingInterval caddy.Duration `json:"ping_interval,omitempty"`
 }
 
 // LoadBalancing has parameters related to load balancing.
