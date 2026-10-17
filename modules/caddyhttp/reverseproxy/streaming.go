@@ -204,6 +204,27 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
+	if c, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = c.SetDeadline(time.Time{})
+	} else {
+		if c, ok := conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = c.SetReadDeadline(time.Time{})
+		}
+		if c, ok := conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = c.SetWriteDeadline(time.Time{})
+		}
+	}
+	if c, ok := backConn.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = c.SetDeadline(time.Time{})
+	} else {
+		if c, ok := backConn.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = c.SetReadDeadline(time.Time{})
+		}
+		if c, ok := backConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = c.SetWriteDeadline(time.Time{})
+		}
+	}
+
 	spc := switchProtocolCopier{
 		user:       conn,
 		backend:    backConn,

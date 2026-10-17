@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +278,64 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestTCPRWTimeoutConn_SetDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	rawConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { rawConn.Close() })
+
+	tcpConn, ok := rawConn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("expected *net.TCPConn, got %T", rawConn)
+	}
+
+	conn := &tcpRWTimeoutConn{
+		TCPConn:      tcpConn,
+		readTimeout:  5 * time.Minute,
+		writeTimeout: 5 * time.Minute,
+	}
+
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	if conn.readTimeout != 0 {
+		t.Errorf("expected readTimeout to be 0, got %v", conn.readTimeout)
+	}
+
+	if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	if conn.writeTimeout != 0 {
+		t.Errorf("expected writeTimeout to be 0, got %v", conn.writeTimeout)
+	}
+
+	conn.readTimeout = 5 * time.Minute
+	conn.writeTimeout = 5 * time.Minute
+
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	if conn.readTimeout != 0 || conn.writeTimeout != 0 {
+		t.Errorf("expected readTimeout and writeTimeout to be 0, got readTimeout=%v writeTimeout=%v", conn.readTimeout, conn.writeTimeout)
 	}
 }
