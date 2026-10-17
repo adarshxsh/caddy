@@ -58,11 +58,16 @@ func (p CustomCertSelectionPolicy) SelectCertificate(hello *tls.ClientHelloInfo,
 
 nextChoice:
 	for _, cert := range choices {
+		leaf := getOrParseLeaf(&cert)
+
 		if len(p.SerialNumber) > 0 {
+			if leaf == nil {
+				continue
+			}
 			var found bool
 			for _, sn := range p.SerialNumber {
 				snInt := sn.Int // avoid taking address of iteration variable (gosec warning)
-				if cert.Leaf.SerialNumber.Cmp(&snInt) == 0 {
+				if leaf.SerialNumber.Cmp(&snInt) == 0 {
 					found = true
 					break
 				}
@@ -73,17 +78,21 @@ nextChoice:
 		}
 
 		if len(p.SubjectOrganization) > 0 {
+			if leaf == nil {
+				continue
+			}
 			found := slices.ContainsFunc(p.SubjectOrganization, func(s string) bool {
-				return slices.Contains(cert.Leaf.Subject.Organization, s)
+				return slices.Contains(leaf.Subject.Organization, s)
 			})
 			if !found {
 				continue
 			}
 		}
 
-		if p.PublicKeyAlgorithm != PublicKeyAlgorithm(x509.UnknownPublicKeyAlgorithm) &&
-			PublicKeyAlgorithm(cert.Leaf.PublicKeyAlgorithm) != p.PublicKeyAlgorithm {
-			continue
+		if p.PublicKeyAlgorithm != PublicKeyAlgorithm(x509.UnknownPublicKeyAlgorithm) {
+			if leaf == nil || PublicKeyAlgorithm(leaf.PublicKeyAlgorithm) != p.PublicKeyAlgorithm {
+				continue
+			}
 		}
 
 		if len(p.AnyTag) > 0 {
@@ -111,6 +120,24 @@ nextChoice:
 	}
 
 	return certmagic.DefaultCertificateSelector(hello, viable)
+}
+
+func getOrParseLeaf(cert *certmagic.Certificate) *x509.Certificate {
+	if cert == nil {
+		return nil
+	}
+	if cert.Leaf != nil {
+		return cert.Leaf
+	}
+	if len(cert.Certificate.Certificate) == 0 {
+		return nil
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate.Certificate[0])
+	if err != nil {
+		return nil
+	}
+	cert.Leaf = leaf
+	return leaf
 }
 
 // UnmarshalCaddyfile sets up the CustomCertSelectionPolicy from Caddyfile tokens. Syntax:
