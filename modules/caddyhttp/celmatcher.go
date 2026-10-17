@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -274,8 +275,21 @@ func (m MatchExpression) caddyPlaceholderFunc(lhs, rhs ref.Val) ref.Val {
 		)
 	}
 
+	key := string(phStr)
 	repl := celReq.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	val, _ := repl.Get(string(phStr))
+	val, _ := repl.Get(key)
+
+	if str, isStr := val.(string); isStr {
+		if strings.HasSuffix(key, "status_code") || strings.HasSuffix(key, "status") {
+			if i, err := strconv.ParseInt(str, 10, 64); err == nil {
+				return types.Int(i)
+			}
+		} else if strings.HasSuffix(key, "is_transport_error") {
+			if b, err := strconv.ParseBool(str); err == nil {
+				return types.Bool(b)
+			}
+		}
+	}
 
 	return m.ta.NativeToValue(val)
 }

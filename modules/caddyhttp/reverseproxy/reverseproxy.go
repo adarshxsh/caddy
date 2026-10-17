@@ -551,7 +551,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	defer func() {
 		// total proxying duration, including time spent on LB and retries
 		repl.Set("http.reverse_proxy.duration", time.Since(start))
-		repl.Set("http.reverse_proxy.duration_ms", time.Since(start).Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
+		repl.SetFloat64("http.reverse_proxy.duration_ms", time.Since(start).Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
 	}()
 
 	// in the proxy loop, each iteration is an attempt to proxy the request,
@@ -587,7 +587,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	// number of retries actually performed
-	repl.Set("http.reverse_proxy.retries", retries)
+	repl.SetInt("http.reverse_proxy.retries", retries)
 
 	if proxyErr != nil {
 		return statusError(proxyErr)
@@ -666,13 +666,13 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	caddyhttp.SetVar(r.Context(), dialInfoVarKey, dialInfo)
 
 	// set placeholders with information about this upstream
-	repl.Set("http.reverse_proxy.upstream.address", dialInfo.String())
-	repl.Set("http.reverse_proxy.upstream.hostport", dialInfo.Address)
-	repl.Set("http.reverse_proxy.upstream.host", dialInfo.Host)
-	repl.Set("http.reverse_proxy.upstream.port", dialInfo.Port)
-	repl.Set("http.reverse_proxy.upstream.requests", upstream.Host.NumRequests())
-	repl.Set("http.reverse_proxy.upstream.max_requests", upstream.MaxRequests)
-	repl.Set("http.reverse_proxy.upstream.fails", upstream.Host.Fails())
+	repl.SetString("http.reverse_proxy.upstream.address", dialInfo.String())
+	repl.SetString("http.reverse_proxy.upstream.hostport", dialInfo.Address)
+	repl.SetString("http.reverse_proxy.upstream.host", dialInfo.Host)
+	repl.SetString("http.reverse_proxy.upstream.port", dialInfo.Port)
+	repl.SetInt("http.reverse_proxy.upstream.requests", upstream.Host.NumRequests())
+	repl.SetInt("http.reverse_proxy.upstream.max_requests", upstream.MaxRequests)
+	repl.SetInt("http.reverse_proxy.upstream.fails", upstream.Host.Fails())
 
 	// mutate request headers according to this upstream;
 	// because we're in a retry loop, we have to copy headers
@@ -1074,7 +1074,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 
 	// duration until upstream wrote response headers (roundtrip duration)
 	repl.Set("http.reverse_proxy.upstream.latency", duration)
-	repl.Set("http.reverse_proxy.upstream.latency_ms", duration.Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
+	repl.SetFloat64("http.reverse_proxy.upstream.latency_ms", duration.Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
 
 	// update circuit breaker on current conditions
 	if di.Upstream.cb != nil {
@@ -1108,10 +1108,10 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 	// leak into the next retry evaluation
 	repl.DeleteByPrefix("http.reverse_proxy.header.")
 	for field, value := range res.Header {
-		repl.Set("http.reverse_proxy.header."+field, strings.Join(value, ","))
+		repl.SetString("http.reverse_proxy.header."+field, strings.Join(value, ","))
 	}
-	repl.Set("http.reverse_proxy.status_code", res.StatusCode)
-	repl.Set("http.reverse_proxy.status_text", res.Status)
+	repl.SetInt("http.reverse_proxy.status_code", res.StatusCode)
+	repl.SetString("http.reverse_proxy.status_text", res.Status)
 
 	// check if the response matches a retry match entry; if so,
 	// close the body and return a retryable error so the request
@@ -1293,7 +1293,7 @@ func (h *Handler) finalizeResponse(
 
 	// total duration spent proxying, including writing response body
 	repl.Set("http.reverse_proxy.upstream.duration", time.Since(start))
-	repl.Set("http.reverse_proxy.upstream.duration_ms", time.Since(start).Seconds()*1e3)
+	repl.SetFloat64("http.reverse_proxy.upstream.duration_ms", time.Since(start).Seconds()*1e3)
 
 	if len(res.Trailer) == announcedTrailers {
 		copyHeader(rw.Header(), res.Trailer)
@@ -1363,7 +1363,7 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 			// {rp.is_transport_error} to decide whether to retry
 			repl, _ := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 			if repl != nil {
-				repl.Set("http.reverse_proxy.is_transport_error", true)
+				repl.SetBool("http.reverse_proxy.is_transport_error", true)
 				defer repl.Delete("http.reverse_proxy.is_transport_error")
 			}
 
