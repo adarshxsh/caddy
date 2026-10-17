@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -361,3 +363,110 @@ func TestClientAuthenticationProvision(t *testing.T) {
 		})
 	}
 }
+
+func TestGetEncryptedClientHelloKeysConcurrentRotation(t *testing.T) {
+	cfgJSON := []byte(`{
+		"apps": {
+			"tls": {
+				"encrypted_client_hello": {
+					"configs": [
+						{"public_name": "example.com"}
+					]
+				}
+			}
+		}
+	}`)
+
+	if err := caddy.Load(cfgJSON, true); err != nil {
+		t.Fatalf("loading config: %v", err)
+	}
+	defer caddy.Stop()
+
+	ctx := caddy.ActiveContext()
+	tlsAppIface, err := ctx.App("tls")
+	if err != nil {
+		t.Fatalf("loading tls app: %v", err)
+	}
+	tlsApp := tlsAppIface.(*TLS)
+
+	policies := ConnectionPolicies{}
+	tlsCfg := policies.TLSConfig(ctx)
+
+	if tlsCfg.GetEncryptedClientHelloKeys == nil {
+		t.Fatalf("expected GetEncryptedClientHelloKeys to be non-nil")
+	}
+
+	keys, err := tlsCfg.GetEncryptedClientHelloKeys(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("GetEncryptedClientHelloKeys error: %v", err)
+	}
+	if len(keys) == 0 {
+		t.Fatalf("expected initial keys to be non-empty")
+	}
+
+	stopWriter := make(chan struct{})
+	var wgWriter sync.WaitGroup
+	wgWriter.Add(1)
+	go func() {
+		defer wgWriter.Done()
+		for {
+			select {
+			case <-stopWriter:
+				return
+			default:
+				tlsApp.EncryptedClientHello.configsMu.Lock()
+				tlsApp.EncryptedClientHello.updateKeyList()
+				tlsApp.EncryptedClientHello.configsMu.Unlock()
+			}
+		}
+	}()
+
+	var wgReaders sync.WaitGroup
+	for r := 0; r < 5; r++ {
+		wgReaders.Add(1)
+		go func() {
+			defer wgReaders.Done()
+			for i := 0; i < 500; i++ {
+				k, err := tlsCfg.GetEncryptedClientHelloKeys(&tls.ClientHelloInfo{})
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				for _, key := range k {
+					_ = len(key.Config)
+					_ = len(key.PrivateKey)
+					_ = key.SendAsRetry
+				}
+			}
+		}()
+	}
+
+	wgReaders.Wait()
+	close(stopWriter)
+	wgWriter.Wait()
+
+	t.Run("empty or nil stdlibReady", func(t *testing.T) {
+		emptyECH := &ECH{
+			configsMu: new(sync.RWMutex),
+		}
+		emptyTLSApp := &TLS{
+			EncryptedClientHello: emptyECH,
+		}
+
+		emptyECH.configsMu.RLock()
+		clonedNil := slices.Clone(emptyTLSApp.EncryptedClientHello.stdlibReady)
+		emptyECH.configsMu.RUnlock()
+		if clonedNil != nil {
+			t.Errorf("expected nil for nil stdlibReady, got %v", clonedNil)
+		}
+
+		emptyECH.stdlibReady = []tls.EncryptedClientHelloKey{}
+		emptyECH.configsMu.RLock()
+		clonedEmpty := slices.Clone(emptyTLSApp.EncryptedClientHello.stdlibReady)
+		emptyECH.configsMu.RUnlock()
+		if clonedEmpty == nil || len(clonedEmpty) != 0 {
+			t.Errorf("expected empty non-nil slice, got %v", clonedEmpty)
+		}
+	})
+}
+
