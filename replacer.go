@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -294,6 +295,11 @@ func ToString(val any) string {
 		return ""
 	case string:
 		return v
+	case *string:
+		if v != nil {
+			return *v
+		}
+		return ""
 	case fmt.Stringer:
 		return v.String()
 	case error:
@@ -372,6 +378,41 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 	return string(body), true
 }
 
+// timeCache holds pre-formatted strings for second-granularity time placeholders.
+type timeCache struct {
+	unixSec   int64
+	tzOffset  int
+	http      string
+	commonLog string
+	year      string
+	unix      string
+}
+
+var defaultTimeCache atomic.Pointer[timeCache]
+
+func getTimeCache(now time.Time) *timeCache {
+	unixSec := now.Unix()
+	_, tzOffset := now.Zone()
+
+	cached := defaultTimeCache.Load()
+	if cached != nil && cached.unixSec == unixSec && cached.tzOffset == tzOffset {
+		return cached
+	}
+
+	// Compute new cached values for this second
+	newCache := &timeCache{
+		unixSec:   unixSec,
+		tzOffset:  tzOffset,
+		http:      now.UTC().Format(http.TimeFormat),
+		commonLog: now.Format("02/Jan/2006:15:04:05 -0700"),
+		year:      strconv.Itoa(now.Year()),
+		unix:      strconv.FormatInt(unixSec, 10),
+	}
+
+	defaultTimeCache.Store(newCache)
+	return newCache
+}
+
 // globalDefaultReplacementProvider handles replacements
 // that can be used in any context, such as system variables,
 // time, or environment variables.
@@ -405,13 +446,13 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 		// According to the comment for http.TimeFormat, the timezone must be in UTC
 		// to generate the correct format.
 		// https://github.com/caddyserver/caddy/issues/5773
-		return nowFunc().UTC().Format(http.TimeFormat), true
+		return &getTimeCache(nowFunc()).http, true
 	case "time.now.common_log":
-		return nowFunc().Format("02/Jan/2006:15:04:05 -0700"), true
+		return &getTimeCache(nowFunc()).commonLog, true
 	case "time.now.year":
-		return strconv.Itoa(nowFunc().Year()), true
+		return &getTimeCache(nowFunc()).year, true
 	case "time.now.unix":
-		return strconv.FormatInt(nowFunc().Unix(), 10), true
+		return &getTimeCache(nowFunc()).unix, true
 	case "time.now.unix_ms":
 		return strconv.FormatInt(nowFunc().UnixNano()/int64(time.Millisecond), 10), true
 	}
