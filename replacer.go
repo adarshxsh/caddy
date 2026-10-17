@@ -180,11 +180,7 @@ func (r *Replacer) replace(input, empty string,
 		return input, nil
 	}
 
-	var sb strings.Builder
-
-	// it is reasonable to assume that the output
-	// will be approximately as long as the input
-	sb.Grow(len(input))
+	var buf *bytes.Buffer
 
 	// iterate the input to find each placeholder
 	var lastWriteCursor int
@@ -196,7 +192,10 @@ scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
-			sb.WriteString(input[lastWriteCursor : i-1])
+			if buf == nil {
+				buf = getBuf(len(input))
+			}
+			buf.WriteString(input[lastWriteCursor : i-1])
 			lastWriteCursor = i
 			continue
 		}
@@ -209,6 +208,7 @@ scan:
 
 		// too many unclosed placeholders in absolutely ridiculous input can be extremely slow (issue #4170)
 		if unclosedCount > 100 {
+			putBuf(buf)
 			return "", fmt.Errorf("too many unclosed placeholders")
 		}
 
@@ -229,9 +229,6 @@ scan:
 			end += nextEnd + 1
 		}
 
-		// write the substring from the last cursor to this point
-		sb.WriteString(input[lastWriteCursor:i])
-
 		// trim opening bracket
 		key := input[i+1 : end]
 
@@ -240,12 +237,12 @@ scan:
 		if !found {
 			// placeholder is unknown (unrecognized); handle accordingly
 			if errOnUnknown {
+				putBuf(buf)
 				return "", fmt.Errorf("unrecognized placeholder %s%s%s",
 					string(phOpen), key, string(phClose))
 			} else if !treatUnknownAsEmpty {
 				// if treatUnknownAsEmpty is true, we'll handle an empty
 				// val later; so only continue otherwise
-				lastWriteCursor = i
 				continue
 			}
 		}
@@ -255,6 +252,7 @@ scan:
 			var err error
 			val, err = f(key, val)
 			if err != nil {
+				putBuf(buf)
 				return "", err
 			}
 		}
@@ -264,15 +262,23 @@ scan:
 
 		// write the value; if it's empty, either return
 		// an error or write a default value
+		if valStr == "" && errOnEmpty {
+			putBuf(buf)
+			return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
+				string(phOpen), key, string(phClose))
+		}
+
+		if buf == nil {
+			buf = getBuf(len(input))
+		}
+		buf.WriteString(input[lastWriteCursor:i])
+
 		if valStr == "" {
-			if errOnEmpty {
-				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
-					string(phOpen), key, string(phClose))
-			} else if empty != "" {
-				sb.WriteString(empty)
+			if empty != "" {
+				buf.WriteString(empty)
 			}
 		} else {
-			sb.WriteString(valStr)
+			buf.WriteString(valStr)
 		}
 
 		// advance cursor to end of placeholder
@@ -280,10 +286,43 @@ scan:
 		lastWriteCursor = i + 1
 	}
 
-	// flush any unwritten remainder
-	sb.WriteString(input[lastWriteCursor:])
+	if buf == nil {
+		return input, nil
+	}
 
-	return sb.String(), nil
+	// flush any unwritten remainder
+	buf.WriteString(input[lastWriteCursor:])
+
+	out := buf.String()
+	putBuf(buf)
+	return out, nil
+}
+
+const maxBufferCapacity = 64 * 1024
+
+var replacerBufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+func getBuf(grow int) *bytes.Buffer {
+	buf := replacerBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if grow > 0 {
+		buf.Grow(grow)
+	}
+	return buf
+}
+
+func putBuf(buf *bytes.Buffer) {
+	if buf == nil {
+		return
+	}
+	if buf.Cap() <= maxBufferCapacity {
+		buf.Reset()
+		replacerBufPool.Put(buf)
+	}
 }
 
 // ToString returns val as a string, as efficiently as possible.
