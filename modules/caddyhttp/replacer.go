@@ -81,12 +81,8 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// cookies
 			if strings.HasPrefix(key, reqCookieReplPrefix) {
 				name := key[len(reqCookieReplPrefix):]
-				for _, cookie := range req.Cookies() {
-					if strings.EqualFold(name, cookie.Name) {
-						// always return true, since the cookie might
-						// be present only in some requests
-						return cookie.Value, true
-					}
+				if val, ok := getCookieVal(req.Header, name); ok {
+					return val, true
 				}
 			}
 
@@ -319,15 +315,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil || idx < 0 {
 					return "", false
 				}
-				reqHost, _, err := net.SplitHostPort(req.Host)
-				if err != nil {
-					reqHost = req.Host // OK; assume there was no port
-				}
-				hostLabels := strings.Split(reqHost, ".")
-				if idx >= len(hostLabels) {
-					return "", true
-				}
-				return strings.ToLower(hostLabels[len(hostLabels)-idx-1]), true
+				return getHostLabel(req.Host, idx)
 			}
 
 			// path parts
@@ -337,17 +325,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil {
 					return "", false
 				}
-				pathParts := strings.Split(req.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
-				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
-					return "", true
-				}
-				return pathParts[idx], true
+				return getPathSegment(req.URL.Path, idx)
 			}
 
 			// orig uri path parts
@@ -358,17 +336,10 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 					return "", false
 				}
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				pathParts := strings.Split(or.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
-				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
+				if or.URL == nil {
 					return "", true
 				}
-				return pathParts[idx], true
+				return getPathSegment(or.URL.Path, idx)
 			}
 
 			// middleware variables
@@ -597,3 +568,78 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+func getCookieVal(headers http.Header, name string) (string, bool) {
+	for _, line := range headers["Cookie"] {
+		for line != "" {
+			var part string
+			part, line, _ = strings.Cut(line, ";")
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			cookieName, val, ok := strings.Cut(part, "=")
+			if !ok {
+				cookieName = part
+				val = ""
+			} else {
+				if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+					val = val[1 : len(val)-1]
+				}
+			}
+			cookieName = strings.TrimSpace(cookieName)
+			if cookieName == "" {
+				continue
+			}
+			if strings.EqualFold(name, cookieName) {
+				return val, true
+			}
+		}
+	}
+	return "", false
+}
+
+func getHostLabel(host string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	reqHost := host
+	if strings.IndexByte(host, ':') != -1 {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			reqHost = h
+		}
+	}
+
+	end := len(reqHost)
+	currentIdx := 0
+	for i := len(reqHost) - 1; i >= -1; i-- {
+		if i == -1 || reqHost[i] == '.' {
+			if currentIdx == idx {
+				label := reqHost[i+1 : end]
+				return strings.ToLower(label), true
+			}
+			currentIdx++
+			end = i
+		}
+	}
+	return "", true
+}
+
+func getPathSegment(pathStr string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	if strings.HasPrefix(pathStr, "/") {
+		pathStr = pathStr[1:]
+	}
+	currentIdx := 0
+	for pathStr != "" {
+		var segment string
+		segment, pathStr, _ = strings.Cut(pathStr, "/")
+		if currentIdx == idx {
+			return segment, true
+		}
+		currentIdx++
+	}
+	return "", true
+}
