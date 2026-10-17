@@ -36,6 +36,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -223,34 +224,18 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return id.String(), true
 
 			case "http.request.body":
-				if req.Body == nil {
+				bodyBytes := getRequestBody(req)
+				if bodyBytes == nil {
 					return "", true
 				}
-				// normally net/http will close the body for us, but since we
-				// are replacing it with a fake one, we have to ensure we close
-				// the real body ourselves when we're done
-				defer req.Body.Close()
-				// read the request body into a buffer (can't pool because we
-				// don't know its lifetime and would have to make a copy anyway)
-				buf := new(bytes.Buffer)
-				_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-				req.Body = io.NopCloser(buf)  // replace real body with buffered data
-				return buf.String(), true
+				return string(bodyBytes), true
 
 			case "http.request.body_base64":
-				if req.Body == nil {
+				bodyBytes := getRequestBody(req)
+				if bodyBytes == nil {
 					return "", true
 				}
-				// normally net/http will close the body for us, but since we
-				// are replacing it with a fake one, we have to ensure we close
-				// the real body ourselves when we're done
-				defer req.Body.Close()
-				// read the request body into a buffer (can't pool because we
-				// don't know its lifetime and would have to make a copy anyway)
-				buf := new(bytes.Buffer)
-				_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-				req.Body = io.NopCloser(buf)  // replace real body with buffered data
-				return base64.StdEncoding.EncodeToString(buf.Bytes()), true
+				return base64.StdEncoding.EncodeToString(bodyBytes), true
 
 			// original request, before any internal changes
 			case "http.request.orig_method":
@@ -597,3 +582,82 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+const bodyBytesVarKey = "http.request.body_bytes"
+
+var reqBodyBufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+type bodyBufferReader struct {
+	reader io.Reader
+	buf    *bytes.Buffer
+	once   sync.Once
+	closed bool
+}
+
+func (b *bodyBufferReader) Read(p []byte) (int, error) {
+	if b.closed {
+		return 0, io.EOF
+	}
+	return b.reader.Read(p)
+}
+
+func (b *bodyBufferReader) Close() error {
+	b.once.Do(func() {
+		b.closed = true
+		if b.buf != nil {
+			b.buf.Reset()
+			reqBodyBufPool.Put(b.buf)
+			b.buf = nil
+		}
+	})
+	return nil
+}
+
+func getRequestBody(req *http.Request) []byte {
+	if req == nil || req.Body == nil || req.Body == http.NoBody {
+		return nil
+	}
+
+	varMap, ok := req.Context().Value(VarsCtxKey).(map[string]any)
+	if !ok || varMap == nil {
+		varMap = make(map[string]any)
+		*req = *req.WithContext(context.WithValue(req.Context(), VarsCtxKey, varMap))
+	} else if cachedBytes, ok := varMap[bodyBytesVarKey].([]byte); ok {
+		return cachedBytes
+	}
+
+	if req.ContentLength == 0 {
+		varMap[bodyBytesVarKey] = []byte{}
+		req.Body = http.NoBody
+		return []byte{}
+	}
+
+	buf := reqBodyBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	defer req.Body.Close()
+
+	_, _ = io.Copy(buf, req.Body)
+
+	if buf.Len() == 0 {
+		buf.Reset()
+		reqBodyBufPool.Put(buf)
+		varMap[bodyBytesVarKey] = []byte{}
+		req.Body = http.NoBody
+		return []byte{}
+	}
+
+	cachedBytes := bytes.Clone(buf.Bytes())
+	varMap[bodyBytesVarKey] = cachedBytes
+
+	req.Body = &bodyBufferReader{
+		reader: bytes.NewReader(buf.Bytes()),
+		buf:    buf,
+	}
+
+	return cachedBytes
+}
