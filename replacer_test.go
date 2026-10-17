@@ -485,11 +485,25 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 }
 
 func BenchmarkReplacer(b *testing.B) {
+	b.Run("creation/NewReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = NewReplacer()
+		}
+	})
+
+	b.Run("creation/NewEmptyReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = NewEmptyReplacer()
+		}
+	})
+
 	type testCase struct {
 		name, input, empty string
 	}
 
-	rep := testReplacer()
+	rep := NewReplacer()
 	rep.Set("str", "a string")
 	rep.Set("int", 123.456)
 
@@ -503,8 +517,20 @@ func BenchmarkReplacer(b *testing.B) {
 			input: `str={str}`,
 		},
 		{
+			name:  "system placeholder",
+			input: `{system.os}`,
+		},
+		{
 			name:  "int replacement",
 			input: `int={int}`,
+		},
+		{
+			name:  "multi placeholder",
+			input: `str={str} int={int}`,
+		},
+		{
+			name:  "complex multi placeholder",
+			input: `str={str} os={system.os} int={int} host={system.hostname}`,
 		},
 		{
 			name:  "placeholder",
@@ -516,8 +542,134 @@ func BenchmarkReplacer(b *testing.B) {
 		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
+			}
+		})
+	}
+
+	b.Run("parallel/ReplaceAll_single", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				rep.ReplaceAll("str={str}", "")
+			}
+		})
+	})
+
+	b.Run("parallel/ReplaceAll_multi", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				rep.ReplaceAll("str={str} os={system.os} int={int}", "")
+			}
+		})
+	})
+
+	b.Run("parallel/GetString", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _ = rep.GetString("str")
+			}
+		})
+	})
+
+	b.Run("parallel/Set_Get", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				i++
+				key := "var"
+				rep.Set(key, i)
+				_, _ = rep.Get(key)
+			}
+		})
+	})
+}
+
+func TestReplacerAllocations(t *testing.T) {
+	rep := NewReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	tests := []struct {
+		name     string
+		maxAlloc float64
+		fn       func()
+	}{
+		{
+			name:     "NewReplacer",
+			maxAlloc: 8.0,
+			fn: func() {
+				_ = NewReplacer()
+			},
+		},
+		{
+			name:     "NewEmptyReplacer",
+			maxAlloc: 8.0,
+			fn: func() {
+				_ = NewEmptyReplacer()
+			},
+		},
+		{
+			name:     "Set existing key",
+			maxAlloc: 1.0,
+			fn: func() {
+				rep.Set("str", "a string")
+			},
+		},
+		{
+			name:     "Get static key",
+			maxAlloc: 0.0,
+			fn: func() {
+				_, _ = rep.Get("str")
+			},
+		},
+		{
+			name:     "GetString static key",
+			maxAlloc: 0.0,
+			fn: func() {
+				_, _ = rep.GetString("str")
+			},
+		},
+		{
+			name:     "ReplaceAll no placeholders",
+			maxAlloc: 0.0,
+			fn: func() {
+				_ = rep.ReplaceAll("simple string without placeholders", "")
+			},
+		},
+		{
+			name:     "ReplaceAll single placeholder",
+			maxAlloc: 1.0,
+			fn: func() {
+				_ = rep.ReplaceAll("str={str}", "")
+			},
+		},
+		{
+			name:     "ReplaceAll multi placeholder",
+			maxAlloc: 3.0,
+			fn: func() {
+				_ = rep.ReplaceAll("str={str} int={int} str2={str}", "")
+			},
+		},
+		{
+			name:     "ReplaceKnown multi placeholder",
+			maxAlloc: 2.0,
+			fn: func() {
+				_ = rep.ReplaceKnown("str={str} int={int}", "")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, tc.fn)
+			if allocs > tc.maxAlloc {
+				t.Errorf("%s: expected <= %f allocations per run, got %f", tc.name, tc.maxAlloc, allocs)
 			}
 		})
 	}

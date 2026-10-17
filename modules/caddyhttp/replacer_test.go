@@ -296,3 +296,115 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkHTTPReplacer(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	repl := caddy.NewReplacer()
+	localAddr, _ := net.ResolveTCPAddr("tcp", "192.168.159.1:80")
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, http.LocalAddrContextKey, localAddr)
+	req = req.WithContext(ctx)
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+
+	clientCert := []byte(`-----BEGIN CERTIFICATE-----
+MIIB9jCCAV+gAwIBAgIBAjANBgkqhkiG9w0BAQsFADAYMRYwFAYDVQQDDA1DYWRk
+eSBUZXN0IENBMB4XDTE4MDcyNDIxMzUwNVoXDTI8MDcyMTIxMzUwNVowHTEbMBkG
+A1UEAwwSY2xpZW50LmxvY2FsZG9tYWluMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCB
+iQKBgQDFDEpzF0ew68teT3xDzcUxVFaTII+jXH1ftHXxxP4BEYBU4q90qzeKFneF
+z83I0nC0WAQ45ZwHfhLMYHFzHPdxr6+jkvKPASf0J2v2HDJuTM1bHBbik5Ls5eq+
+fVZDP8o/VHKSBKxNs8Goc2NTsr5b07QTIpkRStQK+RJALk4x9QIDAQABo0swSTAJ
+BgNVHRMEAjAAMAsGA1UdDwQEAwIHgDAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8A
+AAEwEwYDVR0lBAwwCgYIKwYBBQUHAwIwDQYJKoZIhvcNAQELBQADgYEANSjz2Sk+
+eqp31wM9il1n+guTNyxJd+FzVAH+hCZE5K+tCgVDdVFUlDEHHbS/wqb2PSIoouLV
+3Q9fgDkiUod+uIK0IynzIKvw+Cjg+3nx6NQ0IM0zo8c7v398RzB4apbXKZyeeqUH
+9fNwfEi+OoXR6s+upSKobCmLGLGi9Na5s5g=
+-----END CERTIFICATE-----`)
+
+	block, _ := pem.Decode(clientCert)
+	if block != nil {
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err == nil {
+			req.TLS = &tls.ConnectionState{
+				Version:                    tls.VersionTLS13,
+				HandshakeComplete:          true,
+				ServerName:                 "example.com",
+				CipherSuite:                tls.TLS_AES_256_GCM_SHA384,
+				PeerCertificates:           []*x509.Certificate{cert},
+				NegotiatedProtocol:         "h2",
+				NegotiatedProtocolIsMutual: true,
+			}
+		}
+	}
+
+	res := httptest.NewRecorder()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	for _, bm := range []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "uri",
+			input: "{http.request.uri}",
+		},
+		{
+			name:  "host",
+			input: "{http.request.host}",
+		},
+		{
+			name:  "tls_cipher",
+			input: "{http.request.tls.cipher_suite}",
+		},
+		{
+			name:  "tls_fingerprint",
+			input: "{http.request.tls.client.fingerprint}",
+		},
+		{
+			name:  "multi_request",
+			input: "{http.request.method} {http.request.host} {http.request.uri}",
+		},
+		{
+			name:  "multi_url",
+			input: "{http.request.scheme}://{http.request.hostport}{http.request.uri.path}",
+		},
+		{
+			name:  "multi_tls",
+			input: "{http.request.tls.version} {http.request.tls.cipher_suite} {http.request.tls.client.subject}",
+		},
+	} {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				repl.ReplaceAll(bm.input, "")
+			}
+		})
+	}
+
+	b.Run("parallel/uri", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				repl.ReplaceAll("{http.request.uri}", "")
+			}
+		})
+	})
+
+	b.Run("parallel/multi_request", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				repl.ReplaceAll("{http.request.method} {http.request.host} {http.request.uri}", "")
+			}
+		})
+	})
+
+	b.Run("parallel/GetString_uri", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _ = repl.GetString("http.request.uri")
+			}
+		})
+	})
+}
