@@ -296,3 +296,98 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestZeroAllocReplacerLookups(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/profile", nil)
+	ctx := context.WithValue(req.Context(), OriginalRequestCtxKey, *req)
+	req = req.WithContext(ctx)
+	req.Host = "Sub.Domain.Example.Com:8080"
+	req.Header.Add("Cookie", "session=abc123xyz; Theme=dark; Quoted=\"val123\"")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Test cookie lookups
+	testsCookie := []struct {
+		key    string
+		expect string
+		ok     bool
+	}{
+		{"http.request.cookie.session", "abc123xyz", true},
+		{"http.request.cookie.THEME", "dark", true},
+		{"http.request.cookie.quoted", "val123", true},
+		{"http.request.cookie.nonexistent", "", false},
+	}
+	for _, tc := range testsCookie {
+		val, ok := repl.GetString(tc.key)
+		if ok != tc.ok || val != tc.expect {
+			t.Errorf("Cookie %s: expected (%q, %t), got (%q, %t)", tc.key, tc.expect, tc.ok, val, ok)
+		}
+	}
+
+	// Test host label lookups
+	testsHost := []struct {
+		key    string
+		expect string
+		ok     bool
+	}{
+		{"http.request.host.labels.0", "com", true},
+		{"http.request.host.labels.1", "example", true},
+		{"http.request.host.labels.2", "domain", true},
+		{"http.request.host.labels.3", "sub", true},
+		{"http.request.host.labels.4", "", true},
+		{"http.request.host.labels.-1", "", false},
+		{"http.request.host.labels.abc", "", false},
+	}
+	for _, tc := range testsHost {
+		val, ok := repl.GetString(tc.key)
+		if ok != tc.ok || val != tc.expect {
+			t.Errorf("Host label %s: expected (%q, %t), got (%q, %t)", tc.key, tc.expect, tc.ok, val, ok)
+		}
+	}
+
+	// Test path segment lookups
+	testsPath := []struct {
+		key    string
+		expect string
+		ok     bool
+	}{
+		{"http.request.uri.path.0", "api", true},
+		{"http.request.uri.path.1", "v1", true},
+		{"http.request.uri.path.2", "users", true},
+		{"http.request.uri.path.3", "profile", true},
+		{"http.request.uri.path.4", "", true},
+		{"http.request.uri.path.-1", "", false},
+		{"http.request.uri.path.xyz", "", false},
+		{"http.request.orig_uri.path.0", "api", true},
+		{"http.request.orig_uri.path.1", "v1", true},
+	}
+	for _, tc := range testsPath {
+		val, ok := repl.GetString(tc.key)
+		if ok != tc.ok || val != tc.expect {
+			t.Errorf("Path segment %s: expected (%q, %t), got (%q, %t)", tc.key, tc.expect, tc.ok, val, ok)
+		}
+	}
+
+	// Verify zero allocations during helper evaluation
+	allocsCookie := testing.AllocsPerRun(100, func() {
+		_, _ = getCookieVal(req.Header, "session")
+	})
+	if allocsCookie != 0 {
+		t.Errorf("Expected 0 allocations for getCookieVal, got %f", allocsCookie)
+	}
+
+	allocsHost := testing.AllocsPerRun(100, func() {
+		_, _ = getHostLabel("sub.domain.example.com", 1)
+	})
+	if allocsHost != 0 {
+		t.Errorf("Expected 0 allocations for getHostLabel, got %f", allocsHost)
+	}
+
+	allocsPath := testing.AllocsPerRun(100, func() {
+		_, _ = getPathSegment(req.URL.Path, 2)
+	})
+	if allocsPath != 0 {
+		t.Errorf("Expected 0 allocations for getPathSegment, got %f", allocsPath)
+	}
+}
