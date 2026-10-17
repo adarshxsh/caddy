@@ -3,10 +3,14 @@ package reverseproxy
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +84,139 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+type mockFlushingResponseWriter struct {
+	http.ResponseWriter
+	mu         sync.Mutex
+	writeCount int
+	flushCount int
+	buf        bytes.Buffer
+}
+
+func (m *mockFlushingResponseWriter) Header() http.Header {
+	return http.Header{}
+}
+
+func (m *mockFlushingResponseWriter) WriteHeader(statusCode int) {}
+
+func (m *mockFlushingResponseWriter) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.writeCount++
+	return m.buf.Write(p)
+}
+
+func (m *mockFlushingResponseWriter) Flush() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.flushCount++
+}
+
+func (m *mockFlushingResponseWriter) counts() (writes, flushes int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.writeCount, m.flushCount
+}
+
+func TestH2ReadWriteCloserLatencyBounded(t *testing.T) {
+	mockRW := &mockFlushingResponseWriter{}
+	mlw := &maxLatencyWriter{
+		dst:     mockRW,
+		flush:   func() error { mockRW.Flush(); return nil },
+		latency: 50 * time.Millisecond,
+		logger:  zap.NewNop(),
+	}
+	rwc := h2ReadWriteCloser{
+		ReadCloser: io.NopCloser(strings.NewReader("")),
+		writer:     mlw,
+	}
+	defer rwc.Close()
+
+	// Perform consecutive rapid writes within the 50ms latency window
+	for i := 0; i < 5; i++ {
+		_, err := rwc.Write([]byte("data"))
+		if err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+	}
+
+	writes, flushes := mockRW.counts()
+	if writes != 5 {
+		t.Errorf("expected 5 writes, got %d", writes)
+	}
+	if flushes != 0 {
+		t.Errorf("expected 0 immediate flushes during rapid writes, got %d", flushes)
+	}
+
+	// Wait for delayed flush timer
+	time.Sleep(100 * time.Millisecond)
+
+	_, flushes = mockRW.counts()
+	if flushes != 1 {
+		t.Errorf("expected 1 aggregated flush after latency window, got %d", flushes)
+	}
+}
+
+func TestH2ReadWriteCloserImmediateFlush(t *testing.T) {
+	mockRW := &mockFlushingResponseWriter{}
+	mlw := &maxLatencyWriter{
+		dst:     mockRW,
+		flush:   func() error { mockRW.Flush(); return nil },
+		latency: -1,
+		logger:  zap.NewNop(),
+	}
+	rwc := h2ReadWriteCloser{
+		ReadCloser: io.NopCloser(strings.NewReader("")),
+		writer:     mlw,
+	}
+	defer rwc.Close()
+
+	for i := 0; i < 3; i++ {
+		_, err := rwc.Write([]byte("data"))
+		if err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+	}
+
+	writes, flushes := mockRW.counts()
+	if writes != 3 {
+		t.Errorf("expected 3 writes, got %d", writes)
+	}
+	if flushes != 3 {
+		t.Errorf("expected 3 immediate flushes for negative latency, got %d", flushes)
+	}
+}
+
+func TestH2ReadWriteCloserFlushOnClose(t *testing.T) {
+	mockRW := &mockFlushingResponseWriter{}
+	mlw := &maxLatencyWriter{
+		dst:     mockRW,
+		flush:   func() error { mockRW.Flush(); return nil },
+		latency: 10 * time.Second, // long latency so timer won't fire during test
+		logger:  zap.NewNop(),
+	}
+	rwc := h2ReadWriteCloser{
+		ReadCloser: io.NopCloser(strings.NewReader("")),
+		writer:     mlw,
+	}
+
+	_, err := rwc.Write([]byte("data"))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	_, flushes := mockRW.counts()
+	if flushes != 0 {
+		t.Errorf("expected 0 flushes before close, got %d", flushes)
+	}
+
+	err = rwc.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	_, flushes = mockRW.counts()
+	if flushes != 1 {
+		t.Errorf("expected 1 flush upon connection close, got %d", flushes)
+	}
+}
