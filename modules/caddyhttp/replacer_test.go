@@ -296,3 +296,68 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPReplacerMemoization(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar?a=1&b=2", nil)
+	req.RemoteAddr = "192.168.1.50:54321"
+
+	origReq := *req
+	ctx := context.WithValue(req.Context(), OriginalRequestCtxKey, origReq)
+	req = req.WithContext(ctx)
+
+	repl := NewTestReplacer(req)
+
+	keys := []struct {
+		key    string
+		expect string
+	}{
+		{key: "http.request.remote.host/24", expect: "192.168.1.0/24"},
+		{key: "http.request.uri.prefixed_query", expect: "?a=1&b=2"},
+		{key: "http.request.orig_uri.prefixed_query", expect: "?a=1&b=2"},
+	}
+
+	for _, tc := range keys {
+		// First lookup computes and memoizes
+		val, ok := repl.GetString(tc.key)
+		if !ok || val != tc.expect {
+			t.Fatalf("First lookup for %s failed: got %q (ok=%t), expected %q", tc.key, val, ok, tc.expect)
+		}
+
+		// Subsequent lookups must yield 0 heap allocations
+		allocs := testing.AllocsPerRun(100, func() {
+			v, ok := repl.GetString(tc.key)
+			if !ok || v != tc.expect {
+				t.Fatalf("Repeated lookup for %s failed: got %q (ok=%t)", tc.key, v, ok)
+			}
+		})
+		if allocs > 0 {
+			t.Errorf("Expected 0 allocations on repeated lookup for %s, got %f", tc.key, allocs)
+		}
+	}
+
+	// Verify invalid placeholder formats do not store error states in cache
+	invalidKey := "http.request.remote.host/999"
+	val, ok := repl.GetString(invalidKey)
+	if !ok || val != "" {
+		t.Fatalf("Invalid placeholder %s returned got %q (ok=%t), expected empty", invalidKey, val, ok)
+	}
+
+	// Verify concurrent lookups are thread-safe
+	done := make(chan struct{})
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for j := 0; j < 100; j++ {
+				for _, tc := range keys {
+					v, ok := repl.GetString(tc.key)
+					if !ok || v != tc.expect {
+						t.Errorf("Concurrent lookup for %s got %q", tc.key, v)
+					}
+				}
+			}
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+}
