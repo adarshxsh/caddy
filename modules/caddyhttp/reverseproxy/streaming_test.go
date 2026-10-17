@@ -49,7 +49,8 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 		bufferSize: 7,
 	}
 
-	buf := copier.buffer()
+	buf, release := copier.getBuffer()
+	defer release()
 	if got := len(buf); got != 7 {
 		t.Fatalf("buffer len = %d, want 7", got)
 	}
@@ -68,10 +69,47 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 
 func TestSwitchProtocolCopierDefaultBufferSize(t *testing.T) {
 	copier := switchProtocolCopier{}
-	buf := copier.buffer()
+	buf, release := copier.getBuffer()
+	defer release()
 	if got := len(buf); got != defaultBufferSize {
 		t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
 	}
+}
+
+func TestSwitchProtocolCopierGetBufferPool(t *testing.T) {
+	t.Run("default buffer size uses pool", func(t *testing.T) {
+		copiers := []switchProtocolCopier{
+			{}, // bufferSize == 0
+			{bufferSize: -1},
+			{bufferSize: defaultBufferSize},
+		}
+
+		for _, c := range copiers {
+			buf, release := c.getBuffer()
+			if got := len(buf); got != defaultBufferSize {
+				t.Fatalf("buffer len = %d, want %d for copier %+v", got, defaultBufferSize, c)
+			}
+			// Verify release returns buffer to streamingBufPool
+			release()
+
+			pBuf := streamingBufPool.Get().(*[]byte)
+			if pBuf == nil || len(*pBuf) != defaultBufferSize {
+				t.Fatalf("expected buffer from pool with size %d", defaultBufferSize)
+			}
+			streamingBufPool.Put(pBuf)
+		}
+	})
+
+	t.Run("custom buffer size allocates directly", func(t *testing.T) {
+		customSize := 8192
+		copier := switchProtocolCopier{bufferSize: customSize}
+		buf, release := copier.getBuffer()
+		if got := len(buf); got != customSize {
+			t.Fatalf("buffer len = %d, want %d", got, customSize)
+		}
+		// release for custom size should be no-op and not panic
+		release()
+	})
 }
 
 type nopReadWriteCloser struct {
