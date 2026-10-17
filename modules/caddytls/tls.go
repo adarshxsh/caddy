@@ -722,6 +722,20 @@ func (t *TLS) alpnValuesForServerNames(dnsNames []string) map[string][]string {
 	return result
 }
 
+func (t *TLS) serverNamesSnapshot() map[string]struct{} {
+	if t == nil || t.serverNamesMu == nil {
+		return nil
+	}
+	t.serverNamesMu.Lock()
+	defer t.serverNamesMu.Unlock()
+
+	snapshot := make(map[string]struct{}, len(t.serverNames))
+	for name := range t.serverNames {
+		snapshot[name] = struct{}{}
+	}
+	return snapshot
+}
+
 // OrderedHTTPSRRALPN returns the HTTPS RR ALPN values in preferred order.
 func OrderedHTTPSRRALPN(alpnSet map[string]struct{}) []string {
 	if len(alpnSet) == 0 {

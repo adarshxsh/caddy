@@ -1,12 +1,17 @@
 package caddytls
 
 import (
+	"context"
 	"encoding/base64"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
 
 	"github.com/libdns/libdns"
+	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func TestRegisterServerNamesWithALPN(t *testing.T) {
@@ -62,4 +67,51 @@ func TestECHDNSPublisherPublishedSvcParams(t *testing.T) {
 	if !reflect.DeepEqual(got["ech"], []string{wantECH}) {
 		t.Fatalf("unexpected ECH params: got %v want %v", got["ech"], wantECH)
 	}
+}
+
+func TestPublishECHConfigsConcurrentRegisterServerNames(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	tlsApp := &TLS{
+		ctx:           ctx,
+		serverNames:   make(map[string]serverNameRegistration),
+		serverNamesMu: new(sync.Mutex),
+		EncryptedClientHello: &ECH{
+			configsMu: new(sync.RWMutex),
+			Publication: []*ECHPublication{
+				{
+					Domains: nil, // force publishECHConfigs to snapshot t.serverNames
+				},
+			},
+		},
+	}
+
+	logger := zap.NewNop()
+
+	var wg sync.WaitGroup
+	const iterations = 200
+
+	// Writer goroutine: concurrently registers server names
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			tlsApp.RegisterServerNames(
+				[]string{fmt.Sprintf("domain%d.com", i), fmt.Sprintf("sub%d.example.com", i)},
+				[]string{"h2", "h3"},
+			)
+		}
+	}()
+
+	// Reader goroutine: concurrently publishes ECH configs which reads server names snapshot
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = tlsApp.publishECHConfigs(logger)
+		}
+	}()
+
+	wg.Wait()
 }
