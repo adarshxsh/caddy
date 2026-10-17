@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -529,4 +530,125 @@ func testReplacer() Replacer {
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
 	}
+}
+
+func TestTimeCache(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	baseTime := time.Date(2026, 10, 17, 12, 0, 0, 100000000, time.UTC)
+	nowFunc = func() time.Time { return baseTime }
+
+	repl := NewReplacer()
+
+	// 1. Same-second calls return identical values
+	val1, _ := repl.GetString("time.now.http")
+	val2, _ := repl.GetString("time.now.http")
+	if val1 != val2 {
+		t.Errorf("Expected same time.now.http string within same second, got %q vs %q", val1, val2)
+	}
+
+	commonLog1, _ := repl.GetString("time.now.common_log")
+	commonLog2, _ := repl.GetString("time.now.common_log")
+	if commonLog1 != commonLog2 {
+		t.Errorf("Expected same time.now.common_log string within same second, got %q vs %q", commonLog1, commonLog2)
+	}
+
+	year1, _ := repl.GetString("time.now.year")
+	if year1 != "2026" {
+		t.Errorf("Expected year 2026, got %q", year1)
+	}
+
+	unix1, _ := repl.GetString("time.now.unix")
+	expectedUnix := fmt.Sprintf("%d", baseTime.Unix())
+	if unix1 != expectedUnix {
+		t.Errorf("Expected unix timestamp %s, got %q", expectedUnix, unix1)
+	}
+
+	// 2. Advancing time past second boundary updates cache
+	nextSecond := baseTime.Add(1500 * time.Millisecond) // advances by 1.5s
+	nowFunc = func() time.Time { return nextSecond }
+
+	val3, _ := repl.GetString("time.now.http")
+	if val3 == val1 {
+		t.Errorf("Expected time.now.http to update after second boundary, but remained %q", val3)
+	}
+
+	unix2, _ := repl.GetString("time.now.unix")
+	expectedUnix2 := fmt.Sprintf("%d", nextSecond.Unix())
+	if unix2 != expectedUnix2 {
+		t.Errorf("Expected unix timestamp %s, got %q", expectedUnix2, unix2)
+	}
+
+	// 3. Sub-second time placeholders (unix_ms) update accurately
+	msTime1 := baseTime
+	msTime2 := baseTime.Add(100 * time.Millisecond)
+
+	nowFunc = func() time.Time { return msTime1 }
+	msVal1, _ := repl.GetString("time.now.unix_ms")
+
+	nowFunc = func() time.Time { return msTime2 }
+	msVal2, _ := repl.GetString("time.now.unix_ms")
+
+	if msVal1 == msVal2 {
+		t.Errorf("Expected unix_ms to change across sub-second time updates, got %q and %q", msVal1, msVal2)
+	}
+}
+
+func TestTimeCacheConcurrent(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	fixedTime := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	nowFunc = func() time.Time { return fixedTime }
+
+	repl := NewReplacer()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_, _ = repl.GetString("time.now.http")
+				_, _ = repl.GetString("time.now.common_log")
+				_, _ = repl.GetString("time.now.year")
+				_, _ = repl.GetString("time.now.unix")
+				_, _ = repl.GetString("time.now.unix_ms")
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func BenchmarkTimePlaceholderLookups(b *testing.B) {
+	repl := NewReplacer()
+
+	b.Run("time.now.http", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("time.now.http")
+		}
+	})
+
+	b.Run("time.now.common_log", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("time.now.common_log")
+		}
+	})
+
+	b.Run("time.now.year", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("time.now.year")
+		}
+	})
+
+	b.Run("time.now.unix", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("time.now.unix")
+		}
+	})
 }
