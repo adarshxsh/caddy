@@ -296,3 +296,100 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestToLowerASCII(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"version", "version"},
+		{"CLIENT.SUBJECT", "client.subject"},
+		{"client.san.dns_names.0", "client.san.dns_names.0"},
+		{"Cipher_Suite", "cipher_suite"},
+	}
+
+	for _, tt := range tests {
+		got := toLowerASCII(tt.input)
+		if got != tt.expected {
+			t.Errorf("toLowerASCII(%q) = %q; want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestReqTLSReplacerMissingClientCert(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+		ServerName:  "example.com",
+	}
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Test placeholders when no client certificate is provided
+	val, ok := repl.GetString("http.request.tls.client.subject")
+	if !ok || val != "" {
+		t.Errorf("expected empty string for missing client cert subject, got %q (ok=%t)", val, ok)
+	}
+
+	val, ok = repl.GetString("http.request.tls.client.issuer")
+	if !ok || val != "" {
+		t.Errorf("expected empty string for missing client cert issuer, got %q (ok=%t)", val, ok)
+	}
+
+	val, ok = repl.GetString("http.request.tls.client.san.dns_names.0")
+	if !ok || val != "" {
+		t.Errorf("expected empty string for missing client cert dns name, got %q (ok=%t)", val, ok)
+	}
+
+	val, ok = repl.GetString("http.request.tls.version")
+	if !ok || val != "tls1.3" {
+		t.Errorf("expected tls1.3 for tls version, got %q (ok=%t)", val, ok)
+	}
+
+	// Uppercase key test to verify toLowerASCII handles uppercase keys
+	val, ok = repl.GetString("http.request.tls.VERSION")
+	if !ok || val != "tls1.3" {
+		t.Errorf("expected tls1.3 for uppercase tls version key, got %q (ok=%t)", val, ok)
+	}
+}
+
+func TestReqTLSReplacerAllocations(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:            tls.VersionTLS13,
+		CipherSuite:        tls.TLS_AES_256_GCM_SHA384,
+		ServerName:         "example.com",
+		NegotiatedProtocol: "h2",
+	}
+
+	// Verify zero allocations when evaluating placeholders on requests without client certificates
+	zeroAllocKeys := []string{
+		"http.request.tls.client.san.dns_names.0",
+		"http.request.tls.client.san.emails.0",
+		"http.request.tls.client.san.ips.0",
+		"http.request.tls.client.san.uris.0",
+	}
+
+	for _, k := range zeroAllocKeys {
+		// Warmup
+		getReqTLSReplacement(req, k)
+
+		allocs := testing.AllocsPerRun(100, func() {
+			getReqTLSReplacement(req, k)
+		})
+		if allocs > 0 {
+			t.Errorf("expected 0 allocs for key %s on missing client cert, got %f", k, allocs)
+		}
+	}
+
+	// Verify toLowerASCII produces 0 allocs for already-lowercase ASCII string
+	keySuffix := "client.san.dns_names.0"
+	allocsToLower := testing.AllocsPerRun(100, func() {
+		_ = toLowerASCII(keySuffix)
+	})
+	if allocsToLower > 0 {
+		t.Errorf("expected 0 allocs for toLowerASCII on lowercase string, got %f", allocsToLower)
+	}
+}
