@@ -187,30 +187,31 @@ func (s *SessionTicketService) unregister(cfg *tls.Config) {
 // RotateSTEKs rotates the keys in keys by producing a new key and eliding
 // the oldest one. The new slice of keys is returned.
 func (s SessionTicketService) RotateSTEKs(keys [][32]byte) ([][32]byte, error) {
+	if s.MaxKeys <= 0 {
+		return [][32]byte{}, nil
+	}
+
 	// produce a new key
 	newKey, err := s.generateSTEK()
 	if err != nil {
 		return nil, fmt.Errorf("generating STEK: %v", err)
 	}
 
-	// we need to prepend this new key to the list of
-	// keys so that it is preferred, but we need to be
-	// careful that we do not grow the slice larger
-	// than MaxKeys, otherwise we'll be storing one
-	// more key in memory than we expect; so be sure
-	// that the slice does not grow beyond the limit
-	// even for a brief period of time, since there's
-	// no guarantee when that extra allocation will
-	// be overwritten; this is why we first trim the
-	// length to one less the max, THEN prepend the
-	// new key
-	if len(keys) >= s.MaxKeys {
-		keys[len(keys)-1] = [32]byte{} // zero-out memory of oldest key
-		keys = keys[:s.MaxKeys-1]      // trim length of slice
+	numOld := len(keys)
+	if numOld > s.MaxKeys-1 {
+		numOld = s.MaxKeys - 1
 	}
-	keys = append([][32]byte{newKey}, keys...) // prepend new key
+	if numOld < 0 {
+		numOld = 0
+	}
 
-	return keys, nil
+	newKeys := make([][32]byte, 0, 1+numOld)
+	newKeys = append(newKeys, newKey)
+	if numOld > 0 {
+		newKeys = append(newKeys, keys[:numOld]...)
+	}
+
+	return newKeys, nil
 }
 
 // generateSTEK generates key material suitable for use as a
