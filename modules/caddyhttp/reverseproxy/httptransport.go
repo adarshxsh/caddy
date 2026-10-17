@@ -955,6 +955,28 @@ func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
 	return c.TCPConn.Write(b)
 }
 
+func (c *tcpRWTimeoutConn) SetReadDeadline(t time.Time) error {
+	if t.IsZero() {
+		c.readTimeout = 0
+	}
+	return c.TCPConn.SetReadDeadline(t)
+}
+
+func (c *tcpRWTimeoutConn) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		c.writeTimeout = 0
+	}
+	return c.TCPConn.SetWriteDeadline(t)
+}
+
+func (c *tcpRWTimeoutConn) SetDeadline(t time.Time) error {
+	if t.IsZero() {
+		c.readTimeout = 0
+		c.writeTimeout = 0
+	}
+	return c.TCPConn.SetDeadline(t)
+}
+
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
 func decodeBase64DERCert(certStr string) (*x509.Certificate, error) {
 	// decode base64

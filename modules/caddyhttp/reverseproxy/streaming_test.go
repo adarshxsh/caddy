@@ -1,12 +1,18 @@
 package reverseproxy
 
 import (
+	"bufio"
 	"bytes"
 	"io"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +86,91 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+type mockHijacker struct {
+	*httptest.ResponseRecorder
+	clientConn net.Conn
+}
+
+func (m *mockHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return m.clientConn, bufio.NewReadWriter(bufio.NewReader(m.clientConn), bufio.NewWriter(m.clientConn)), nil
+}
+
+func TestHandleUpgradeResponse_ClearsDeadlines(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	clientRaw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientRaw.Close()
+
+	backendRaw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backendRaw.Close()
+
+	frontConn := &tcpRWTimeoutConn{
+		TCPConn:      clientRaw.(*net.TCPConn),
+		readTimeout:  10 * time.Second,
+		writeTimeout: 10 * time.Second,
+	}
+	backConn := &tcpRWTimeoutConn{
+		TCPConn:      backendRaw.(*net.TCPConn),
+		readTimeout:  10 * time.Second,
+		writeTimeout: 10 * time.Second,
+	}
+
+	mh := &mockHijacker{
+		ResponseRecorder: httptest.NewRecorder(),
+		clientConn:       frontConn,
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+
+	res := &http.Response{
+		StatusCode: 101,
+		Header:     make(http.Header),
+		Body:       backConn,
+	}
+	res.Header.Set("Upgrade", "websocket")
+	res.Header.Set("Connection", "Upgrade")
+
+	h := &Handler{
+		connectionsMu: new(sync.Mutex),
+		connections:   make(map[io.ReadWriteCloser]openConnection),
+	}
+	var wg sync.WaitGroup
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		frontConn.Close()
+		backConn.Close()
+	}()
+
+	h.handleUpgradeResponse(zap.NewNop(), &wg, mh, req, res)
+
+	if frontConn.readTimeout != 0 || frontConn.writeTimeout != 0 {
+		t.Errorf("frontConn timeouts not cleared: readTimeout=%v, writeTimeout=%v", frontConn.readTimeout, frontConn.writeTimeout)
+	}
+	if backConn.readTimeout != 0 || backConn.writeTimeout != 0 {
+		t.Errorf("backConn timeouts not cleared: readTimeout=%v, writeTimeout=%v", backConn.readTimeout, backConn.writeTimeout)
+	}
+}
