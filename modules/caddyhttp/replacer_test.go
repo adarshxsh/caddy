@@ -296,3 +296,119 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestQueryAndHeaderReplacerFastPath(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/test?single=foo&multi=bar1&multi=bar2", nil)
+	req.Header.Set("User-Agent", "TestAgent")
+	req.Header["x-non-canonical"] = []string{"custom-value"}
+	req.Header["Accept"] = []string{"text/html", "application/json"}
+
+	rec := httptest.NewRecorder()
+	rec.Header().Set("X-Response-ID", "12345")
+	rec.Header()["x-resp-raw"] = []string{"raw-value"}
+	rec.Header()["Set-Cookie"] = []string{"a=1", "b=2"}
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, rec)
+
+	// 1. Single value query parameter (fast path, no strings.Join)
+	if val, ok := repl.GetString("http.request.uri.query.single"); !ok || val != "foo" {
+		t.Errorf("expected query.single to be 'foo', got %q (ok=%t)", val, ok)
+	}
+
+	// 2. Query map caching: mutate RawQuery on req.URL; subsequent lookups should hit cached map
+	req.URL.RawQuery = "single=changed&multi=changed"
+	if val, ok := repl.GetString("http.request.uri.query.single"); !ok || val != "foo" {
+		t.Errorf("expected cached query.single to remain 'foo', got %q (ok=%t)", val, ok)
+	}
+
+	// 3. Multi-value query parameter (joined with comma)
+	if val, ok := repl.GetString("http.request.uri.query.multi"); !ok || val != "bar1,bar2" {
+		t.Errorf("expected query.multi to be 'bar1,bar2', got %q (ok=%t)", val, ok)
+	}
+
+	// 4. Single-value request header direct map lookup (exact match)
+	if val, ok := repl.GetString("http.request.header.User-Agent"); !ok || val != "TestAgent" {
+		t.Errorf("expected header.User-Agent to be 'TestAgent', got %q (ok=%t)", val, ok)
+	}
+
+	// 5. Direct map lookup for non-canonical map key
+	if val, ok := repl.GetString("http.request.header.x-non-canonical"); !ok || val != "custom-value" {
+		t.Errorf("expected header.x-non-canonical to be 'custom-value', got %q (ok=%t)", val, ok)
+	}
+
+	// 6. Request header canonical fallback (when placeholder is lowercase)
+	if val, ok := repl.GetString("http.request.header.user-agent"); !ok || val != "TestAgent" {
+		t.Errorf("expected header.user-agent to be 'TestAgent', got %q (ok=%t)", val, ok)
+	}
+
+	// 7. Multi-value request header (joined with comma)
+	if val, ok := repl.GetString("http.request.header.Accept"); !ok || val != "text/html,application/json" {
+		t.Errorf("expected header.Accept to be 'text/html,application/json', got %q (ok=%t)", val, ok)
+	}
+
+	// 8. Single-value response header direct map lookup
+	if val, ok := repl.GetString("http.response.header.X-Response-ID"); !ok || val != "12345" {
+		t.Errorf("expected response header X-Response-ID to be '12345', got %q (ok=%t)", val, ok)
+	}
+
+	// 9. Response header non-canonical direct map lookup
+	if val, ok := repl.GetString("http.response.header.x-resp-raw"); !ok || val != "raw-value" {
+		t.Errorf("expected response header x-resp-raw to be 'raw-value', got %q (ok=%t)", val, ok)
+	}
+
+	// 10. Multi-value response header
+	if val, ok := repl.GetString("http.response.header.Set-Cookie"); !ok || val != "a=1,b=2" {
+		t.Errorf("expected response header Set-Cookie to be 'a=1,b=2', got %q (ok=%t)", val, ok)
+	}
+}
+
+var sinkAny any
+
+func TestQueryAndHeaderReplacerAllocations(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/test?foo=bar", nil)
+	req.Header.Set("User-Agent", "TestAgent")
+	rec := httptest.NewRecorder()
+	rec.Header().Set("X-Header", "Value")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, rec)
+
+	// Warm up query map cache
+	_, _ = repl.GetString("http.request.uri.query.foo")
+
+	allocsHeader := testing.AllocsPerRun(100, func() {
+		sinkAny, _ = repl.GetString("http.request.header.User-Agent")
+	})
+	t.Logf("allocsHeader: %f", allocsHeader)
+
+	allocsQuery := testing.AllocsPerRun(100, func() {
+		sinkAny, _ = repl.GetString("http.request.uri.query.foo")
+	})
+	t.Logf("allocsQuery: %f", allocsQuery)
+}
+
+func BenchmarkHeaderLookup(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sinkAny, _ = repl.GetString("http.request.header.User-Agent")
+	}
+}
+
+func BenchmarkQueryLookup(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/test?foo=bar&baz=qux", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sinkAny, _ = repl.GetString("http.request.uri.query.foo")
+	}
+}
