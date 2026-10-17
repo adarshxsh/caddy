@@ -26,6 +26,7 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -204,9 +205,33 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
+	if h.StreamKeepAlive != nil && h.StreamKeepAlive.ProbeInterval > 0 {
+		probeInterval := time.Duration(h.StreamKeepAlive.ProbeInterval)
+		enableTCPKeepAlive(conn, probeInterval)
+		enableTCPKeepAlive(backConn, probeInterval)
+	}
+
+	userWriter := io.Writer(conn)
+	backWriter := io.Writer(backConn)
+
+	if isWebsocket(req) && h.StreamKeepAlive != nil && h.StreamKeepAlive.PingInterval > 0 {
+		pingInterval := time.Duration(h.StreamKeepAlive.PingInterval)
+		userPingWriter := newIdlePingWriter(conn, pingInterval, false)
+		backPingWriter := newIdlePingWriter(backConn, pingInterval, true)
+		defer userPingWriter.Stop()
+		defer backPingWriter.Stop()
+
+		userWriter = userPingWriter
+		backWriter = backPingWriter
+	}
+
 	spc := switchProtocolCopier{
 		user:       conn,
 		backend:    backConn,
+		userWriter: userWriter,
+		userReader: conn,
+		backWriter: backWriter,
+		backReader: backConn,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
 	}
@@ -639,19 +664,37 @@ func (m *maxLatencyWriter) stop() {
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
-	user, backend io.ReadWriteCloser
-	wg            *sync.WaitGroup
-	bufferSize    int
+	user, backend          io.ReadWriteCloser
+	userWriter, backWriter io.Writer
+	userReader, backReader io.Reader
+	wg                     *sync.WaitGroup
+	bufferSize             int
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	dst := c.userWriter
+	if dst == nil {
+		dst = c.user
+	}
+	src := c.backReader
+	if src == nil {
+		src = c.backend
+	}
+	_, err := io.CopyBuffer(dst, src, c.buffer())
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	dst := c.backWriter
+	if dst == nil {
+		dst = c.backend
+	}
+	src := c.userReader
+	if src == nil {
+		src = c.user
+	}
+	_, err := io.CopyBuffer(dst, src, c.buffer())
 	errc <- err
 	c.wg.Done()
 }
@@ -662,6 +705,141 @@ func (c switchProtocolCopier) buffer() []byte {
 		size = defaultBufferSize
 	}
 	return make([]byte, size)
+}
+
+type keepAliveSetter interface {
+	SetKeepAlive(bool) error
+	SetKeepAlivePeriod(time.Duration) error
+}
+
+type keepAliveConfigSetter interface {
+	SetKeepAliveConfig(net.KeepAliveConfig) error
+}
+
+func enableTCPKeepAlive(c any, interval time.Duration) {
+	if interval <= 0 || c == nil {
+		return
+	}
+	for c != nil {
+		if kaConfig, ok := c.(keepAliveConfigSetter); ok {
+			_ = kaConfig.SetKeepAliveConfig(net.KeepAliveConfig{
+				Enable:   true,
+				Idle:     interval,
+				Interval: interval,
+			})
+			return
+		}
+		if ka, ok := c.(keepAliveSetter); ok {
+			_ = ka.SetKeepAlive(true)
+			_ = ka.SetKeepAlivePeriod(interval)
+			return
+		}
+
+		switch u := c.(type) {
+		case interface{ Unwrap() net.Conn }:
+			c = u.Unwrap()
+		case interface{ Unwrap() io.ReadWriteCloser }:
+			c = u.Unwrap()
+		case interface{ NetConn() net.Conn }:
+			c = u.NetConn()
+		case interface{ Conn() net.Conn }:
+			c = u.Conn()
+		case interface{ UnderlyingConn() net.Conn }:
+			c = u.UnderlyingConn()
+		default:
+			return
+		}
+	}
+}
+
+type idlePingWriter struct {
+	w            io.Writer
+	interval     time.Duration
+	isClient     bool
+	mu           sync.Mutex
+	timer        *time.Timer
+	lastActivity time.Time
+	closed       bool
+}
+
+func newIdlePingWriter(w io.Writer, interval time.Duration, isClient bool) *idlePingWriter {
+	ipw := &idlePingWriter{
+		w:            w,
+		interval:     interval,
+		isClient:     isClient,
+		lastActivity: time.Now(),
+	}
+	if interval > 0 {
+		ipw.timer = time.AfterFunc(interval, ipw.onIdle)
+	}
+	return ipw
+}
+
+func (ipw *idlePingWriter) Write(p []byte) (int, error) {
+	ipw.mu.Lock()
+	defer ipw.mu.Unlock()
+
+	if ipw.closed {
+		return 0, io.ErrClosedPipe
+	}
+
+	if ipw.timer != nil {
+		ipw.timer.Stop()
+	}
+
+	n, err := ipw.w.Write(p)
+	ipw.lastActivity = time.Now()
+
+	if !ipw.closed && ipw.timer != nil && ipw.interval > 0 {
+		ipw.timer.Reset(ipw.interval)
+	}
+
+	return n, err
+}
+
+func (ipw *idlePingWriter) onIdle() {
+	ipw.mu.Lock()
+	defer ipw.mu.Unlock()
+
+	if ipw.closed || ipw.interval <= 0 {
+		return
+	}
+
+	elapsed := time.Since(ipw.lastActivity)
+	if elapsed < ipw.interval {
+		if !ipw.closed && ipw.timer != nil {
+			ipw.timer.Reset(ipw.interval - elapsed)
+		}
+		return
+	}
+
+	_ = writePingFrame(ipw.w, ipw.isClient)
+	ipw.lastActivity = time.Now()
+
+	if !ipw.closed && ipw.timer != nil {
+		ipw.timer.Reset(ipw.interval)
+	}
+}
+
+func (ipw *idlePingWriter) Stop() {
+	ipw.mu.Lock()
+	defer ipw.mu.Unlock()
+
+	ipw.closed = true
+	if ipw.timer != nil {
+		ipw.timer.Stop()
+	}
+}
+
+func writePingFrame(w io.Writer, isClient bool) error {
+	if !isClient {
+		_, err := w.Write([]byte{0x89, 0x00})
+		return err
+	}
+	key := newMaskKey()
+	frame := []byte{0x89, 0x80, key[0], key[1], key[2], key[3]}
+	_, err := w.Write(frame)
+	return err
 }
 
 var streamingBufPool = sync.Pool{
