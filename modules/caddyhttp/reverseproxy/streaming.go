@@ -250,17 +250,22 @@ func (h Handler) flushInterval(req *http.Request, res *http.Response) time.Durat
 		return -1 // negative means immediately
 	}
 
-	// We might have the case of streaming for which Content-Length might be unset.
-	if res.ContentLength == -1 {
-		return -1
-	}
-
 	// for h2 and h2c upstream streaming data to client (issues #3556 and #3606)
 	if h.isBidirectionalStream(req, res) {
 		return -1
 	}
 
-	return time.Duration(h.FlushInterval)
+	// Honor user-configured FlushInterval if explicitly set.
+	if h.FlushInterval != 0 {
+		return time.Duration(h.FlushInterval)
+	}
+
+	// Default: if Content-Length is unset (-1), flush immediately.
+	if res.ContentLength == -1 {
+		return -1
+	}
+
+	return 0
 }
 
 // isBidirectionalStream returns whether we should work in bi-directional stream mode.
