@@ -19,8 +19,11 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -360,4 +363,68 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+type mockHandshakeContext struct{}
+
+type dummyConn struct{}
+
+func (dummyConn) Read(b []byte) (n int, err error)   { return 0, nil }
+func (dummyConn) Write(b []byte) (n int, err error)  { return len(b), nil }
+func (dummyConn) Close() error                       { return nil }
+func (dummyConn) LocalAddr() net.Addr                { return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443} }
+func (dummyConn) RemoteAddr() net.Addr               { return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345} }
+func (dummyConn) SetDeadline(t time.Time) error      { return nil }
+func (dummyConn) SetReadDeadline(t time.Time) error  { return nil }
+func (dummyConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func (m mockHandshakeContext) HandshakeContext(hello *tls.ClientHelloInfo) (context.Context, error) {
+	ctx := hello.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, "testKey", "testValue"), nil
+}
+
+func TestGetCertificateConcurrentHandshakeContext(t *testing.T) {
+	ctx, err := caddy.ProvisionContext(&caddy.Config{})
+	if err != nil {
+		t.Fatalf("ProvisionContext error = %v", err)
+	}
+
+	tlsAppIface, err := ctx.App("tls")
+	if err != nil {
+		t.Fatalf("ctx.App('tls') error = %v", err)
+	}
+	tlsApp := tlsAppIface.(*TLS)
+	err = tlsApp.Provision(ctx)
+	if err != nil {
+		t.Fatalf("tlsApp.Provision error = %v", err)
+	}
+
+	pol := &ConnectionPolicy{
+		handshakeContext: mockHandshakeContext{},
+	}
+
+	err = pol.buildStandardTLSConfig(ctx)
+	if err != nil {
+		t.Fatalf("buildStandardTLSConfig error = %v", err)
+	}
+
+	const numGoroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			hello := &tls.ClientHelloInfo{
+				ServerName: "example.com",
+				Conn:       dummyConn{},
+			}
+			_, _ = pol.TLSConfig.GetCertificate(hello)
+		}()
+	}
+
+	wg.Wait()
 }
