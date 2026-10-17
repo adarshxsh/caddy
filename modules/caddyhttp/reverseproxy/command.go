@@ -276,7 +276,7 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 		"http": caddyconfig.JSON(httpApp, nil),
 	}
 	if internalCerts && fromAddr.Host != "" {
-		tlsApp := caddytls.TLS{
+		tlsApp := &caddytls.TLS{
 			Automation: &caddytls.AutomationConfig{
 				Policies: []*caddytls.AutomationPolicy{{
 					SubjectsRaw: []string{fromAddr.Host},
