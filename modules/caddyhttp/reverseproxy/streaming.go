@@ -28,6 +28,7 @@ import (
 	"mime"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -199,6 +200,50 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 		return nil
 	}
+	// setup the timeout if requested
+	var timeoutc <-chan time.Time
+	if h.StreamTimeout > 0 {
+		var lastActivity atomic.Int64
+		lastActivity.Store(time.Now().UnixNano())
+
+		conn = &activityRWC{ReadWriteCloser: conn, lastActivity: &lastActivity}
+		backConn = &activityRWC{ReadWriteCloser: backConn, lastActivity: &lastActivity}
+
+		streamTimeout := time.Duration(h.StreamTimeout)
+		timer := time.NewTimer(streamTimeout)
+		defer timer.Stop()
+
+		done := make(chan struct{})
+		defer close(done)
+
+		timeoutCh := make(chan time.Time, 1)
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				case <-timer.C:
+					now := time.Now()
+					last := time.Unix(0, lastActivity.Load())
+					elapsed := now.Sub(last)
+					if elapsed >= streamTimeout {
+						select {
+						case timeoutCh <- now:
+						case <-done:
+						}
+						return
+					}
+					remaining := streamTimeout - elapsed
+					if remaining <= 0 {
+						remaining = time.Nanosecond
+					}
+					timer.Reset(remaining)
+				}
+			}
+		}()
+		timeoutc = timeoutCh
+	}
+
 	deleteFrontConn := h.registerConnection(conn, gracefulClose(conn, false))
 	deleteBackConn := h.registerConnection(backConn, gracefulClose(backConn, true))
 	defer deleteFrontConn()
@@ -209,14 +254,6 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		backend:    backConn,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
-	}
-
-	// setup the timeout if requested
-	var timeoutc <-chan time.Time
-	if h.StreamTimeout > 0 {
-		timer := time.NewTimer(time.Duration(h.StreamTimeout))
-		defer timer.Stop()
-		timeoutc = timer.C
 	}
 
 	// when a stream timeout is encountered, no error will be read from errc
@@ -381,6 +418,9 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 // The caller should call the returned delete() function when the
 // connection is done to remove it from memory.
 func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (del func()) {
+	if h.connectionsMu == nil {
+		return func() {}
+	}
 	h.connectionsMu.Lock()
 	h.connections[conn] = openConnection{conn, gracefulClose}
 	h.connectionsMu.Unlock()
@@ -679,3 +719,25 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	lastActivity *atomic.Int64
+}
+
+func (a *activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 {
+		a.lastActivity.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (a *activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 {
+		a.lastActivity.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
