@@ -220,10 +220,11 @@ func TestReplacerSet(t *testing.T) {
 	} {
 		rep.Set(tc.variable, tc.value)
 
-		// test if key is added
+		// test if key is added and primitive value is pre-stringified
+		expected := ToString(tc.value)
 		if val, ok := rep.static[tc.variable]; ok {
-			if val != tc.value {
-				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
+			if val != expected {
+				t.Errorf("Expected value '%s' for key '%s' got '%s'", expected, tc.variable, val)
 			}
 		} else {
 			t.Errorf("Expected existing key '%s' found nothing", tc.variable)
@@ -233,7 +234,70 @@ func TestReplacerSet(t *testing.T) {
 	// test if all keys are still there (by length)
 	length := len(rep.static)
 	if len(rep.static) != 8 {
-		t.Errorf("Expected length '%v' got '%v'", 7, length)
+		t.Errorf("Expected length '%v' got '%v'", 8, length)
+	}
+}
+
+func TestReplacerTypedSetters(t *testing.T) {
+	rep := NewEmptyReplacer()
+
+	rep.SetString("str", "hello")
+	rep.SetInt("int", 42)
+	rep.SetBool("bool", true)
+	rep.SetFloat64("float", 3.14159)
+
+	if val, ok := rep.Get("str"); !ok || val != "hello" {
+		t.Errorf("SetString: expected 'hello', got %v", val)
+	}
+	if val, ok := rep.Get("int"); !ok || val != "42" {
+		t.Errorf("SetInt: expected '42', got %v", val)
+	}
+	if val, ok := rep.Get("bool"); !ok || val != "true" {
+		t.Errorf("SetBool: expected 'true', got %v", val)
+	}
+	if val, ok := rep.Get("float"); !ok || val != "3.14159" {
+		t.Errorf("SetFloat64: expected '3.14159', got %v", val)
+	}
+}
+
+func TestReplacerSetNonScalarPreserved(t *testing.T) {
+	rep := NewEmptyReplacer()
+
+	errVal := fmt.Errorf("sample error")
+	rep.Set("err", errVal)
+
+	if val, ok := rep.Get("err"); !ok {
+		t.Errorf("Expected 'err' key in replacer")
+	} else if err, ok := val.(error); !ok || err != errVal {
+		t.Errorf("Expected non-scalar error to be preserved as error, got %T: %v", val, val)
+	}
+
+	if str, ok := rep.GetString("err"); !ok || str != "sample error" {
+		t.Errorf("GetString on error: expected 'sample error', got %q", str)
+	}
+}
+
+func TestReplacerTypedSettersAllocations(t *testing.T) {
+	rep := NewEmptyReplacer()
+	rep.SetString("s", "value")
+	rep.SetInt("i", 100)
+	rep.SetBool("b", false)
+	rep.SetFloat64("f", 12.34)
+
+	input := "str={s} int={i} bool={b} float={f}"
+	expected := "str=value int=100 bool=false float=12.34"
+
+	if actual := rep.ReplaceAll(input, ""); actual != expected {
+		t.Fatalf("ReplaceAll expected %q, got %q", expected, actual)
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = rep.GetString("i")
+		_, _ = rep.GetString("b")
+		_, _ = rep.GetString("f")
+	})
+	if allocs > 0 {
+		t.Errorf("Expected 0 allocs for GetString on pre-stringified values, got %f", allocs)
 	}
 }
 

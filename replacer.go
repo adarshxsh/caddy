@@ -88,11 +88,45 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 	r.providers = append(r.providers, mapFunc)
 }
 
-// Set sets a custom variable to a static value.
+// Set sets a custom variable to a static value. Primitive scalar
+// values are pre-converted to string to avoid repeated type assertions.
 func (r *Replacer) Set(variable string, value any) {
+	switch v := value.(type) {
+	case string, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64, uintptr,
+		float32, float64:
+		value = ToString(v)
+	}
 	r.mapMutex.Lock()
 	r.static[variable] = value
 	r.mapMutex.Unlock()
+}
+
+// SetString sets a custom variable to a static string value.
+func (r *Replacer) SetString(variable, value string) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetInt sets a custom variable to a static int value.
+func (r *Replacer) SetInt(variable string, value int) {
+	r.SetString(variable, strconv.Itoa(value))
+}
+
+// SetBool sets a custom variable to a static bool value.
+func (r *Replacer) SetBool(variable string, value bool) {
+	if value {
+		r.SetString(variable, "true")
+	} else {
+		r.SetString(variable, "false")
+	}
+}
+
+// SetFloat64 sets a custom variable to a static float64 value.
+func (r *Replacer) SetFloat64(variable string, value float64) {
+	r.SetString(variable, strconv.FormatFloat(value, 'f', -1, 64))
 }
 
 // Get gets a value from the replacer. It returns
