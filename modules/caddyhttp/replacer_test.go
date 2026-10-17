@@ -296,3 +296,80 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLazyRequestID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	repl := caddy.NewReplacer()
+	req = PrepareRequest(req, repl, nil, nil)
+
+	// Ensure requestID is not allocated prior to querying http.request.uuid
+	if idVal := GetVar(req.Context(), "uuid"); idVal != nil {
+		t.Fatalf("expected uuid context variable to be nil before placeholder lookup, got: %v", idVal)
+	}
+
+	// First lookup: should lazily create requestID and set extra log fields
+	uuid1, ok1 := repl.GetString("http.request.uuid")
+	if !ok1 || uuid1 == "" {
+		t.Fatalf("expected non-empty uuid, got %q (ok=%t)", uuid1, ok1)
+	}
+
+	// Verify requestID was stored in context map
+	idVal := GetVar(req.Context(), "uuid")
+	if idVal == nil {
+		t.Fatalf("expected uuid context variable to be set after lookup")
+	}
+
+	// Verify extra log fields
+	extra := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields)
+	var logUUID string
+	for _, f := range extra.fields {
+		if f.Key == "uuid" {
+			logUUID = f.String
+			break
+		}
+	}
+	if logUUID != uuid1 {
+		t.Errorf("expected access log uuid field to be %q, got %q", uuid1, logUUID)
+	}
+
+	// Second lookup: should return exact same cached UUID
+	uuid2, ok2 := repl.GetString("http.request.uuid")
+	if !ok2 || uuid2 != uuid1 {
+		t.Errorf("expected cached uuid %q on second lookup, got %q (ok=%t)", uuid1, uuid2, ok2)
+	}
+}
+
+func TestRequestIDZeroAllocationWhenUnused(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	repl := caddy.NewReplacer()
+	req = PrepareRequest(req, repl, nil, nil)
+
+	// Confirm uuid context variable remains unallocated
+	if idVal := GetVar(req.Context(), "uuid"); idVal != nil {
+		t.Fatalf("expected uuid context variable to be nil when unreferenced, got: %v", idVal)
+	}
+
+	// Evaluate non-uuid placeholders
+	method, ok := repl.GetString("http.request.method")
+	if !ok || method != http.MethodGet {
+		t.Errorf("expected GET, got %q", method)
+	}
+
+	// Ensure uuid context variable was not created
+	if idVal := GetVar(req.Context(), "uuid"); idVal != nil {
+		t.Fatalf("expected uuid context variable to remain nil after non-uuid replacements, got: %v", idVal)
+	}
+}
+
+func TestAddHTTPVarsAllocation(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+	req = req.WithContext(ctx)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		addHTTPVarsToReplacer(repl, req, nil)
+	})
+
+	t.Logf("addHTTPVarsToReplacer allocs per run: %f", allocs)
+}
