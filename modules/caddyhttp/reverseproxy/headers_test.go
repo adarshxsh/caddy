@@ -2,6 +2,8 @@ package reverseproxy
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -123,5 +125,51 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestPreannouncedResponseTrailers(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Trailer", "At-End, Second-Trailer")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("response body"))
+		w.Header().Set("At-End", "value1")
+		w.Header().Set("Second-Trailer", "value2")
+	}))
+	t.Cleanup(upstream.Close)
+
+	h := minimalHandler(0, &Upstream{
+		Host: new(Host),
+		Dial: upstream.Listener.Addr().String(),
+	})
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := prepareTestRequest(r)
+		err := h.ServeHTTP(w, req, nil)
+		if err != nil {
+			t.Errorf("ServeHTTP error: %v", err)
+		}
+	}))
+	t.Cleanup(proxyServer.Close)
+
+	resp, err := http.Get(proxyServer.URL)
+	if err != nil {
+		t.Fatalf("GET request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body failed: %v", err)
+	}
+	if string(body) != "response body" {
+		t.Errorf("unexpected body: got %q, want %q", string(body), "response body")
+	}
+
+	if got := resp.Trailer.Get("At-End"); got != "value1" {
+		t.Errorf("At-End trailer = %q, want %q", got, "value1")
+	}
+	if got := resp.Trailer.Get("Second-Trailer"); got != "value2" {
+		t.Errorf("Second-Trailer trailer = %q, want %q", got, "value2")
 	}
 }
