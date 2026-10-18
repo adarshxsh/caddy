@@ -813,6 +813,11 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 	// (see Section 6.2)."
 	if req.TLS != nil && !req.TLS.HandshakeComplete {
 		req.Header.Set("Early-Data", "1")
+	} else {
+		trusted, _ := caddyhttp.GetVar(req.Context(), caddyhttp.TrustedProxyVarKey).(bool)
+		if !trusted {
+			req.Header.Del("Early-Data")
+		}
 	}
 
 	reqUpgradeType := upgradeType(req.Header)
