@@ -332,8 +332,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
 	h["Server"] = serverHeader
 
-	// advertise HTTP/3, if enabled
-	if s.h3server != nil && r.ProtoMajor < 3 {
+	// advertise HTTP/3, if enabled and connection is encrypted
+	if s.h3server != nil && r.TLS != nil && r.ProtoMajor < 3 {
 		if err := s.h3server.SetQUICHeaders(h); err != nil {
 			if c := s.logger.Check(zapcore.ErrorLevel, "setting HTTP/3 Alt-Svc header"); c != nil {
 				c.Write(zap.Error(err))
