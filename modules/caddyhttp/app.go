@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -417,6 +418,14 @@ func (app *App) Validate() error {
 				if _, _, err := net.SplitHostPort(host); err == nil {
 					return fmt.Errorf("server %s: logger name must not have a port: %s", srvName, host)
 				}
+			}
+		}
+
+		if srv.EarlyDataPolicy != "" {
+			switch strings.ToLower(srv.EarlyDataPolicy) {
+			case "reject_unsafe", "reject_all", "allow_all":
+			default:
+				return fmt.Errorf("server %s: invalid early_data_policy '%s'; expected 'reject_unsafe', 'reject_all', or 'allow_all'", srvName, srv.EarlyDataPolicy)
 			}
 		}
 	}

@@ -291,3 +291,108 @@ func TestMergeACMEIssuers(t *testing.T) {
 		t.Fatalf("expected base roots to remain unchanged, got %v", base.TrustedRootsPEMFiles)
 	}
 }
+
+func TestServerOptions_EarlyDataPolicy(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          string
+		expectedPolicy string
+		expectedStrict *bool
+	}{
+		{
+			name: "early_data_policy allow_all",
+			input: `{
+				servers {
+					early_data_policy allow_all
+				}
+			}
+			example.com {
+				respond "ok"
+			}`,
+			expectedPolicy: "allow_all",
+		},
+		{
+			name: "early_data_policy reject_unsafe",
+			input: `{
+				servers {
+					early_data_policy reject_unsafe
+				}
+			}
+			example.com {
+				respond "ok"
+			}`,
+			expectedPolicy: "reject_unsafe",
+		},
+		{
+			name: "strict_early_data false",
+			input: `{
+				servers {
+					strict_early_data false
+				}
+			}
+			example.com {
+				respond "ok"
+			}`,
+			expectedStrict: boolPtr(false),
+		},
+		{
+			name: "strict_early_data off",
+			input: `{
+				servers {
+					strict_early_data off
+				}
+			}
+			example.com {
+				respond "ok"
+			}`,
+			expectedStrict: boolPtr(false),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := caddyfile.Adapter{
+				ServerType: ServerType{},
+			}
+			out, _, err := adapter.Adapt([]byte(tc.input), nil)
+			if err != nil {
+				t.Fatalf("adapter.Adapt failed: %v", err)
+			}
+
+			var config struct {
+				Apps struct {
+					HTTP struct {
+						Servers map[string]struct {
+							EarlyDataPolicy string `json:"early_data_policy,omitempty"`
+							StrictEarlyData *bool  `json:"strict_early_data,omitempty"`
+						} `json:"servers"`
+					} `json:"http"`
+				} `json:"apps"`
+			}
+
+			if err := json.Unmarshal(out, &config); err != nil {
+				t.Fatalf("unmarshaling adapted config: %v", err)
+			}
+
+			found := false
+			for _, srv := range config.Apps.HTTP.Servers {
+				found = true
+				if tc.expectedPolicy != "" && srv.EarlyDataPolicy != tc.expectedPolicy {
+					t.Errorf("expected early_data_policy %q, got %q", tc.expectedPolicy, srv.EarlyDataPolicy)
+				}
+				if tc.expectedStrict != nil {
+					if srv.StrictEarlyData == nil || *srv.StrictEarlyData != *tc.expectedStrict {
+						t.Errorf("expected strict_early_data %v, got %v", *tc.expectedStrict, srv.StrictEarlyData)
+					}
+				}
+			}
+			if !found {
+				t.Error("no servers found in adapted output")
+			}
+		})
+	}
+}
+
+func boolPtr(b bool) *bool {
+	return &b
+}
