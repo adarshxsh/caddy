@@ -35,6 +35,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http/httpguts"
@@ -1276,8 +1278,18 @@ func (h *Handler) finalizeResponse(
 		// we'll just log the error and abort the stream here and panic just as
 		// the standard lib's proxy to propagate the stream error.
 		// see issue https://github.com/caddyserver/caddy/issues/5951
+		fields := []zap.Field{zap.Error(err)}
+		if code, ok := extractQUICErrorCode(err); ok {
+			fields = append(fields, zap.Uint64("quic_error_code", uint64(code)))
+			if streamer := findHTTPStreamer(rw); streamer != nil {
+				if stream := streamer.HTTPStream(); stream != nil {
+					stream.CancelWrite(code)
+					stream.CancelRead(code)
+				}
+			}
+		}
 		if c := logger.Check(zapcore.WarnLevel, "aborting with incomplete response"); c != nil {
-			c.Write(zap.Error(err))
+			c.Write(fields...)
 		}
 		// no extra logging from stdlib
 		panic(http.ErrAbortHandler)
@@ -1874,3 +1886,44 @@ var (
 	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 )
+
+// extractQUICErrorCode extracts a QUIC stream or application error code from err if present.
+func extractQUICErrorCode(err error) (quic.StreamErrorCode, bool) {
+	var streamErr *quic.StreamError
+	if errors.As(err, &streamErr) {
+		return streamErr.ErrorCode, true
+	}
+	var h3Err *http3.Error
+	if errors.As(err, &h3Err) {
+		return quic.StreamErrorCode(h3Err.ErrorCode), true
+	}
+	var appErr *quic.ApplicationError
+	if errors.As(err, &appErr) {
+		return quic.StreamErrorCode(appErr.ErrorCode), true
+	}
+	return 0, false
+}
+
+// findHTTPStreamer recursively unwraps rw to find an http3.HTTPStreamer if present.
+func findHTTPStreamer(rw http.ResponseWriter) http3.HTTPStreamer {
+	for depth := 0; rw != nil && depth < 100; depth++ {
+		if streamer, ok := rw.(http3.HTTPStreamer); ok {
+			return streamer
+		}
+		switch u := rw.(type) {
+		case interface{ Unwrap() http.ResponseWriter }:
+			rw = u.Unwrap()
+		case interface{ Unwrap() []http.ResponseWriter }:
+			rws := u.Unwrap()
+			for _, w := range rws {
+				if streamer := findHTTPStreamer(w); streamer != nil {
+					return streamer
+				}
+			}
+			return nil
+		default:
+			return nil
+		}
+	}
+	return nil
+}
