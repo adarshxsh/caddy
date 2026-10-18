@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
 )
 
 // SessionTicketService configures and manages TLS session tickets.
@@ -52,9 +53,11 @@ type SessionTicketService struct {
 	stopChan    chan struct{}
 	currentKeys [][32]byte
 	mu          *sync.Mutex
+	logger      *zap.Logger
 }
 
 func (s *SessionTicketService) provision(ctx caddy.Context) error {
+	s.logger = ctx.Logger()
 	s.configs = make(map[*tls.Config]struct{})
 	s.mu = new(sync.Mutex)
 
@@ -139,6 +142,11 @@ func (s *SessionTicketService) stayUpdated() {
 			s.currentKeys = newKeys
 			for cfg := range s.configs {
 				cfg.SetSessionTicketKeys(newKeys)
+			}
+			if s.logger != nil {
+				s.logger.Debug("rotated session ticket keys across active connection policy configurations",
+					zap.Int("num_configs", len(s.configs)),
+					zap.Int("num_keys", len(newKeys)))
 			}
 			s.mu.Unlock()
 		case <-s.stopChan:
