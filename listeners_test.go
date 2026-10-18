@@ -16,6 +16,7 @@ package caddy
 
 import (
 	"crypto/tls"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -210,16 +211,16 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 
 	_, cancel := sqs.addState(updatedConfig)
-	sqs.rmu.Lock()
-	sqs.activeTlsConf = updatedConfig
-	sqs.rmu.Unlock()
+
+	expectedAggregated := append([]tls.EncryptedClientHelloKey{}, updatedKeys...)
+	expectedAggregated = append(expectedAggregated, initialKeys...)
 
 	keys, err = sqs.getEncryptedClientHelloKeys(hello)
 	if err != nil {
 		t.Fatalf("getting updated ECH keys: %v", err)
 	}
-	if !reflect.DeepEqual(keys, updatedKeys) {
-		t.Fatalf("unexpected updated ECH keys: got %#v, want %#v", keys, updatedKeys)
+	if !reflect.DeepEqual(keys, expectedAggregated) {
+		t.Fatalf("unexpected updated ECH keys: got %#v, want %#v", keys, expectedAggregated)
 	}
 
 	cancel(nil)
@@ -230,6 +231,129 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(keys, initialKeys) {
 		t.Fatalf("unexpected restored ECH keys: got %#v, want %#v", keys, initialKeys)
+	}
+}
+
+func TestSharedQUICStateMultiConfigDispatch(t *testing.T) {
+	tc1Target := &tls.Config{MinVersion: tls.VersionTLS13}
+	tc2Target := &tls.Config{MinVersion: tls.VersionTLS12}
+
+	tc1 := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "domain-a.com" {
+				return tc1Target, nil
+			}
+			return nil, fmt.Errorf("domain %s not matched on tc1", ch.ServerName)
+		},
+	}
+
+	sqs := newSharedQUICState(tc1)
+
+	// Test initial single config
+	got, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domain-a.com"})
+	if err != nil || got != tc1Target {
+		t.Fatalf("expected tc1Target, got %v, err: %v", got, err)
+	}
+
+	// Register second config
+	tc2 := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "domain-b.com" {
+				return tc2Target, nil
+			}
+			return nil, fmt.Errorf("domain %s not matched on tc2", ch.ServerName)
+		},
+	}
+
+	_, cancel2 := sqs.addState(tc2)
+
+	// addState promotes tc2 to activeTlsConf
+	if sqs.activeTlsConf != tc2 {
+		t.Fatalf("expected activeTlsConf to be promoted to tc2, got %v", sqs.activeTlsConf)
+	}
+
+	// Request for domain-b.com matches activeTlsConf (tc2) directly
+	gotB, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domain-b.com"})
+	if err != nil || gotB != tc2Target {
+		t.Fatalf("expected tc2Target for domain-b.com, got %v, err: %v", gotB, err)
+	}
+
+	// Request for domain-a.com fails activeTlsConf (tc2) and falls back to tc1
+	gotA, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domain-a.com"})
+	if err != nil || gotA != tc1Target {
+		t.Fatalf("expected fallback to tc1Target for domain-a.com, got %v, err: %v", gotA, err)
+	}
+
+	// Request for unknown domain fails across all configs
+	gotUnknown, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "unknown.com"})
+	if err == nil || gotUnknown != nil {
+		t.Fatalf("expected error for unknown domain, got config %v, err: %v", gotUnknown, err)
+	}
+
+	// Cancel tc2, verifying promotion fallback
+	cancel2(nil)
+
+	if sqs.activeTlsConf != tc1 {
+		t.Fatalf("expected activeTlsConf to revert to tc1 after cancel, got %v", sqs.activeTlsConf)
+	}
+
+	gotA2, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "domain-a.com"})
+	if err != nil || gotA2 != tc1Target {
+		t.Fatalf("expected tc1Target for domain-a.com after cancel, got %v, err: %v", gotA2, err)
+	}
+}
+
+func TestSharedQUICStateAddStatePromotion(t *testing.T) {
+	tc1 := &tls.Config{MinVersion: tls.VersionTLS12}
+	tc2 := &tls.Config{MinVersion: tls.VersionTLS13}
+
+	sqs := newSharedQUICState(tc1)
+	if sqs.activeTlsConf != tc1 {
+		t.Fatalf("expected activeTlsConf to be tc1, got %v", sqs.activeTlsConf)
+	}
+
+	sqs.addState(tc2)
+	if sqs.activeTlsConf != tc2 {
+		t.Fatalf("expected activeTlsConf to be promoted to tc2, got %v", sqs.activeTlsConf)
+	}
+
+	// Re-adding tc1 should re-promote tc1 to activeTlsConf
+	sqs.addState(tc1)
+	if sqs.activeTlsConf != tc1 {
+		t.Fatalf("expected activeTlsConf to be re-promoted to tc1, got %v", sqs.activeTlsConf)
+	}
+}
+
+func TestSharedQUICStateNilGetConfigForClient(t *testing.T) {
+	tcStatic := &tls.Config{MinVersion: tls.VersionTLS13}
+	sqs := newSharedQUICState(tcStatic)
+
+	got, err := sqs.getConfigForClient(&tls.ClientHelloInfo{ServerName: "any.com"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != tcStatic {
+		t.Fatalf("expected static config %v, got %v", tcStatic, got)
+	}
+}
+
+func TestSharedQUICStateGetEncryptedClientHelloKeysError(t *testing.T) {
+	hello := &tls.ClientHelloInfo{ServerName: "example.com"}
+	expectedErr := fmt.Errorf("failed to fetch ECH keys")
+
+	tc := &tls.Config{
+		GetEncryptedClientHelloKeys: func(*tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+			return nil, expectedErr
+		},
+	}
+
+	sqs := newSharedQUICState(tc)
+	keys, err := sqs.getEncryptedClientHelloKeys(hello)
+	if err == nil {
+		t.Fatalf("expected error, got keys: %v", keys)
+	}
+	if err.Error() != expectedErr.Error() {
+		t.Fatalf("expected error %v, got %v", expectedErr, err)
 	}
 }
 
