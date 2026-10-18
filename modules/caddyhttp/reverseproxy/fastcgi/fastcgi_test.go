@@ -1,6 +1,8 @@
 package fastcgi
 
 import (
+	"context"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -8,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -355,3 +358,51 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
 	}
 }
+
+func TestBuildEnvFilterProxyHeader(t *testing.T) {
+	tr := Transport{
+		Root: "/var/www/html",
+		EnvVars: map[string]string{
+			"CUSTOM_VAR": "custom_val",
+		},
+	}
+
+	req := httptest.NewRequest("GET", "http://localhost/test.php", nil)
+	req.Header.Set("Proxy", "http://malicious-proxy.com")
+	req.Header.Set("PROXY", "http://malicious-proxy2.com")
+	req.Header.Set("proxy", "http://malicious-proxy3.com")
+	req.Header.Set("X-Custom-Header", "allowed")
+
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, caddyhttp.OriginalRequestCtxKey, *req)
+	req = req.WithContext(ctx)
+
+	env, err := tr.buildEnv(req)
+	require.NoError(t, err)
+
+	// Ensure HTTP_PROXY is not populated from Proxy request headers
+	_, hasProxy := env["HTTP_PROXY"]
+	assert.False(t, hasProxy, "HTTP_PROXY should not be set from request header")
+
+	// Ensure legitimate request headers are preserved
+	assert.Equal(t, "allowed", env["HTTP_X_CUSTOM_HEADER"])
+
+	// Ensure explicit transport EnvVars are present
+	assert.Equal(t, "custom_val", env["CUSTOM_VAR"])
+
+	// Test case where server administrator explicitly configures HTTP_PROXY in EnvVars
+	trWithProxy := Transport{
+		Root: "/var/www/html",
+		EnvVars: map[string]string{
+			"HTTP_PROXY": "http://legitimate-proxy.com",
+		},
+	}
+
+	envWithProxy, err := trWithProxy.buildEnv(req)
+	require.NoError(t, err)
+
+	// Explicit HTTP_PROXY in EnvVars should be preserved and NOT overwritten by client headers
+	assert.Equal(t, "http://legitimate-proxy.com", envWithProxy["HTTP_PROXY"])
+}
+
