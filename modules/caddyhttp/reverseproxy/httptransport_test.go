@@ -279,3 +279,38 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPTransport_HTTP3_DynamicSNI_Dial(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{http.request.host}",
+		},
+	}
+
+	_, err := ht.NewTransport(ctx)
+	if err != nil {
+		t.Fatalf("NewTransport() error = %v", err)
+	}
+
+	if ht.h3Transport == nil {
+		t.Fatal("expected h3Transport to be non-nil")
+	}
+	if ht.h3Transport.Dial == nil {
+		t.Fatal("expected h3Transport.Dial to be non-nil when TLS ServerName has placeholder")
+	}
+	if ht.quicTransport == nil {
+		t.Fatal("expected quicTransport to be non-nil when TLS ServerName has placeholder")
+	}
+	if ht.quicTransport.Conn == nil {
+		t.Fatal("expected quicTransport.Conn to be non-nil")
+	}
+
+	// Verify Cleanup closes h.quicTransport and h.quicTransport.Conn
+	if err := ht.Cleanup(); err != nil {
+		t.Errorf("Cleanup() error = %v", err)
+	}
+}
