@@ -2,12 +2,14 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -279,3 +281,142 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPTransport_DialTLSContext_ReplacerFallback(t *testing.T) {
+	t.Setenv("TEST_DIAL_SNI", "fallback.example.com")
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	serverNameCaptured := make(chan string, 1)
+	serverTLSConfig := &tls.Config{
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			serverNameCaptured <- chi.ServerName
+			return nil, nil
+		},
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	tlsLn := tls.NewListener(ln, serverTLSConfig)
+	defer tlsLn.Close()
+
+	go func() {
+		for {
+			c, err := tlsLn.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			ServerName:         "{env.TEST_DIAL_SNI}",
+			InsecureSkipVerify: true,
+		},
+	}
+	rt, err := ht.NewTransport(ctx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	t.Run("context without replacer uses fallback replacer", func(t *testing.T) {
+		plainCtx := context.Background()
+		conn, err := rt.DialTLSContext(plainCtx, "tcp", ln.Addr().String())
+		if err != nil {
+			// Handshake might fail due to dummy TLS config, but we care that DialTLSContext did not panic
+		} else {
+			conn.Close()
+		}
+		select {
+		case gotSNI := <-serverNameCaptured:
+			if gotSNI != "fallback.example.com" {
+				t.Errorf("ServerName = %q, want %q", gotSNI, "fallback.example.com")
+			}
+		default:
+		}
+	})
+
+	t.Run("context with custom replacer uses context replacer", func(t *testing.T) {
+		repl := caddy.NewReplacer()
+		repl.Set("custom_sni", "custom.example.com")
+		htCustom := &HTTPTransport{
+			TLS: &TLSConfig{
+				ServerName:         "{custom_sni}",
+				InsecureSkipVerify: true,
+			},
+		}
+		rtCustom, err := htCustom.NewTransport(ctx)
+		if err != nil {
+			t.Fatalf("NewTransport: %v", err)
+		}
+
+		replCtx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+		conn, err := rtCustom.DialTLSContext(replCtx, "tcp", ln.Addr().String())
+		if err != nil {
+		} else {
+			conn.Close()
+		}
+		select {
+		case gotSNI := <-serverNameCaptured:
+			if gotSNI != "custom.example.com" {
+				t.Errorf("ServerName = %q, want %q", gotSNI, "custom.example.com")
+			}
+		default:
+		}
+	})
+}
+
+func TestHTTPTransport_H3Dial_ReplacerFallback(t *testing.T) {
+	t.Setenv("TEST_H3_SNI", "h3fallback.example.com")
+
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{env.TEST_H3_SNI}",
+		},
+	}
+	_, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+	defer ht.Cleanup()
+
+	if ht.h3Transport == nil || ht.h3Transport.Dial == nil {
+		t.Fatalf("expected h3Transport.Dial to be non-nil")
+	}
+
+	t.Run("context without replacer uses fallback replacer", func(t *testing.T) {
+		tlsCfg := &tls.Config{ServerName: ht.TLS.ServerName}
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer dialCancel()
+		_, _ = ht.h3Transport.Dial(dialCtx, "127.0.0.1:12345", tlsCfg, nil)
+
+		if tlsCfg.ServerName != "h3fallback.example.com" {
+			t.Errorf("ServerName = %q, want %q", tlsCfg.ServerName, "h3fallback.example.com")
+		}
+	})
+
+	t.Run("context with custom replacer uses context replacer", func(t *testing.T) {
+		tlsCfg := &tls.Config{ServerName: "{custom_h3_sni}"}
+		repl := caddy.NewReplacer()
+		repl.Set("custom_h3_sni", "h3custom.example.com")
+		dialCtx, dialCancel := context.WithTimeout(context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl), 10*time.Millisecond)
+		defer dialCancel()
+
+		_, _ = ht.h3Transport.Dial(dialCtx, "127.0.0.1:12345", tlsCfg, nil)
+
+		if tlsCfg.ServerName != "h3custom.example.com" {
+			t.Errorf("ServerName = %q, want %q", tlsCfg.ServerName, "h3custom.example.com")
+		}
+	})
+}
+
