@@ -540,17 +540,72 @@ func newSharedQUICState(tlsConfig *tls.Config) *sharedQUICState {
 func (sqs *sharedQUICState) getConfigForClient(ch *tls.ClientHelloInfo) (*tls.Config, error) {
 	sqs.rmu.RLock()
 	defer sqs.rmu.RUnlock()
-	return sqs.activeTlsConf.GetConfigForClient(ch)
+
+	var activeErr error
+	if sqs.activeTlsConf != nil {
+		if sqs.activeTlsConf.GetConfigForClient != nil {
+			cfg, err := sqs.activeTlsConf.GetConfigForClient(ch)
+			if err == nil && cfg != nil {
+				return cfg, nil
+			}
+			activeErr = err
+		} else {
+			return sqs.activeTlsConf, nil
+		}
+	}
+
+	for tc := range sqs.tlsConfs {
+		if tc == sqs.activeTlsConf {
+			continue
+		}
+		if tc.GetConfigForClient != nil {
+			cfg, err := tc.GetConfigForClient(ch)
+			if err == nil && cfg != nil {
+				return cfg, nil
+			}
+			if activeErr == nil {
+				activeErr = err
+			}
+		} else {
+			return tc, nil
+		}
+	}
+
+	if activeErr != nil {
+		return nil, activeErr
+	}
+	return nil, fmt.Errorf("no matching TLS configuration found for ClientHello")
 }
 
 // getEncryptedClientHelloKeys is used as tls.Config's GetEncryptedClientHelloKeys field.
 func (sqs *sharedQUICState) getEncryptedClientHelloKeys(ch *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
 	sqs.rmu.RLock()
 	defer sqs.rmu.RUnlock()
-	if sqs.activeTlsConf.GetEncryptedClientHelloKeys == nil {
-		return nil, nil
+
+	var allKeys []tls.EncryptedClientHelloKey
+
+	if sqs.activeTlsConf != nil && sqs.activeTlsConf.GetEncryptedClientHelloKeys != nil {
+		keys, err := sqs.activeTlsConf.GetEncryptedClientHelloKeys(ch)
+		if err != nil {
+			return nil, err
+		}
+		allKeys = append(allKeys, keys...)
 	}
-	return sqs.activeTlsConf.GetEncryptedClientHelloKeys(ch)
+
+	for tc := range sqs.tlsConfs {
+		if tc == sqs.activeTlsConf {
+			continue
+		}
+		if tc.GetEncryptedClientHelloKeys != nil {
+			keys, err := tc.GetEncryptedClientHelloKeys(ch)
+			if err != nil {
+				return nil, err
+			}
+			allKeys = append(allKeys, keys...)
+		}
+	}
+
+	return allKeys, nil
 }
 
 // addState adds tls.Config and activeRequests to the map if not present and returns the corresponding context and its cancelFunc
@@ -558,6 +613,8 @@ func (sqs *sharedQUICState) getEncryptedClientHelloKeys(ch *tls.ClientHelloInfo)
 func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, context.CancelCauseFunc) {
 	sqs.rmu.Lock()
 	defer sqs.rmu.Unlock()
+
+	sqs.activeTlsConf = tlsConfig
 
 	if cacc, ok := sqs.tlsConfs[tlsConfig]; ok {
 		return cacc.Context, cacc.CancelCauseFunc
@@ -574,6 +631,7 @@ func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, co
 		if sqs.activeTlsConf == tlsConfig {
 			// select another tls.Config, if there is none,
 			// related sharedQuicListener will be destroyed anyway
+			sqs.activeTlsConf = nil
 			for tc := range sqs.tlsConfs {
 				sqs.activeTlsConf = tc
 				break
