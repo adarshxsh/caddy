@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -576,3 +579,84 @@ func TestServer_DetermineTrustedProxy_MatchRightMostUntrustedFirst(t *testing.T)
 	assert.True(t, trusted)
 	assert.Equal(t, clientIP, "90.100.110.120")
 }
+
+type mockQUICListener struct{}
+
+func (m mockQUICListener) Accept(ctx context.Context) (*quic.Conn, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (m mockQUICListener) Close() error { return nil }
+
+func (m mockQUICListener) Addr() net.Addr {
+	return &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443}
+}
+
+func TestServer_ServeHTTP_AltSvcHeader(t *testing.T) {
+	h3srv := &http3.Server{}
+	ln := mockQUICListener{}
+	go h3srv.ServeListener(ln)
+
+	require.Eventually(t, func() bool {
+		h := make(http.Header)
+		return h3srv.SetQUICHeaders(h) == nil
+	}, 1*time.Second, 10*time.Millisecond)
+
+	tests := []struct {
+		name         string
+		req          *http.Request
+		expectAltSvc bool
+	}{
+		{
+			name:         "plaintext HTTP request without TLS",
+			req:          httptest.NewRequest(http.MethodGet, "http://example.com/", nil),
+			expectAltSvc: false,
+		},
+		{
+			name: "encrypted HTTPS request with TLS",
+			req: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+				r.TLS = &tls.ConnectionState{}
+				return r
+			}(),
+			expectAltSvc: true,
+		},
+		{
+			name: "TLS connection state provided via context key",
+			req: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+				r.TLS = nil
+				ctx := context.WithValue(r.Context(), tlsConnectionStateFuncCtxKey, func() *tls.ConnectionState {
+					return &tls.ConnectionState{}
+				})
+				return r.WithContext(ctx)
+			}(),
+			expectAltSvc: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{
+				logger:      zap.NewNop(),
+				errorLogger: zap.NewNop(),
+				h3server:    h3srv,
+				primaryHandlerChain: HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+					return nil
+				}),
+			}
+
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, tt.req)
+
+			altSvc := rec.Header().Get("Alt-Svc")
+			if tt.expectAltSvc {
+				assert.NotEmpty(t, altSvc, "expected Alt-Svc header for TLS request")
+			} else {
+				assert.Empty(t, altSvc, "expected no Alt-Svc header for plaintext request")
+			}
+		})
+	}
+}
+
