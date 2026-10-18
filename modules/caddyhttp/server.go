@@ -263,6 +263,14 @@ type Server struct {
 	// don't perform a retry, so disabling 0-RTT can smooth it out.
 	Allow0RTT *bool `json:"allow_0rtt,omitempty"`
 
+	// EarlyDataPolicy configures how 0-RTT early data requests are handled.
+	// Options: "reject_unsafe" (default), "reject_all", or "allow_all".
+	EarlyDataPolicy string `json:"early_data_policy,omitempty"`
+
+	// StrictEarlyData, if set to false, disables automatic HTTP 425 early data rejection.
+	// Alias for early_data_policy: "allow_all" when false.
+	StrictEarlyData *bool `json:"strict_early_data,omitempty"`
+
 	// If set, metrics observations will be enabled.
 	// This setting is EXPERIMENTAL and subject to change.
 	// DEPRECATED: Use the app-level `metrics` field.
@@ -354,7 +362,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Request:              r.Clone(r.Context()),
 		ShouldLogCredentials: shouldLogCredentials,
 	})
-	errLog := s.errorLogger.WithLazy(loggableReq)
+	errorLogger := s.errorLogger
+	if errorLogger == nil {
+		errorLogger = zap.NewNop()
+	}
+	errLog := errorLogger.WithLazy(loggableReq)
 
 	var duration time.Duration
 
@@ -382,7 +394,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// guarantee ACME HTTP challenges; handle them separately from any user-defined handlers
-	if s.tlsApp.HandleHTTPChallenge(w, r) {
+	if s.tlsApp != nil && s.tlsApp.HandleHTTPChallenge(w, r) {
 		duration = time.Since(start)
 		return
 	}
@@ -539,7 +551,49 @@ func (s *Server) enforcementHandler(w http.ResponseWriter, r *http.Request, next
 			return Error(http.StatusMisdirectedRequest, err)
 		}
 	}
+
+	// RFC 8470 replay protection: evaluate 0-RTT early data requests before running handler chains
+	if r.TLS != nil && !r.TLS.HandshakeComplete {
+		policy := s.getEarlyDataPolicy()
+		switch policy {
+		case "reject_all":
+			return Error(http.StatusTooEarly, fmt.Errorf("0-RTT early data rejected by server policy"))
+		case "reject_unsafe":
+			if !isSafeMethod(r.Method) {
+				return Error(http.StatusTooEarly, fmt.Errorf("0-RTT early data unsafe method %s rejected", r.Method))
+			}
+		case "allow_all":
+			// allow early data request
+		default:
+			if !isSafeMethod(r.Method) {
+				return Error(http.StatusTooEarly, fmt.Errorf("0-RTT early data unsafe method %s rejected", r.Method))
+			}
+		}
+	}
+
 	return next.ServeHTTP(w, r)
+}
+
+func (s *Server) getEarlyDataPolicy() string {
+	if s == nil {
+		return "reject_unsafe"
+	}
+	if s.StrictEarlyData != nil && !*s.StrictEarlyData {
+		return "allow_all"
+	}
+	if s.EarlyDataPolicy != "" {
+		return strings.ToLower(s.EarlyDataPolicy)
+	}
+	return "reject_unsafe"
+}
+
+func isSafeMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
 }
 
 // listenersUseAnyPortOtherThan returns true if there are any
@@ -980,6 +1034,15 @@ func (s *Server) Name() string { return s.name }
 // PrepareRequest fills the request r for use in a Caddy HTTP handler chain. w and s can
 // be nil, but the handlers will lose response placeholders and access to the server.
 func PrepareRequest(r *http.Request, repl *caddy.Replacer, w http.ResponseWriter, s *Server) *http.Request {
+	if r.Header == nil {
+		r.Header = make(http.Header)
+	}
+	if r.TLS != nil && !r.TLS.HandshakeComplete {
+		r.Header.Set("Early-Data", "1")
+	} else {
+		r.Header.Del("Early-Data")
+	}
+
 	// set up the context for the request
 	ctx := context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl)
 	ctx = context.WithValue(ctx, ServerCtxKey, s)

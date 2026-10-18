@@ -127,6 +127,11 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return port, true
 			case "http.request.hostport":
 				return req.Host, true
+			case "http.request.early_data":
+				if req.TLS != nil && !req.TLS.HandshakeComplete {
+					return "1", true
+				}
+				return "0", true
 			case "http.request.local":
 				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
 				return localAddr.String(), true
@@ -542,6 +547,8 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 		return req.TLS.ServerName, true
 	case "ech":
 		return req.TLS.ECHAccepted, true
+	case "early_data":
+		return req.TLS != nil && !req.TLS.HandshakeComplete, true
 	}
 	return nil, false
 }
