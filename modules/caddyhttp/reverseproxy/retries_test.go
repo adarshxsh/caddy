@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -784,4 +785,221 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	if rec.Body.String() != expectedBody {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
 	}
+}
+
+func TestBodyConsumptionRetryGuard(t *testing.T) {
+	const payload = "hello body consumption tracking"
+
+	t.Run("Unbuffered POST request with consumed body suppresses retry", func(t *testing.T) {
+		core, observedLogs := observer.New(zap.DebugLevel)
+		logger := zap.New(core)
+
+		// First upstream: reads 5 bytes from body and forcibly closes connection
+		badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			buf := make([]byte, 5)
+			_, _ = io.ReadFull(r.Body, buf)
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					conn.Close()
+				}
+			}
+		}))
+		t.Cleanup(badServer.Close)
+
+		// Second upstream: good server
+		var secondUpstreamCalled atomic.Bool
+		goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			secondUpstreamCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(goodServer.Close)
+
+		// Upstreams: goodServer at 0, badServer at 1 so RoundRobin selects badServer first
+		upstreams := []*Upstream{
+			{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+			{Host: new(Host), Dial: badServer.Listener.Addr().String()},
+		}
+
+		h := minimalHandler(1, upstreams...)
+		h.logger = logger
+
+		bodyReader := newCloseOnCloseReader(payload)
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+		req.Body = bodyReader
+		req.ContentLength = int64(len(payload))
+		req = prepareTestRequest(req)
+
+		rec := httptest.NewRecorder()
+		err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			return nil
+		}))
+
+		if secondUpstreamCalled.Load() {
+			t.Errorf("second upstream should not have been called because request body was consumed")
+		}
+
+		// Verify HandlerError 502 was returned
+		if err == nil {
+			t.Fatalf("expected error from ServeHTTP, got nil")
+		}
+		if herr, ok := err.(caddyhttp.HandlerError); !ok || herr.StatusCode != http.StatusBadGateway {
+			t.Errorf("expected 502 Bad Gateway, got err: %v", err)
+		}
+
+		// Check debug log produced
+		logEntries := observedLogs.FilterMessage("suppressing retry because request body was read").All()
+		if len(logEntries) == 0 {
+			t.Errorf("expected debug log for retry suppression, got logs: %v", observedLogs.All())
+		}
+	})
+
+	t.Run("Unbuffered POST request dial error retries successfully", func(t *testing.T) {
+		dead := deadUpstreamAddr(t)
+
+		goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(goodServer.Close)
+
+		upstreams := []*Upstream{
+			{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+			{Host: new(Host), Dial: dead},
+		}
+
+		h := minimalHandler(1, upstreams...)
+
+		bodyReader := newCloseOnCloseReader(payload)
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+		req.Body = bodyReader
+		req.ContentLength = int64(len(payload))
+		req = prepareTestRequest(req)
+
+		rec := httptest.NewRecorder()
+		err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			return nil
+		}))
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rec.Code != http.StatusOK {
+			t.Errorf("status: got %d, want %d", rec.Code, http.StatusOK)
+		}
+		if rec.Body.String() != payload {
+			t.Errorf("body: got %q, want %q", rec.Body.String(), payload)
+		}
+	})
+
+	t.Run("Pre-buffered POST request rewinds and retries mid-stream failure", func(t *testing.T) {
+		badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			buf := make([]byte, 5)
+			_, _ = io.ReadFull(r.Body, buf)
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					conn.Close()
+				}
+			}
+		}))
+		t.Cleanup(badServer.Close)
+
+		goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(goodServer.Close)
+
+		upstreams := []*Upstream{
+			{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+			{Host: new(Host), Dial: badServer.Listener.Addr().String()},
+		}
+
+		retryMatch := caddyhttp.MatcherSets{
+			caddyhttp.MatcherSet{
+				newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true"),
+			},
+		}
+
+		h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+		h.RequestBuffers = 1024 // pre-buffer up to 1KB
+
+		bodyReader := newCloseOnCloseReader(payload)
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+		req.Body = bodyReader
+		req.ContentLength = int64(len(payload))
+		req = prepareTestRequest(req)
+
+		rec := httptest.NewRecorder()
+		err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			return nil
+		}))
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rec.Code != http.StatusOK {
+			t.Errorf("status: got %d, want %d", rec.Code, http.StatusOK)
+		}
+		if rec.Body.String() != payload {
+			t.Errorf("body: got %q, want %q", rec.Body.String(), payload)
+		}
+	})
+
+	t.Run("GET request with consumed body suppresses retry on mid-stream failure", func(t *testing.T) {
+		core, observedLogs := observer.New(zap.DebugLevel)
+		logger := zap.New(core)
+
+		badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			buf := make([]byte, 5)
+			_, _ = io.ReadFull(r.Body, buf)
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					conn.Close()
+				}
+			}
+		}))
+		t.Cleanup(badServer.Close)
+
+		var secondCalled atomic.Bool
+		goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			secondCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(goodServer.Close)
+
+		// Upstreams: goodServer at 0, badServer at 1 so RoundRobin selects badServer first
+		upstreams := []*Upstream{
+			{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+			{Host: new(Host), Dial: badServer.Listener.Addr().String()},
+		}
+
+		h := minimalHandler(1, upstreams...)
+		h.logger = logger
+
+		bodyReader := newCloseOnCloseReader(payload)
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", bodyReader)
+		req.Body = bodyReader
+		req.ContentLength = int64(len(payload))
+		req = prepareTestRequest(req)
+
+		rec := httptest.NewRecorder()
+		err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			return nil
+		}))
+
+		if secondCalled.Load() {
+			t.Errorf("second upstream should not have been called for GET request with consumed body")
+		}
+
+		if err == nil {
+			t.Fatalf("expected error from ServeHTTP, got nil")
+		}
+
+		logEntries := observedLogs.FilterMessage("suppressing retry because request body was read").All()
+		if len(logEntries) == 0 {
+			t.Errorf("expected debug log for retry suppression, got logs: %v", observedLogs.All())
+		}
+	})
 }

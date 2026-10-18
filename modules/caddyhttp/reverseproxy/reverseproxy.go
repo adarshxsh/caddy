@@ -449,12 +449,32 @@ func (h *Handler) Cleanup() error {
 	return err
 }
 
+// bodyConsumedTracker is implemented by request body wrappers to report
+// whether any bytes have been read from an unbuffered request body stream.
+type bodyConsumedTracker interface {
+	bodyConsumed() bool
+}
+
 // bodyNopCloserIfNotRead wraps a request body to prevent closing if not read, i.e., when
 // dialing to upstream fails.
 // It will close the body as normal if the body is read.
 type bodyNopCloserIfNotRead struct {
 	io.ReadCloser
 	read int // tracks the number of bytes read, -1 when first Read returns 0, io.EOF
+}
+
+func (b *bodyNopCloserIfNotRead) bodyConsumed() bool {
+	return b != nil && b.read > 0
+}
+
+func reqBodyConsumed(req *http.Request) bool {
+	if req == nil || req.Body == nil {
+		return false
+	}
+	if tracker, ok := req.Body.(bodyConsumedTracker); ok {
+		return tracker.bodyConsumed()
+	}
+	return false
 }
 
 func (b *bodyNopCloserIfNotRead) Read(p []byte) (int, error) {
@@ -1353,27 +1373,36 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 		// are not idempotent; retryableResponseError is excluded here
 		// because its retry decision was already made in reverseProxy()
 		// when the response matchers were evaluated
-		if !isDialError && !isRetryableResponse && (!isHandlerError || !errors.Is(herr, errNoUpstream)) {
-			if lb.RetryMatch == nil && req.Method != "GET" {
-				// by default, don't retry requests if they aren't GET
+		if !isDialError {
+			if reqBodyConsumed(req) {
+				if c := logger.Check(zapcore.DebugLevel, "suppressing retry because request body was read"); c != nil {
+					c.Write(zap.String("method", req.Method), zap.String("path", req.URL.Path))
+				}
 				return false
 			}
 
-			// set transport error flag so CEL expressions can use
-			// {rp.is_transport_error} to decide whether to retry
-			repl, _ := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-			if repl != nil {
-				repl.Set("http.reverse_proxy.is_transport_error", true)
-				defer repl.Delete("http.reverse_proxy.is_transport_error")
-			}
+			if !isRetryableResponse && (!isHandlerError || !errors.Is(herr, errNoUpstream)) {
+				if lb.RetryMatch == nil && req.Method != "GET" {
+					// by default, don't retry requests if they aren't GET
+					return false
+				}
 
-			match, err := lb.RetryMatch.AnyMatchWithError(req)
-			if err != nil {
-				logger.Error("error matching request for retry", zap.Error(err))
-				return false
-			}
-			if !match {
-				return false
+				// set transport error flag so CEL expressions can use
+				// {rp.is_transport_error} to decide whether to retry
+				repl, _ := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+				if repl != nil {
+					repl.Set("http.reverse_proxy.is_transport_error", true)
+					defer repl.Delete("http.reverse_proxy.is_transport_error")
+				}
+
+				match, err := lb.RetryMatch.AnyMatchWithError(req)
+				if err != nil {
+					logger.Error("error matching request for retry", zap.Error(err))
+					return false
+				}
+				if !match {
+					return false
+				}
 			}
 		}
 	}
