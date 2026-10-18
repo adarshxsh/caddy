@@ -489,13 +489,29 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 		}
 		// TODO: figure out when to close the listener and the transport
 		// using the original net.PacketConn to close them properly
-		return &sharedQuicListener{EarlyListener: earlyLn, packetConn: ln, sqs: sqs, key: lnKey}, nil
+		return &sharedQuicListener{
+			EarlyListener: earlyLn,
+			packetConn:    ln,
+			sqs:           sqs,
+			key:           lnKey,
+			allow0RTT:     allow0rtt,
+		}, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	sql := sharedEarlyListener.(*sharedQuicListener)
+
+	requested0RTT := true
+	if allow0rttconf != nil {
+		requested0RTT = *allow0rttconf
+	}
+	if sql.allow0RTT != requested0RTT {
+		_, _ = listenerPool.Delete(lnKey)
+		return nil, fmt.Errorf("0-RTT configuration conflict for shared QUIC listener %s: requested allow_0rtt=%t, but existing listener has allow_0rtt=%t", lnKey, requested0RTT, sql.allow0RTT)
+	}
+
 	// add current tls.Config to sqs, so GetConfigForClient will always return the latest tls.Config in case of context cancellation
 	ctx, cancel := sql.sqs.addState(tlsConf)
 
@@ -594,6 +610,7 @@ type sharedQuicListener struct {
 	packetConn net.PacketConn // we have to hold these because quic-go won't close listeners it didn't create
 	sqs        *sharedQUICState
 	key        string
+	allow0RTT  bool
 }
 
 // Destruct closes the underlying QUIC listener and its associated net.PacketConn.

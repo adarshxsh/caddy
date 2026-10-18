@@ -15,8 +15,11 @@
 package caddy
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/internal"
@@ -709,4 +712,98 @@ func TestSplitUnixSocketPermissionsBits(t *testing.T) {
 			t.Errorf("Test %d: Expected perms '%s' but got '%s'", i, tc.expectFileMode, actualFileMode.Perm().String())
 		}
 	}
+}
+
+func TestListenQUIC0RTTConflict(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr, err := ParseNetworkAddress("udp/127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to parse network address: %v", err)
+	}
+
+	tlsConf := &tls.Config{
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			return &tls.Config{}, nil
+		},
+	}
+
+	boolTrue := true
+	boolFalse := false
+
+	// Scenario 1: Initial listener created with allow0rtt = true
+	ln1, err := addr.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf, nil, &boolTrue)
+	if err != nil {
+		t.Fatalf("failed initial ListenQUIC with allow0rtt=true: %v", err)
+	}
+
+	// Sub-case A: Second server requests allow0rtt = false -> MUST FAIL
+	_, err = addr.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf, nil, &boolFalse)
+	if err == nil {
+		t.Errorf("expected error when attaching allow0rtt=false to allow0rtt=true listener, got nil")
+	} else if !strings.Contains(err.Error(), "conflict") {
+		t.Errorf("expected conflict error, got: %v", err)
+	}
+
+	// Sub-case B: Second server requests allow0rtt = true -> MUST SUCCEED
+	ln2, err := addr.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf, nil, &boolTrue)
+	if err != nil {
+		t.Errorf("unexpected error attaching allow0rtt=true to allow0rtt=true listener: %v", err)
+	} else {
+		_ = ln2.Close()
+		_ = ln2.Close()
+	}
+
+	// Sub-case C: Second server omits allow0rtt (defaults to true) -> MUST SUCCEED
+	ln3, err := addr.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf, nil, nil)
+	if err != nil {
+		t.Errorf("unexpected error attaching default allow0rtt (nil) to allow0rtt=true listener: %v", err)
+	} else {
+		_ = ln3.Close()
+		_ = ln3.Close()
+	}
+
+	// Close initial listener twice to completely destroy it from listenerPool
+	_ = ln1.Close()
+	_ = ln1.Close()
+
+	// Scenario 2: Initial listener created with allow0rtt = false
+	addr2, err := ParseNetworkAddress("udp/127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to parse network address: %v", err)
+	}
+
+	lnFalse1, err := addr2.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf, nil, &boolFalse)
+	if err != nil {
+		t.Fatalf("failed initial ListenQUIC with allow0rtt=false: %v", err)
+	}
+
+	// Sub-case A: Second server requests allow0rtt = true -> MUST FAIL
+	_, err = addr2.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf, nil, &boolTrue)
+	if err == nil {
+		t.Errorf("expected error when attaching allow0rtt=true to allow0rtt=false listener, got nil")
+	} else if !strings.Contains(err.Error(), "conflict") {
+		t.Errorf("expected conflict error, got: %v", err)
+	}
+
+	// Sub-case B: Second server omits allow0rtt (defaults to true) -> MUST FAIL
+	_, err = addr2.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf, nil, nil)
+	if err == nil {
+		t.Errorf("expected error when attaching default allow0rtt (nil) to allow0rtt=false listener, got nil")
+	} else if !strings.Contains(err.Error(), "conflict") {
+		t.Errorf("expected conflict error, got: %v", err)
+	}
+
+	// Sub-case C: Second server requests allow0rtt = false -> MUST SUCCEED
+	lnFalse2, err := addr2.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf, nil, &boolFalse)
+	if err != nil {
+		t.Errorf("unexpected error attaching allow0rtt=false to allow0rtt=false listener: %v", err)
+	} else {
+		_ = lnFalse2.Close()
+		_ = lnFalse2.Close()
+	}
+
+	_ = lnFalse1.Close()
+	_ = lnFalse1.Close()
 }
