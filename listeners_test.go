@@ -233,6 +233,101 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 }
 
+func TestSharedQUICStateGetConfigForClientSessionTicketKeys(t *testing.T) {
+	hello := &tls.ClientHelloInfo{ServerName: "example.com"}
+
+	initialPolicy := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+	}
+	var key1, key2, key3 [32]byte
+	copy(key1[:], "initial-stek-key-000000000000001")
+	copy(key2[:], "rotated-stek-key-000000000000002")
+	copy(key3[:], "reloaded-stek-key-000000000000003")
+
+	initialPolicy.SetSessionTicketKeys([][32]byte{key1})
+
+	initialTopLevel := &tls.Config{
+		GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+			return initialPolicy, nil
+		},
+	}
+
+	sqs := newSharedQUICState(initialTopLevel)
+
+	// 1. Verify initial GetConfigForClient delegation
+	cfg, err := sqs.getConfigForClient(hello)
+	if err != nil {
+		t.Fatalf("unexpected error on getConfigForClient: %v", err)
+	}
+	if cfg != initialPolicy {
+		t.Fatalf("expected initialPolicy, got %v", cfg)
+	}
+
+	// 2. Simulate session ticket key rotation on the active policy
+	initialPolicy.SetSessionTicketKeys([][32]byte{key2, key1})
+
+	cfg, err = sqs.getConfigForClient(hello)
+	if err != nil {
+		t.Fatalf("unexpected error on getConfigForClient after rotation: %v", err)
+	}
+	if cfg != initialPolicy {
+		t.Fatalf("expected initialPolicy, got %v", cfg)
+	}
+
+	// 3. Add a new active config (e.g., config reload)
+	updatedPolicy := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+	}
+	updatedPolicy.SetSessionTicketKeys([][32]byte{key3})
+
+	updatedTopLevel := &tls.Config{
+		GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+			return updatedPolicy, nil
+		},
+	}
+
+	_, cancel := sqs.addState(updatedTopLevel)
+	sqs.rmu.Lock()
+	sqs.activeTlsConf = updatedTopLevel
+	sqs.rmu.Unlock()
+
+	cfg, err = sqs.getConfigForClient(hello)
+	if err != nil {
+		t.Fatalf("unexpected error on getConfigForClient after reload: %v", err)
+	}
+	if cfg != updatedPolicy {
+		t.Fatalf("expected updatedPolicy, got %v", cfg)
+	}
+
+	// 4. Cancel updated state and verify fallback to initialPolicy with rotated keys
+	cancel(nil)
+
+	cfg, err = sqs.getConfigForClient(hello)
+	if err != nil {
+		t.Fatalf("unexpected error on getConfigForClient after cancel: %v", err)
+	}
+	if cfg != initialPolicy {
+		t.Fatalf("expected initialPolicy, got %v", cfg)
+	}
+}
+
+func BenchmarkSharedQUICStateGetConfigForClient(b *testing.B) {
+	hello := &tls.ClientHelloInfo{ServerName: "example.com"}
+	policy := &tls.Config{MinVersion: tls.VersionTLS13}
+	topLevel := &tls.Config{
+		GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+			return policy, nil
+		},
+	}
+	sqs := newSharedQUICState(topLevel)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = sqs.getConfigForClient(hello)
+	}
+}
+
 func TestParseNetworkAddress(t *testing.T) {
 	for i, tc := range []struct {
 		input          string
