@@ -425,6 +425,13 @@ func JoinNetworkAddress(network, host, port string) string {
 
 // ListenQUIC returns a http3.QUICEarlyListener suitable for use in a Caddy module.
 //
+// The QUIC listener created here utilizes a wrapper tls.Config that delegates client
+// configuration lookups to sharedQUICState.getConfigForClient. By delegating GetConfigForClient
+// dynamically to the underlying active TLS connection policy configs (which are registered
+// with SessionTicketService), QUIC listeners automatically inherit rotated Session Ticket Ephemeral
+// Keys (STEKs) for 0-RTT session resumption without registering wrapper configs directly or incurring
+// extra state tracking overhead.
+//
 // The network will be transformed into a QUIC-compatible type if the same address can be used with
 // different networks. Currently this just means that for tcp, udp will be used with the same
 // address instead.
@@ -518,7 +525,19 @@ type contextAndCancelFunc struct {
 	context.CancelCauseFunc
 }
 
-// sharedQUICState manages GetConfigForClient
+// sharedQUICState manages GetConfigForClient delegation for QUIC listeners across configuration reloads.
+//
+// Architecture & TLS Config Delegation Flow:
+// 1. ListenQUIC creates a wrapper tls.Config configured with GetConfigForClient pointing to sqs.getConfigForClient.
+// 2. The wrapper tls.Config is not registered directly in SessionTicketService, avoiding duplicate registration and memory leaks.
+// 3. During QUIC TLS handshakes, quic-go invokes GetConfigForClient on the wrapper config.
+// 4. sqs.getConfigForClient delegates client configuration resolution to sqs.activeTlsConf.GetConfigForClient(ch).
+// 5. sqs.activeTlsConf evaluates matching connection policies and returns the active caddytls connection policy tls.Config.
+// 6. Active connection policy tls.Configs are registered with SessionTicketService upon provisioning. When SessionTicketService
+//    rotates STEKs (via interval, reload, or cluster sync), it calls SetSessionTicketKeys on all registered policy configs.
+// 7. Consequently, incoming QUIC handshakes dynamically receive connection policy configs containing the current rotated ticket
+//    keys, enabling 0-RTT session resumption without requiring listener restarts or direct wrapper registration.
+//
 // see issue: https://github.com/caddyserver/caddy/pull/4849
 type sharedQUICState struct {
 	rmu           sync.RWMutex
