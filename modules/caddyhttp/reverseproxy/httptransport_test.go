@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -275,6 +276,55 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			t.Cleanup(func() { conn.Close() })
 			if got := conn.RemoteAddr().String(); got != ln.Addr().String() {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_DialTimeout(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	tests := []struct {
+		name        string
+		dialTimeout caddy.Duration
+		wantTimeout caddy.Duration
+	}{
+		{
+			name:        "zero dial timeout defaults to 3s",
+			dialTimeout: 0,
+			wantTimeout: caddy.Duration(3 * time.Second),
+		},
+		{
+			name:        "negative 1s dial timeout defaults to 3s",
+			dialTimeout: caddy.Duration(-1 * time.Second),
+			wantTimeout: caddy.Duration(3 * time.Second),
+		},
+		{
+			name:        "negative 1ns dial timeout defaults to 3s",
+			dialTimeout: caddy.Duration(-1),
+			wantTimeout: caddy.Duration(3 * time.Second),
+		},
+		{
+			name:        "positive dial timeout preserved",
+			dialTimeout: caddy.Duration(5 * time.Second),
+			wantTimeout: caddy.Duration(5 * time.Second),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ht := &HTTPTransport{
+				DialTimeout: tt.dialTimeout,
+			}
+
+			_, err := ht.NewTransport(ctx)
+			if err != nil {
+				t.Fatalf("NewTransport() error = %v", err)
+			}
+
+			if ht.DialTimeout != tt.wantTimeout {
+				t.Errorf("DialTimeout = %v, want %v", ht.DialTimeout, tt.wantTimeout)
 			}
 		})
 	}
