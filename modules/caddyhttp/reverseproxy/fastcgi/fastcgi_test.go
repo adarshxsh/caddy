@@ -1,13 +1,20 @@
 package fastcgi
 
 import (
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 )
 
 func TestProvisionSplitPath(t *testing.T) {
@@ -354,4 +361,26 @@ func TestSplitPosSecurityRegressionUnicodeBypass(t *testing.T) {
 	for _, p := range payloads {
 		assert.Equalf(t, -1, tr.splitPos(p), "payload %q must not be detected as .php", p)
 	}
+}
+
+func TestFastCGIDialErrorWrapping(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	deadAddr := ln.Addr().String()
+	ln.Close()
+
+	fcgiTransport := &Transport{logger: zap.NewNop()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/", nil)
+	req = caddyhttp.PrepareRequest(req, caddy.NewReplacer(), nil, &caddyhttp.Server{})
+	caddyhttp.SetVar(req.Context(), "reverse_proxy.dial_info", reverseproxy.DialInfo{
+		Network: "tcp",
+		Address: deadAddr,
+	})
+
+	_, err = fcgiTransport.RoundTrip(req)
+	require.Error(t, err, "expected dial error from FastCGI transport on dead upstream")
+
+	var dialErr reverseproxy.DialError
+	assert.True(t, errors.As(err, &dialErr), "expected FastCGI dial error to be unwrappable as DialError using errors.As, got %T: %v", err, err)
 }

@@ -785,3 +785,182 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
 	}
 }
+
+func TestDialErrorUnwrap(t *testing.T) {
+	innerErr := errors.New("underlying network error")
+	dialErr := NewDialError(innerErr)
+
+	if !errors.Is(dialErr, innerErr) {
+		t.Errorf("errors.Is failed to find inner error in DialError")
+	}
+
+	unwrapped := errors.Unwrap(dialErr)
+	if unwrapped != innerErr {
+		t.Errorf("errors.Unwrap got %v, want %v", unwrapped, innerErr)
+	}
+}
+
+type mockTimeoutError struct{}
+
+func (m mockTimeoutError) Error() string   { return "i/o timeout" }
+func (m mockTimeoutError) Timeout() bool   { return true }
+func (m mockTimeoutError) Temporary() bool { return true }
+
+func TestStatusErrorTimeout(t *testing.T) {
+	timeoutErr := mockTimeoutError{}
+	dialErr := NewDialError(timeoutErr)
+
+	err := statusError(dialErr)
+	if herr, ok := err.(caddyhttp.HandlerError); ok {
+		if herr.StatusCode != http.StatusGatewayTimeout {
+			t.Errorf("expected status 504 Gateway Timeout, got %d", herr.StatusCode)
+		}
+	} else {
+		t.Fatalf("expected caddyhttp.HandlerError, got %T", err)
+	}
+}
+
+type tlsHandshakeTransport struct {
+	goodTransport http.RoundTripper
+	calls         atomic.Int32
+}
+
+func (t *tlsHandshakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "http"
+	}
+	if t.calls.Add(1) == 1 {
+		// First call fails with TLS handshake error wrapped in DialError
+		return nil, NewDialError(errors.New("tls: handshake failure"))
+	}
+	return t.goodTransport.RoundTrip(req)
+}
+
+func TestTLSHandshakeErrorBodyRetry(t *testing.T) {
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(goodServer.Close)
+
+	const reqBody = "tls retry body"
+	transport := &tlsHandshakeTransport{goodTransport: http.DefaultTransport}
+
+	h := &Handler{
+		logger:    zap.NewNop(),
+		Transport: transport,
+		Upstreams: []*Upstream{
+			{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+			{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		},
+		LoadBalancing: &LoadBalancing{
+			Retries:         1,
+			SelectionPolicy: &RoundRobinSelection{},
+		},
+	}
+
+	bodyReader := newCloseOnCloseReader(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+	req.Body = bodyReader
+	req.ContentLength = int64(len(reqBody))
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	gotStatus := rec.Code
+	if err != nil {
+		if herr, ok := err.(caddyhttp.HandlerError); ok {
+			gotStatus = herr.StatusCode
+		}
+	}
+
+	if gotStatus != http.StatusOK {
+		t.Errorf("status: got %d, want %d (err=%v)", gotStatus, http.StatusOK, err)
+	}
+	if rec.Body.String() != reqBody {
+		t.Errorf("body: got %q, want %q", rec.Body.String(), reqBody)
+	}
+}
+
+type mockFastCGIDialTransport struct {
+	goodTransport http.RoundTripper
+	calls         atomic.Int32
+}
+
+func (t *mockFastCGIDialTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "http"
+	}
+	if t.calls.Add(1) == 1 {
+		// First call simulates FastCGI dial error wrapped in DialError
+		return nil, NewDialError(errors.New("dialing backend: dial tcp 127.0.0.1:9000: connect: connection refused"))
+	}
+	return t.goodTransport.RoundTrip(req)
+}
+
+func TestFastCGIDialErrorBodyRetry(t *testing.T) {
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(goodServer.Close)
+
+	dead := deadUpstreamAddr(t)
+
+	// Verify retry handling with Handler when FastCGI dial error occurs on first upstream
+	fcgiRetryTransport := &mockFastCGIDialTransport{
+		goodTransport: http.DefaultTransport,
+	}
+
+	h := &Handler{
+		logger:    zap.NewNop(),
+		Transport: fcgiRetryTransport,
+		Upstreams: []*Upstream{
+			{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+			{Host: new(Host), Dial: dead},
+		},
+		LoadBalancing: &LoadBalancing{
+			Retries:         1,
+			SelectionPolicy: &RoundRobinSelection{},
+		},
+	}
+
+	const reqBody = "fastcgi retry body"
+	bodyReader := newCloseOnCloseReader(reqBody)
+	postReq := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+	postReq.Body = bodyReader
+	postReq.ContentLength = int64(len(reqBody))
+	postReq = prepareTestRequest(postReq)
+
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, postReq, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	gotStatus := rec.Code
+	if err != nil {
+		if herr, ok := err.(caddyhttp.HandlerError); ok {
+			gotStatus = herr.StatusCode
+		}
+	}
+
+	if gotStatus != http.StatusOK {
+		t.Errorf("status: got %d, want %d (err=%v)", gotStatus, http.StatusOK, err)
+	}
+	if rec.Body.String() != reqBody {
+		t.Errorf("body: got %q, want %q", rec.Body.String(), reqBody)
+	}
+}
