@@ -7,6 +7,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +83,147 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestMaxLatencyWriter_EarlyBodyWriteCancelsHeaderTimer(t *testing.T) {
+	var dst bytes.Buffer
+	var flushed sync.Map
+	flushCount := 0
+	var mu sync.Mutex
+
+	flush := func() error {
+		mu.Lock()
+		flushCount++
+		mu.Unlock()
+		flushed.Store(flushCount, true)
+		return nil
+	}
+
+	mlw := &maxLatencyWriter{
+		dst:     &dst,
+		flush:   flush,
+		latency: 500 * time.Millisecond,
+		logger:  zap.NewNop(),
+	}
+	defer mlw.stop()
+
+	mlw.startHeaderTimer()
+
+	// Perform a body write almost immediately before the 500ms header timer expires
+	n, err := mlw.Write([]byte("hello"))
+	if err != nil {
+		t.Fatalf("unexpected Write error: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("expected 5 bytes written, got %d", n)
+	}
+
+	mlw.mu.Lock()
+	if mlw.headerTimer != nil {
+		t.Errorf("expected headerTimer to be canceled and set to nil, got %v", mlw.headerTimer)
+	}
+	if !mlw.flushPending {
+		t.Errorf("expected flushPending to be true for body write")
+	}
+	mlw.mu.Unlock()
+
+	// Wait for body flush timer to execute
+	time.Sleep(600 * time.Millisecond)
+
+	mu.Lock()
+	count := flushCount
+	mu.Unlock()
+	if count < 1 {
+		t.Errorf("expected flush to be called for body write, got count %d", count)
+	}
+}
+
+func TestMaxLatencyWriter_SlowBackendHeaderFlush(t *testing.T) {
+	var dst bytes.Buffer
+	flushed := make(chan struct{}, 1)
+
+	flush := func() error {
+		select {
+		case flushed <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+
+	mlw := &maxLatencyWriter{
+		dst:     &dst,
+		flush:   flush,
+		latency: 50 * time.Millisecond,
+		logger:  zap.NewNop(),
+	}
+	defer mlw.stop()
+
+	mlw.startHeaderTimer()
+
+	// Wait for the initial header flush timer to expire without writing body bytes
+	select {
+	case <-flushed:
+		// Header flush succeeded on timer expiration
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for initial header flush")
+	}
+
+	mlw.mu.Lock()
+	if mlw.headerTimer != nil {
+		t.Errorf("expected headerTimer to be nil after firing, got %v", mlw.headerTimer)
+	}
+	mlw.mu.Unlock()
+}
+
+func TestMaxLatencyWriter_ConcurrentWriteAndHeaderTimer(t *testing.T) {
+	var dst bytes.Buffer
+	flush := func() error { return nil }
+
+	mlw := &maxLatencyWriter{
+		dst:     &dst,
+		flush:   flush,
+		latency: 1 * time.Millisecond,
+		logger:  zap.NewNop(),
+	}
+
+	mlw.startHeaderTimer()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_, _ = mlw.Write([]byte("data"))
+				time.Sleep(100 * time.Microsecond)
+			}
+		}()
+	}
+
+	wg.Wait()
+	mlw.stop()
+}
+
+func TestMaxLatencyWriter_Stop(t *testing.T) {
+	var dst bytes.Buffer
+	flush := func() error { return nil }
+
+	mlw := &maxLatencyWriter{
+		dst:     &dst,
+		flush:   flush,
+		latency: 500 * time.Millisecond,
+		logger:  zap.NewNop(),
+	}
+
+	mlw.startHeaderTimer()
+	mlw.stop()
+
+	mlw.mu.Lock()
+	defer mlw.mu.Unlock()
+
+	if mlw.headerTimer != nil {
+		t.Errorf("expected headerTimer to be nil after stop()")
+	}
+	if mlw.flushPending {
+		t.Errorf("expected flushPending to be false after stop()")
+	}
+}
