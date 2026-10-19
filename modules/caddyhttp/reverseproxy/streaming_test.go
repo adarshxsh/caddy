@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +81,91 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	flushCount int
+}
+
+func (f *flushRecorder) Flush() {
+	f.flushCount++
+	f.ResponseRecorder.Flush()
+}
+
+func TestMaxLatencyWriterStopFinalFlush(t *testing.T) {
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	flushed := 0
+	mlw := &maxLatencyWriter{
+		dst: rec,
+		flush: func() error {
+			flushed++
+			rec.Flush()
+			return nil
+		},
+		latency:      10 * time.Second, // long latency so timer won't fire automatically
+		flushPending: true,
+		logger:       caddy.Log(),
+	}
+
+	// Write some trailing response bytes
+	_, err := mlw.Write([]byte("hello trailing bytes"))
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+
+	if flushed != 0 {
+		t.Fatalf("expected 0 flushes before stop, got %d", flushed)
+	}
+
+	mlw.stop()
+
+	if flushed != 1 {
+		t.Fatalf("expected 1 final flush upon stop, got %d", flushed)
+	}
+	if mlw.flushPending {
+		t.Fatalf("expected flushPending to be false after stop")
+	}
+
+	// Second call to stop should be a no-op (no duplicate flush)
+	mlw.stop()
+	if flushed != 1 {
+		t.Fatalf("expected still 1 flush after second stop, got %d", flushed)
+	}
+}
+
+func TestMaxLatencyWriterStopNoPending(t *testing.T) {
+	flushed := 0
+	mlw := &maxLatencyWriter{
+		dst: bytes.NewBuffer(nil),
+		flush: func() error {
+			flushed++
+			return nil
+		},
+		latency:      10 * time.Second,
+		flushPending: false,
+		logger:       caddy.Log(),
+	}
+
+	mlw.stop()
+	if flushed != 0 {
+		t.Fatalf("expected 0 flushes when stop called without pending flush, got %d", flushed)
+	}
+}
+
+func TestHandlerCopyResponseWithFlushInterval(t *testing.T) {
+	h := Handler{}
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	src := strings.NewReader("streaming response data")
+
+	err := h.copyResponse(rec, src, 100*time.Millisecond, caddy.Log())
+	if err != nil {
+		t.Fatalf("copyResponse failed: %v", err)
+	}
+
+	if rec.Body.String() != "streaming response data" {
+		t.Fatalf("got body %q, want %q", rec.Body.String(), "streaming response data")
+	}
+	if rec.flushCount < 1 {
+		t.Fatalf("expected at least 1 flush upon stream completion, got %d", rec.flushCount)
+	}
+}
