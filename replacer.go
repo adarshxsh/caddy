@@ -38,7 +38,7 @@ func NewReplacer() *Replacer {
 	}
 	rep.providers = []replacementProvider{
 		globalDefaultReplacementProvider{},
-		fileReplacementProvider{},
+		newFileReplacementProvider(),
 		ReplacerFunc(rep.fromStatic),
 	}
 	return rep
@@ -347,9 +347,25 @@ type replacementProvider interface {
 	replace(key string) (any, bool)
 }
 
+// fileCache provides thread-safe caching for fileReplacementProvider.
+type fileCache struct {
+	mu    sync.RWMutex
+	items map[string]any
+}
+
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
-type fileReplacementProvider struct{}
+type fileReplacementProvider struct {
+	cache *fileCache
+}
+
+func newFileReplacementProvider() fileReplacementProvider {
+	return fileReplacementProvider{
+		cache: &fileCache{
+			items: make(map[string]any),
+		},
+	}
+}
 
 func (f fileReplacementProvider) replace(key string) (any, bool) {
 	if !strings.HasPrefix(key, filePrefix) {
@@ -357,20 +373,42 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 	}
 
 	filename := key[len(filePrefix):]
+
+	if f.cache != nil {
+		f.cache.mu.RLock()
+		val, ok := f.cache.items[filename]
+		f.cache.mu.RUnlock()
+		if ok {
+			return val, true
+		}
+	}
+
 	maxSize := 1024 * 1024
 	body, err := readFileIntoBuffer(filename, maxSize)
 	if err != nil {
-		wd, _ := os.Getwd()
 		Log().Error("placeholder: failed to read file",
 			zap.String("file", filename),
-			zap.String("working_dir", wd),
+			zap.String("working_dir", workingDir),
 			zap.Error(err))
+		if f.cache != nil {
+			f.cache.mu.Lock()
+			f.cache.items[filename] = nil
+			f.cache.mu.Unlock()
+		}
 		return nil, true
 	}
 	body = bytes.TrimSuffix(body, []byte("\n"))
 	body = bytes.TrimSuffix(body, []byte("\r"))
-	return string(body), true
+	val := string(body)
+	if f.cache != nil {
+		f.cache.mu.Lock()
+		f.cache.items[filename] = val
+		f.cache.mu.Unlock()
+	}
+	return val, true
 }
+
+var workingDir, _ = os.Getwd()
 
 // globalDefaultReplacementProvider handles replacements
 // that can be used in any context, such as system variables,
