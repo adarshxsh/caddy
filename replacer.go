@@ -88,7 +88,33 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 	r.providers = append(r.providers, mapFunc)
 }
 
-// Set sets a custom variable to a static value.
+// ReplacementProvider is a type that can provide replacements
+// for placeholders. Allows for type assertion to determine
+// which type of provider it is.
+type ReplacementProvider interface {
+	Replace(key string) (any, bool)
+}
+
+type replacementProvider interface {
+	replace(key string) (any, bool)
+}
+
+type providerWrapper struct {
+	provider ReplacementProvider
+}
+
+func (w providerWrapper) replace(key string) (any, bool) {
+	return w.provider.Replace(key)
+}
+
+// MapProvider adds provider to the list of value providers.
+func (r *Replacer) MapProvider(provider ReplacementProvider) {
+	if rp, ok := provider.(replacementProvider); ok {
+		r.providers = append(r.providers, rp)
+	} else {
+		r.providers = append(r.providers, providerWrapper{provider})
+	}
+}
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
 	r.static[variable] = value
@@ -340,12 +366,6 @@ func (f ReplacerFunc) replace(key string) (any, bool) {
 	return f(key)
 }
 
-// replacementProvider is a type that can provide replacements
-// for placeholders. Allows for type assertion to determine
-// which type of provider it is.
-type replacementProvider interface {
-	replace(key string) (any, bool)
-}
 
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
