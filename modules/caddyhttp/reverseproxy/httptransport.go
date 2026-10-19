@@ -21,14 +21,18 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	weakrand "math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -642,7 +646,52 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return h.h3Transport.RoundTrip(req)
 	}
 
-	return h.Transport.RoundTrip(req)
+	if h.ReadTimeout <= 0 && h.WriteTimeout <= 0 {
+		return h.Transport.RoundTrip(req)
+	}
+
+	var tc *tcpRWTimeoutConn
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn != nil {
+				if conn := getTimeoutConn(info.Conn); conn != nil {
+					tc = conn
+					tc.startOp()
+				}
+			}
+		},
+	}
+
+	ctx := httptrace.WithClientTrace(req.Context(), trace)
+	req = req.WithContext(ctx)
+
+	resp, err := h.Transport.RoundTrip(req)
+	if err != nil {
+		if tc != nil {
+			tc.endOp()
+		}
+		return nil, err
+	}
+
+	if resp.Body == nil || resp.Body == http.NoBody {
+		if tc != nil {
+			tc.endOp()
+		}
+		return resp, nil
+	}
+
+	bw := &responseBodyWrapper{
+		ReadCloser: resp.Body,
+		tc:         tc,
+	}
+	if reqCtx := req.Context(); reqCtx != nil {
+		bw.stopContextCallback = context.AfterFunc(reqCtx, func() {
+			bw.endOpOnce()
+		})
+	}
+	resp.Body = bw
+
+	return resp, nil
 }
 
 // SetScheme ensures that the outbound request req
@@ -921,7 +970,7 @@ type KeepAlive struct {
 	IdleConnTimeout caddy.Duration `json:"idle_timeout,omitempty"`
 }
 
-// tcpRWTimeoutConn enforces read/write timeouts for a TCP connection.
+// tcpRWTimeoutConn enforces read/write timeouts for active operations on a TCP connection.
 // If it fails to set deadlines, the error is logged but does not abort
 // the read/write attempt (ignoring the error is consistent with what
 // the standard library does: https://github.com/golang/go/blob/c5da4fb7ac5cb7434b41fc9a1df3bee66c7f1a4d/src/net/http/server.go#L981-L986)
@@ -929,10 +978,49 @@ type tcpRWTimeoutConn struct {
 	*net.TCPConn
 	readTimeout, writeTimeout time.Duration
 	logger                    *zap.Logger
+	activeCount               atomic.Int32
+}
+
+func (c *tcpRWTimeoutConn) startOp() {
+	if c == nil {
+		return
+	}
+	newCount := c.activeCount.Add(1)
+	if newCount == 1 {
+		now := time.Now()
+		if c.readTimeout > 0 {
+			if err := c.TCPConn.SetReadDeadline(now.Add(c.readTimeout)); err != nil {
+				if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
+					ce.Write(zap.Error(err))
+				}
+			}
+		}
+		if c.writeTimeout > 0 {
+			if err := c.TCPConn.SetWriteDeadline(now.Add(c.writeTimeout)); err != nil {
+				if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
+					ce.Write(zap.Error(err))
+				}
+			}
+		}
+	}
+}
+
+func (c *tcpRWTimeoutConn) endOp() {
+	if c == nil {
+		return
+	}
+	newCount := c.activeCount.Add(-1)
+	if newCount <= 0 {
+		if newCount < 0 {
+			c.activeCount.Store(0)
+		}
+		_ = c.TCPConn.SetReadDeadline(time.Time{})
+		_ = c.TCPConn.SetWriteDeadline(time.Time{})
+	}
 }
 
 func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
-	if c.readTimeout > 0 {
+	if c.readTimeout > 0 && c.activeCount.Load() > 0 {
 		err := c.TCPConn.SetReadDeadline(time.Now().Add(c.readTimeout))
 		if err != nil {
 			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
@@ -944,7 +1032,7 @@ func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
 }
 
 func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
-	if c.writeTimeout > 0 {
+	if c.writeTimeout > 0 && c.activeCount.Load() > 0 {
 		err := c.TCPConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 		if err != nil {
 			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
@@ -953,6 +1041,59 @@ func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
 		}
 	}
 	return c.TCPConn.Write(b)
+}
+
+func (c *tcpRWTimeoutConn) Close() error {
+	c.activeCount.Store(0)
+	_ = c.TCPConn.SetReadDeadline(time.Time{})
+	_ = c.TCPConn.SetWriteDeadline(time.Time{})
+	return c.TCPConn.Close()
+}
+
+func getTimeoutConn(conn net.Conn) *tcpRWTimeoutConn {
+	for conn != nil {
+		if tc, ok := conn.(*tcpRWTimeoutConn); ok {
+			return tc
+		}
+		if unwrapper, ok := conn.(interface{ NetConn() net.Conn }); ok {
+			conn = unwrapper.NetConn()
+		} else {
+			break
+		}
+	}
+	return nil
+}
+
+type responseBodyWrapper struct {
+	io.ReadCloser
+	tc                  *tcpRWTimeoutConn
+	once                sync.Once
+	stopContextCallback func() bool
+}
+
+func (b *responseBodyWrapper) endOpOnce() {
+	b.once.Do(func() {
+		if b.stopContextCallback != nil {
+			b.stopContextCallback()
+		}
+		if b.tc != nil {
+			b.tc.endOp()
+		}
+	})
+}
+
+func (b *responseBodyWrapper) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.endOpOnce()
+	}
+	return n, err
+}
+
+func (b *responseBodyWrapper) Close() error {
+	err := b.ReadCloser.Close()
+	b.endOpOnce()
+	return err
 }
 
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.

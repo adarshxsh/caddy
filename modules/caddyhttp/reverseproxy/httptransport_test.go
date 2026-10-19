@@ -1,13 +1,18 @@
 package reverseproxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +282,191 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestHTTPTransport_OperationScopedDeadlines_HTTP11(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(300 * time.Millisecond),
+		KeepAlive: &KeepAlive{
+			IdleConnTimeout: caddy.Duration(2 * time.Second),
+		},
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	req1, err := http.NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest 1 failed: %v", err)
+	}
+	resp1, err := ht.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("RoundTrip 1 failed: %v", err)
+	}
+	body1, err := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if err != nil || string(body1) != "ok" {
+		t.Fatalf("Read body 1 failed: %v, %s", err, string(body1))
+	}
+
+	// Sleep 600ms, which exceeds ReadTimeout (300ms) but is less than IdleConnTimeout (2s)
+	time.Sleep(600 * time.Millisecond)
+
+	req2, err := http.NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest 2 failed: %v", err)
+	}
+	resp2, err := ht.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("RoundTrip 2 failed after idle period: %v", err)
+	}
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if err != nil || string(body2) != "ok" {
+		t.Fatalf("Read body 2 failed: %v, %s", err, string(body2))
+	}
+}
+
+func TestHTTPTransport_OperationScopedDeadlines_HTTP2(t *testing.T) {
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok h2"))
+	}))
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	defer ts.Close()
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(300 * time.Millisecond),
+		Versions:    []string{"2"},
+		TLS: &TLSConfig{
+			InsecureSkipVerify: true,
+		},
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	req1, err := http.NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest 1 failed: %v", err)
+	}
+	resp1, err := ht.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("RoundTrip 1 failed: %v", err)
+	}
+	body1, err := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if err != nil || string(body1) != "ok h2" {
+		t.Fatalf("Read body 1 failed: %v, %s", err, string(body1))
+	}
+
+	// Sleep 600ms (gap between streams > ReadTimeout)
+	time.Sleep(600 * time.Millisecond)
+
+	req2, err := http.NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest 2 failed: %v", err)
+	}
+	resp2, err := ht.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("RoundTrip 2 failed: %v", err)
+	}
+	body2, err := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if err != nil || string(body2) != "ok h2" {
+		t.Fatalf("Read body 2 failed: %v, %s", err, string(body2))
+	}
+}
+
+func TestHTTPTransport_ActiveReadTimeout(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Stall response payload delivery to trigger ReadTimeout
+		time.Sleep(500 * time.Millisecond)
+		_, _ = w.Write([]byte("slow response"))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		ReadTimeout: caddy.Duration(100 * time.Millisecond),
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	req, err := http.NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	resp, err := ht.RoundTrip(req)
+	if err != nil {
+		// Response header read could timeout if headers weren't flushed, or succeeded
+		return
+	}
+	defer resp.Body.Close()
+
+	_, err = io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatalf("expected ReadTimeout error, got nil")
+	}
+}
+
+func TestHTTPTransport_ActiveWriteTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			time.Sleep(2 * time.Second)
+		}
+	}()
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		WriteTimeout: caddy.Duration(100 * time.Millisecond),
+	}
+	if err := ht.Provision(ctx); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	largePayload := make([]byte, 10*1024*1024)
+	req, err := http.NewRequest("POST", "http://"+ln.Addr().String(), bytes.NewReader(largePayload))
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+
+	_, err = ht.RoundTrip(req)
+	if err == nil {
+		t.Fatalf("expected WriteTimeout error, got nil")
 	}
 }
