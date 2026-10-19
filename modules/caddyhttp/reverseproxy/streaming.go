@@ -205,11 +205,21 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteBackConn()
 
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         wg,
-		bufferSize: h.StreamBufferSize,
+		user:        conn,
+		backend:     backConn,
+		wg:          wg,
+		bufferSize:  h.StreamBufferSize,
+		isWebsocket: isWebsocket(req),
 	}
+
+	var closeOnce sync.Once
+	closeConns := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+			backConn.Close()
+		})
+	}
+	defer closeConns()
 
 	// setup the timeout if requested
 	var timeoutc <-chan time.Time
@@ -219,23 +229,43 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		timeoutc = timer.C
 	}
 
-	// when a stream timeout is encountered, no error will be read from errc
-	// a buffer size of 2 will allow both the read and write goroutines to send the error and exit
+	var reqDone <-chan struct{}
+	if req.Context() != nil {
+		reqDone = req.Context().Done()
+	}
+
+	// a buffer size of 2 will allow both the read and write goroutines to send error/nil and exit
 	// see: https://github.com/caddyserver/caddy/issues/7418
 	errc := make(chan error, 2)
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+
+	for finished := 0; finished < 2; {
+		select {
+		case err := <-errc:
+			finished++
+			if err != nil {
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				closeConns()
+			}
+		case time := <-timeoutc:
+			if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", time))
+			}
+			closeConns()
+			timeoutc = nil
+		case <-reqDone:
+			if c := logger.Check(zapcore.DebugLevel, "request context canceled"); c != nil {
+				c.Write(zap.Error(req.Context().Err()))
+			}
+			closeConns()
+			reqDone = nil
 		}
 	}
+	wg.Wait()
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
@@ -381,6 +411,9 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 // The caller should call the returned delete() function when the
 // connection is done to remove it from memory.
 func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (del func()) {
+	if h.connectionsMu == nil {
+		return func() {}
+	}
 	h.connectionsMu.Lock()
 	h.connections[conn] = openConnection{conn, gracefulClose}
 	h.connectionsMu.Unlock()
@@ -636,22 +669,42 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
+func closeWrite(dst io.Writer, isClient bool, isWebsocket bool) {
+	if isWebsocket {
+		_ = writeCloseControl(dst, isClient)
+	}
+	if cw, ok := dst.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
 	user, backend io.ReadWriteCloser
 	wg            *sync.WaitGroup
 	bufferSize    int
+	isWebsocket   bool
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	if err == nil {
+		closeWrite(c.user, false, c.isWebsocket)
+	}
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	if err == nil {
+		closeWrite(c.backend, true, c.isWebsocket)
+	}
 	errc <- err
 	c.wg.Done()
 }
