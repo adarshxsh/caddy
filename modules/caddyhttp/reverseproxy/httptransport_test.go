@@ -8,6 +8,9 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -278,4 +281,87 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTCPRWTimeoutConn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c, err := ln.Accept()
+		if err == nil {
+			c.Close()
+		}
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("expected *net.TCPConn, got %T", conn)
+	}
+
+	timeoutConn := &tcpRWTimeoutConn{
+		TCPConn: tcpConn,
+		logger:  zap.NewNop(),
+	}
+	timeoutConn.readTimeout.Store(int64(500 * time.Millisecond))
+	timeoutConn.writeTimeout.Store(int64(500 * time.Millisecond))
+
+	if timeoutConn.Unwrap() != tcpConn {
+		t.Fatalf("Unwrap() did not return underlying *net.TCPConn")
+	}
+
+	// Test SetReadDeadline(zero)
+	if err := timeoutConn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetReadDeadline error: %v", err)
+	}
+	if got := timeoutConn.readTimeout.Load(); got != 0 {
+		t.Errorf("readTimeout after SetReadDeadline(zero) = %d, want 0", got)
+	}
+
+	// Reset readTimeout
+	timeoutConn.readTimeout.Store(int64(500 * time.Millisecond))
+
+	// Test SetWriteDeadline(zero)
+	if err := timeoutConn.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetWriteDeadline error: %v", err)
+	}
+	if got := timeoutConn.writeTimeout.Load(); got != 0 {
+		t.Errorf("writeTimeout after SetWriteDeadline(zero) = %d, want 0", got)
+	}
+
+	// Reset writeTimeout
+	timeoutConn.writeTimeout.Store(int64(500 * time.Millisecond))
+
+	// Test SetDeadline(zero)
+	if err := timeoutConn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetDeadline error: %v", err)
+	}
+	if got := timeoutConn.readTimeout.Load(); got != 0 || timeoutConn.writeTimeout.Load() != 0 {
+		t.Errorf("timeouts after SetDeadline(zero) = (%d, %d), want (0, 0)", timeoutConn.readTimeout.Load(), timeoutConn.writeTimeout.Load())
+	}
+
+	// Reset timeouts
+	timeoutConn.readTimeout.Store(int64(500 * time.Millisecond))
+	timeoutConn.writeTimeout.Store(int64(500 * time.Millisecond))
+
+	// Test DisableTimeouts()
+	if err := timeoutConn.DisableTimeouts(); err != nil {
+		t.Fatalf("DisableTimeouts error: %v", err)
+	}
+	if got := timeoutConn.readTimeout.Load(); got != 0 || timeoutConn.writeTimeout.Load() != 0 {
+		t.Errorf("timeouts after DisableTimeouts() = (%d, %d), want (0, 0)", timeoutConn.readTimeout.Load(), timeoutConn.writeTimeout.Load())
+	}
+
+	<-done
 }

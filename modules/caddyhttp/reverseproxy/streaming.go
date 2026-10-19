@@ -26,7 +26,9 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
 	"unsafe"
@@ -142,6 +144,9 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			return
 		}
 	}
+
+	clearDeadline(backConn)
+	clearDeadline(conn)
 
 	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
 	backConnCloseCh := make(chan struct{})
@@ -679,3 +684,93 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+// clearDeadline clears read and write deadlines on c, including unwrapping nested connections.
+func clearDeadline(c any) {
+	clearDeadlineWithDepth(c, 0)
+}
+
+func clearDeadlineWithDepth(c any, depth int) {
+	if c == nil || depth > 10 {
+		return
+	}
+
+	if d, ok := c.(interface{ DisableTimeouts() error }); ok {
+		_ = d.DisableTimeouts()
+	} else if d, ok := c.(interface{ DisableTimeouts() }); ok {
+		d.DisableTimeouts()
+	} else {
+		if d, ok := c.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = d.SetDeadline(time.Time{})
+		}
+		if d, ok := c.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = d.SetReadDeadline(time.Time{})
+		}
+		if d, ok := c.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = d.SetWriteDeadline(time.Time{})
+		}
+	}
+
+	// Support nested connection wrappers to reach lower timeout controllers
+	type unwrapperConn interface {
+		Unwrap() net.Conn
+	}
+	type unwrapperRWC interface {
+		Unwrap() io.ReadWriteCloser
+	}
+	type unwrapperAny interface {
+		Unwrap() any
+	}
+
+	unwrapped := false
+	if u, ok := c.(unwrapperConn); ok {
+		if next := u.Unwrap(); next != nil && next != c {
+			unwrapped = true
+			clearDeadlineWithDepth(next, depth+1)
+		}
+	}
+	if !unwrapped {
+		if u, ok := c.(unwrapperRWC); ok {
+			if next := u.Unwrap(); next != nil && next != c {
+				unwrapped = true
+				clearDeadlineWithDepth(next, depth+1)
+			}
+		}
+	}
+	if !unwrapped {
+		if u, ok := c.(unwrapperAny); ok {
+			if next := u.Unwrap(); next != nil && next != c {
+				unwrapped = true
+				clearDeadlineWithDepth(next, depth+1)
+			}
+		}
+	}
+
+	// If method-based unwrapping did not find a child, use reflection to unwrap struct fields
+	// (e.g., stdlib http.readWriteCloserBody or custom wrappers)
+	if !unwrapped {
+		v := reflect.ValueOf(c)
+		if v.IsValid() {
+			if v.Kind() == reflect.Pointer && !v.IsNil() {
+				v = v.Elem()
+			}
+			if v.Kind() == reflect.Struct {
+				for i := 0; i < v.NumField(); i++ {
+					field := v.Field(i)
+					if !field.IsValid() {
+						continue
+					}
+					var fieldVal any
+					if field.CanInterface() {
+						fieldVal = field.Interface()
+					} else if field.CanAddr() {
+						fieldVal = reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Interface()
+					}
+					if fieldVal != nil && fieldVal != c {
+						clearDeadlineWithDepth(fieldVal, depth+1)
+					}
+				}
+			}
+		}
+	}
+}
