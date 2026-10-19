@@ -785,14 +785,14 @@ func (*HTTPErrorConfig) WithError(r *http.Request, err error) *http.Request {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	repl.Set("http.error", err)
 	if handlerErr, ok := err.(HandlerError); ok {
-		repl.Set("http.error.status_code", handlerErr.StatusCode)
-		repl.Set("http.error.status_text", http.StatusText(handlerErr.StatusCode))
-		repl.Set("http.error.id", handlerErr.ID)
-		repl.Set("http.error.trace", handlerErr.Trace)
+		repl.SetInt("http.error.status_code", handlerErr.StatusCode)
+		repl.SetString("http.error.status_text", http.StatusText(handlerErr.StatusCode))
+		repl.SetString("http.error.id", handlerErr.ID)
+		repl.SetString("http.error.trace", handlerErr.Trace)
 		if handlerErr.Err != nil {
-			repl.Set("http.error.message", handlerErr.Err.Error())
+			repl.SetString("http.error.message", handlerErr.Err.Error())
 		} else {
-			repl.Set("http.error.message", http.StatusText(handlerErr.StatusCode))
+			repl.SetString("http.error.message", http.StatusText(handlerErr.StatusCode))
 		}
 	}
 
@@ -854,10 +854,10 @@ func (s *Server) logRequest(
 	status := wrec.Status()
 	size := wrec.Size()
 
-	repl.Set("http.response.status", status) // will be 0 if no response is written by us (Go will write 200 to client)
-	repl.Set("http.response.size", size)
+	repl.SetInt("http.response.status", status) // will be 0 if no response is written by us (Go will write 200 to client)
+	repl.SetInt("http.response.size", size)
 	repl.Set("http.response.duration", duration)
-	repl.Set("http.response.duration_ms", duration.Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
+	repl.SetFloat64("http.response.duration_ms", duration.Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
 
 	loggers := []*zap.Logger{accLog}
 	if s.Logs != nil {

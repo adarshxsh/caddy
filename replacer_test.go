@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -220,10 +221,11 @@ func TestReplacerSet(t *testing.T) {
 	} {
 		rep.Set(tc.variable, tc.value)
 
+		expected := ToString(tc.value)
 		// test if key is added
 		if val, ok := rep.static[tc.variable]; ok {
-			if val != tc.value {
-				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
+			if val != expected {
+				t.Errorf("Expected value '%s' for key '%s' got '%s'", expected, tc.variable, val)
 			}
 		} else {
 			t.Errorf("Expected existing key '%s' found nothing", tc.variable)
@@ -528,5 +530,128 @@ func testReplacer() Replacer {
 		providers: make([]replacementProvider, 0),
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
+	}
+}
+
+type dummyStringer struct {
+	val string
+}
+
+func (d dummyStringer) String() string {
+	return d.val
+}
+
+func TestTypedSetters(t *testing.T) {
+	repl := NewReplacer()
+
+	repl.SetString("str_key", "hello")
+	repl.SetInt("int_key", 42)
+	repl.SetInt64("int64_key", 9876543210)
+	repl.SetFloat64("float_key", 3.14159)
+	repl.SetBool("bool_key", true)
+
+	if val, ok := repl.Get("str_key"); !ok || val != "hello" {
+		t.Errorf("SetString failed, got %v, expected hello", val)
+	}
+	if val, ok := repl.Get("int_key"); !ok || val != "42" {
+		t.Errorf("SetInt failed, got %v, expected 42", val)
+	}
+	if val, ok := repl.Get("int64_key"); !ok || val != "9876543210" {
+		t.Errorf("SetInt64 failed, got %v, expected 9876543210", val)
+	}
+	if val, ok := repl.Get("float_key"); !ok || val != "3.14159" {
+		t.Errorf("SetFloat64 failed, got %v, expected 3.14159", val)
+	}
+	if val, ok := repl.Get("bool_key"); !ok || val != "true" {
+		t.Errorf("SetBool failed, got %v, expected true", val)
+	}
+
+	if res := repl.ReplaceAll("{str_key} {int_key} {int64_key} {float_key} {bool_key}", ""); res != "hello 42 9876543210 3.14159 true" {
+		t.Errorf("ReplaceAll output mismatch: got %q", res)
+	}
+}
+
+func TestSetImmediateCoercion(t *testing.T) {
+	repl := NewReplacer()
+
+	repl.Set("str", "val")
+	repl.Set("int", 100)
+	repl.Set("int64", int64(200))
+	repl.Set("float64", 99.9)
+	repl.Set("bool", false)
+	repl.Set("duration", 5*time.Second)
+
+	if val, _ := repl.Get("str"); val != "val" {
+		t.Errorf("expected string val, got %v", val)
+	}
+	if val, _ := repl.Get("int"); val != "100" {
+		t.Errorf("expected string 100, got %v", val)
+	}
+	if val, _ := repl.Get("int64"); val != "200" {
+		t.Errorf("expected string 200, got %v", val)
+	}
+	if val, _ := repl.Get("float64"); val != "99.9" {
+		t.Errorf("expected string 99.9, got %v", val)
+	}
+	if val, _ := repl.Get("bool"); val != "false" {
+		t.Errorf("expected string false, got %v", val)
+	}
+	if val, _ := repl.Get("duration"); val != "5s" {
+		t.Errorf("expected string 5s, got %v", val)
+	}
+
+	// Non-primitives should NOT be converted to string on Set
+	custom := dummyStringer{val: "custom_stringer"}
+	repl.Set("custom", custom)
+	if val, _ := repl.Get("custom"); val != custom {
+		t.Errorf("expected original dummyStringer object, got %v", val)
+	}
+	if str, _ := repl.GetString("custom"); str != "custom_stringer" {
+		t.Errorf("expected GetString to return custom_stringer, got %s", str)
+	}
+
+	// Nil values
+	repl.Set("nil_val", nil)
+	if val, ok := repl.Get("nil_val"); !ok || val != nil {
+		t.Errorf("expected nil object, got %v", val)
+	}
+	if str, _ := repl.GetString("nil_val"); str != "" {
+		t.Errorf("expected empty string for nil, got %s", str)
+	}
+}
+
+func TestTypedSettersZeroAllocations(t *testing.T) {
+	repl := NewReplacer()
+	repl.SetString("key1", "val")
+
+	allocsGetString := testing.AllocsPerRun(100, func() {
+		_, _ = repl.GetString("key1")
+	})
+	if allocsGetString > 0 {
+		t.Errorf("expected 0 allocations for GetString on pre-coerced string, got %f", allocsGetString)
+	}
+}
+
+func BenchmarkReplacerSetTyped(b *testing.B) {
+	repl := NewReplacer()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		repl.SetInt("status", 200)
+		repl.SetString("method", "GET")
+		repl.SetFloat64("duration_ms", 12.34)
+		repl.SetBool("active", true)
+	}
+}
+
+func BenchmarkReplacerSetUntyped(b *testing.B) {
+	repl := NewReplacer()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		repl.Set("status", 200)
+		repl.Set("method", "GET")
+		repl.Set("duration_ms", 12.34)
+		repl.Set("active", true)
 	}
 }
