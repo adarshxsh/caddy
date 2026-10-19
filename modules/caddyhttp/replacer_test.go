@@ -296,3 +296,108 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPReplacerOptimizations(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test?a=foo&b=bar&b=baz&c=", nil)
+	req.Header.Set("User-Agent", "TestAgent")
+	req.Header.Add("X-Multi", "val1")
+	req.Header.Add("X-Multi", "val2")
+	req.Header["x-lowercase"] = []string{"lowercase_val"}
+
+	res := httptest.NewRecorder()
+	res.Header().Set("Content-Type", "application/json")
+	res.Header().Add("X-Resp-Multi", "r1")
+	res.Header().Add("X-Resp-Multi", "r2")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	tests := []struct {
+		key    string
+		expect string
+	}{
+		// Single query param
+		{key: "http.request.uri.query.a", expect: "foo"},
+		// Multi query param
+		{key: "http.request.uri.query.b", expect: "bar,baz"},
+		// Empty query param
+		{key: "http.request.uri.query.c", expect: ""},
+		// Missing query param
+		{key: "http.request.uri.query.missing", expect: ""},
+
+		// Canonical request header (direct match)
+		{key: "http.request.header.User-Agent", expect: "TestAgent"},
+		// Multi-value request header
+		{key: "http.request.header.X-Multi", expect: "val1,val2"},
+		// Lowercase lookup fallback
+		{key: "http.request.header.user-agent", expect: "TestAgent"},
+		// Exact match for non-canonical header in map
+		{key: "http.request.header.x-lowercase", expect: "lowercase_val"},
+		// Missing request header
+		{key: "http.request.header.X-Missing", expect: ""},
+
+		// Canonical response header
+		{key: "http.response.header.Content-Type", expect: "application/json"},
+		// Multi-value response header
+		{key: "http.response.header.X-Resp-Multi", expect: "r1,r2"},
+		// Missing response header
+		{key: "http.response.header.X-Missing", expect: ""},
+	}
+
+	for i, tc := range tests {
+		val, ok := repl.GetString(tc.key)
+		if !ok {
+			t.Errorf("Test %d (%s): expected key to be recognized", i, tc.key)
+		}
+		if val != tc.expect {
+			t.Errorf("Test %d (%s): expected %q, got %q", i, tc.key, tc.expect, val)
+		}
+	}
+}
+
+func TestQueryParameterCaching(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test?param1=val1&param2=val2", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// First query lookup parses and caches url.Values
+	val1, ok1 := repl.GetString("http.request.uri.query.param1")
+	if !ok1 || val1 != "val1" {
+		t.Fatalf("expected param1 to be 'val1', got %q (ok=%t)", val1, ok1)
+	}
+
+	// Mutate req.URL.RawQuery to confirm subsequent lookups use cached query map
+	req.URL.RawQuery = "param1=changed&param2=changed"
+
+	val2, ok2 := repl.GetString("http.request.uri.query.param2")
+	if !ok2 || val2 != "val2" {
+		t.Errorf("expected param2 to be cached 'val2', got %q (ok=%t)", val2, ok2)
+	}
+
+	val1Again, ok1Again := repl.GetString("http.request.uri.query.param1")
+	if !ok1Again || val1Again != "val1" {
+		t.Errorf("expected param1 to be cached 'val1', got %q (ok=%t)", val1Again, ok1Again)
+	}
+}
+
+func TestJoinValuesFastPath(t *testing.T) {
+	if got := joinValues(nil); got != "" {
+		t.Errorf("joinValues(nil) = %q, expected \"\"", got)
+	}
+	if got := joinValues([]string{}); got != "" {
+		t.Errorf("joinValues([]) = %q, expected \"\"", got)
+	}
+
+	single := []string{"hello"}
+	gotSingle := joinValues(single)
+	if gotSingle != "hello" {
+		t.Errorf("joinValues([hello]) = %q, expected \"hello\"", gotSingle)
+	}
+
+	multi := []string{"a", "b", "c"}
+	if gotMulti := joinValues(multi); gotMulti != "a,b,c" {
+		t.Errorf("joinValues([a,b,c]) = %q, expected \"a,b,c\"", gotMulti)
+	}
+}
+
+
