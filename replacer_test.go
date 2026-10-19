@@ -484,6 +484,62 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestFileReplacementProviderCache(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "caddy_file_replacer_test_*.txt")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	initialContent := "initial_content"
+	if _, err := tmpFile.WriteString(initialContent); err != nil {
+		t.Fatalf("Failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	repl1 := NewReplacer()
+	key := "file." + tmpFile.Name()
+
+	// First lookup reads initial content from disk
+	val1, found1 := repl1.GetString(key)
+	if !found1 || val1 != initialContent {
+		t.Fatalf("First lookup expected %q, got %q (found: %v)", initialContent, val1, found1)
+	}
+
+	// Modify file on disk
+	updatedContent := "updated_content"
+	if err := os.WriteFile(tmpFile.Name(), []byte(updatedContent), 0644); err != nil {
+		t.Fatalf("Failed to update temp file: %v", err)
+	}
+
+	// Second lookup on same repl1 MUST return cached initialContent without disk read
+	val2, found2 := repl1.GetString(key)
+	if !found2 || val2 != initialContent {
+		t.Fatalf("Second lookup on same replacer expected cached %q, got %q (found: %v)", initialContent, val2, found2)
+	}
+
+	// Lookup on a NEW Replacer instance MUST read updatedContent from disk
+	repl2 := NewReplacer()
+	val3, found3 := repl2.GetString(key)
+	if !found3 || val3 != updatedContent {
+		t.Fatalf("Lookup on new replacer expected updated %q from disk, got %q (found: %v)", updatedContent, val3, found3)
+	}
+
+	// Test missing file caching
+	missingKey := "file./nonexistent/file/path/caddy_test_missing.txt"
+	repl3 := NewReplacer()
+
+	val4, found4 := repl3.Get(missingKey)
+	if !found4 || val4 != nil {
+		t.Fatalf("Expected nil, true for missing file placeholder, got val: %v, found: %v", val4, found4)
+	}
+
+	val5, found5 := repl3.Get(missingKey)
+	if !found5 || val5 != nil {
+		t.Fatalf("Expected cached nil, true for missing file placeholder, got val: %v, found: %v", val5, found5)
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
