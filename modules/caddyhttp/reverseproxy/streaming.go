@@ -171,6 +171,21 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		return
 	}
 
+	// setup the timeout if requested
+	var timeoutc <-chan time.Time
+	if h.StreamTimeout > 0 {
+		streamTimeout := time.Duration(h.StreamTimeout)
+		timer := time.NewTimer(streamTimeout)
+		defer timer.Stop()
+		timeoutc = timer.C
+
+		onActivity := func() {
+			timer.Reset(streamTimeout)
+		}
+		conn = &activityReadWriteCloser{ReadWriteCloser: conn, onActivity: onActivity}
+		backConn = &activityReadWriteCloser{ReadWriteCloser: backConn, onActivity: onActivity}
+	}
+
 	// There may be buffered data in the *bufio.Reader
 	// see: https://github.com/caddyserver/caddy/issues/6273
 	if buffered := brw.Reader.Buffered(); buffered > 0 {
@@ -209,14 +224,6 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		backend:    backConn,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
-	}
-
-	// setup the timeout if requested
-	var timeoutc <-chan time.Time
-	if h.StreamTimeout > 0 {
-		timer := time.NewTimer(time.Duration(h.StreamTimeout))
-		defer timer.Stop()
-		timeoutc = timer.C
 	}
 
 	// when a stream timeout is encountered, no error will be read from errc
@@ -679,3 +686,25 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+type activityReadWriteCloser struct {
+	io.ReadWriteCloser
+	onActivity func()
+}
+
+func (a *activityReadWriteCloser) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
+}
+
+func (a *activityReadWriteCloser) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
+}
+
