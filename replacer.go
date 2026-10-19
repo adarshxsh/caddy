@@ -38,7 +38,11 @@ func NewReplacer() *Replacer {
 	}
 	rep.providers = []replacementProvider{
 		globalDefaultReplacementProvider{},
-		fileReplacementProvider{},
+		fileReplacementProvider{
+			state: &fileCacheState{
+				cache: make(map[string]cachedFileResult),
+			},
+		},
 		ReplacerFunc(rep.fromStatic),
 	}
 	return rep
@@ -75,6 +79,9 @@ func (r *Replacer) WithoutFile() *Replacer {
 	rep := &Replacer{static: r.static}
 	for _, v := range r.providers {
 		if _, ok := v.(fileReplacementProvider); ok {
+			continue
+		}
+		if _, ok := v.(*fileReplacementProvider); ok {
 			continue
 		}
 		rep.providers = append(rep.providers, v)
@@ -347,29 +354,67 @@ type replacementProvider interface {
 	replace(key string) (any, bool)
 }
 
+type cachedFileResult struct {
+	val any
+	ok  bool
+}
+
+type fileCacheState struct {
+	mu    sync.RWMutex
+	cache map[string]cachedFileResult
+}
+
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
-type fileReplacementProvider struct{}
+type fileReplacementProvider struct {
+	state *fileCacheState
+}
 
 func (f fileReplacementProvider) replace(key string) (any, bool) {
 	if !strings.HasPrefix(key, filePrefix) {
 		return nil, false
 	}
 
+	if f.state == nil {
+		return nil, false
+	}
+
+	f.state.mu.RLock()
+	if res, found := f.state.cache[key]; found {
+		f.state.mu.RUnlock()
+		return res.val, res.ok
+	}
+	f.state.mu.RUnlock()
+
+	f.state.mu.Lock()
+	defer f.state.mu.Unlock()
+
+	// Double check after acquiring write lock
+	if res, found := f.state.cache[key]; found {
+		return res.val, res.ok
+	}
+
+	if f.state.cache == nil {
+		f.state.cache = make(map[string]cachedFileResult)
+	}
+
 	filename := key[len(filePrefix):]
 	maxSize := 1024 * 1024
 	body, err := readFileIntoBuffer(filename, maxSize)
 	if err != nil {
-		wd, _ := os.Getwd()
+		wd := getWorkingDir()
 		Log().Error("placeholder: failed to read file",
 			zap.String("file", filename),
 			zap.String("working_dir", wd),
 			zap.Error(err))
+		f.state.cache[key] = cachedFileResult{val: nil, ok: true}
 		return nil, true
 	}
 	body = bytes.TrimSuffix(body, []byte("\n"))
 	body = bytes.TrimSuffix(body, []byte("\r"))
-	return string(body), true
+	val := string(body)
+	f.state.cache[key] = cachedFileResult{val: val, ok: true}
+	return val, true
 }
 
 // globalDefaultReplacementProvider handles replacements
@@ -394,9 +439,7 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	case "system.os":
 		return runtime.GOOS, true
 	case "system.wd":
-		// OK if there is an error; just return empty string
-		wd, _ := os.Getwd()
-		return wd, true
+		return getWorkingDir(), true
 	case "system.arch":
 		return runtime.GOARCH, true
 	case "time.now":
@@ -427,10 +470,27 @@ func readFileIntoBuffer(filename string, size int) ([]byte, error) {
 	}
 	defer file.Close()
 
-	// io.LimitReader ensures we never read more than 'size' bytes.
-	// io.ReadAll starts with a small buffer and grows it as needed,
-	// preventing a massive 1MB allocation for small files.
-	return io.ReadAll(io.LimitReader(file, int64(size)))
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	_, err = buf.ReadFrom(io.LimitReader(file, int64(size)))
+	if err != nil {
+		return nil, err
+	}
+	return bytes.Clone(buf.Bytes()), nil
+}
+
+var (
+	workDir     string
+	workDirOnce sync.Once
+)
+
+func getWorkingDir() string {
+	workDirOnce.Do(func() {
+		workDir, _ = os.Getwd()
+	})
+	return workDir
 }
 
 // ReplacementFunc is a function that is called when a
