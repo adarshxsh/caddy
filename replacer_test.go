@@ -530,3 +530,108 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestFileReplacementProviderCaching(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "caddy_file_replacer_test_*.txt")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	initialContent := "hello caddy cache"
+	if _, err := tmpFile.WriteString(initialContent); err != nil {
+		t.Fatalf("Failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	repl1 := NewReplacer()
+	key := "file." + tmpFile.Name()
+
+	// 1. First lookup reads file content
+	val1, ok1 := repl1.Get(key)
+	if !ok1 {
+		t.Fatalf("Expected key '%s' to be recognized", key)
+	}
+	if val1 != initialContent {
+		t.Fatalf("Expected initial content '%s', got '%v'", initialContent, val1)
+	}
+
+	// 2. Overwrite file content on disk
+	updatedContent := "new content on disk"
+	if err := os.WriteFile(tmpFile.Name(), []byte(updatedContent), 0644); err != nil {
+		t.Fatalf("Failed to overwrite temp file: %v", err)
+	}
+
+	// 3. Second lookup on SAME replacer instance returns CACHED value (initial content)
+	val2, ok2 := repl1.Get(key)
+	if !ok2 {
+		t.Fatalf("Expected key '%s' to be recognized on second lookup", key)
+	}
+	if val2 != initialContent {
+		t.Errorf("Expected cached content '%s', but got '%v' (file was re-read from disk)", initialContent, val2)
+	}
+
+	// 4. Lookup on NEW replacer instance returns UPDATED content from disk
+	repl2 := NewReplacer()
+	val3, ok3 := repl2.Get(key)
+	if !ok3 {
+		t.Fatalf("Expected key '%s' to be recognized on new replacer", key)
+	}
+	if val3 != updatedContent {
+		t.Errorf("Expected updated content '%s' on new replacer, got '%v'", updatedContent, val3)
+	}
+}
+
+func TestFileReplacementProviderMissingFileCachingAndWorkingDir(t *testing.T) {
+	repl := NewReplacer()
+	missingKey := "file./non_existent_file_path_caddy_test_123456789.txt"
+
+	// Missing file should return nil/empty, ok = true
+	val, ok := repl.Get(missingKey)
+	if !ok {
+		t.Fatalf("Expected missing file key to be handled by file provider")
+	}
+	if val != nil {
+		t.Errorf("Expected nil value for missing file, got '%v'", val)
+	}
+
+	// Working dir lazy cache should return current working directory
+	wd := getWorkingDir()
+	if wd == "" {
+		t.Errorf("Expected non-empty working directory from getWorkingDir()")
+	}
+	expectedWd, _ := os.Getwd()
+	if wd != expectedWd {
+		t.Errorf("Expected working directory '%s', got '%s'", expectedWd, wd)
+	}
+}
+
+func TestFileReplacementProviderConcurrency(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "caddy_concurrent_test_*.txt")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	content := "concurrent read test"
+	if _, err := tmpFile.WriteString(content); err != nil {
+		t.Fatalf("Failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	repl := NewReplacer()
+	key := "file." + tmpFile.Name()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			val, ok := repl.Get(key)
+			if !ok || val != content {
+				t.Errorf("Concurrent get failed: got ok=%v, val=%v", ok, val)
+			}
+		}()
+	}
+	wg.Wait()
+}
