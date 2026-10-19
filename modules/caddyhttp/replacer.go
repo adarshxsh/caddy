@@ -36,6 +36,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,6 +59,8 @@ func NewTestReplacer(req *http.Request) *caddy.Replacer {
 func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.ResponseWriter) {
 	SetVar(req.Context(), "start_time", time.Now())
 	SetVar(req.Context(), "uuid", new(requestID))
+
+	memo := new(httpVarsMemo)
 
 	httpVars := func(key string) (any, bool) {
 		if req != nil {
@@ -128,26 +131,13 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			case "http.request.hostport":
 				return req.Host, true
 			case "http.request.local":
-				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-				return localAddr.String(), true
+				localAddrStr, _, _ := memo.getLocalHostPort(req)
+				return localAddrStr, true
 			case "http.request.local.host":
-				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-				host, _, err := net.SplitHostPort(localAddr.String())
-				if err != nil {
-					// localAddr is host:port for tcp and udp sockets and /unix/socket.path
-					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
-					// not unix sockets and will fail with the latter.
-					// We assume when net.SplitHostPort fails, localAddr is a unix socket and thus
-					// already "split" and save to return.
-					return localAddr, true
-				}
+				_, host, _ := memo.getLocalHostPort(req)
 				return host, true
 			case "http.request.local.port":
-				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-				_, port, _ := net.SplitHostPort(localAddr.String())
-				if portNum, err := strconv.Atoi(port); err == nil {
-					return portNum, true
-				}
+				_, _, port := memo.getLocalHostPort(req)
 				return port, true
 			case "http.request.remote":
 				if req.TLS != nil && !req.TLS.HandshakeComplete {
@@ -160,21 +150,10 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 					// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
 					return nil, true
 				}
-				host, _, err := net.SplitHostPort(req.RemoteAddr)
-				if err != nil {
-					// req.RemoteAddr is host:port for tcp and udp sockets and /unix/socket.path
-					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
-					// not unix sockets and will fail with the latter.
-					// We assume when net.SplitHostPort fails, req.RemoteAddr is a unix socket
-					// and thus already "split" and save to return.
-					return req.RemoteAddr, true
-				}
+				host, _ := memo.getRemoteHostPort(req.RemoteAddr)
 				return host, true
 			case "http.request.remote.port":
-				_, port, _ := net.SplitHostPort(req.RemoteAddr)
-				if portNum, err := strconv.Atoi(port); err == nil {
-					return portNum, true
-				}
+				_, port := memo.getRemoteHostPort(req.RemoteAddr)
 				return port, true
 
 			// current URI, including any internal rewrites
@@ -201,10 +180,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			case "http.request.uri.query_escaped":
 				return url.QueryEscape(req.URL.RawQuery), true
 			case "http.request.uri.prefixed_query":
-				if req.URL.RawQuery == "" {
-					return "", true
-				}
-				return "?" + req.URL.RawQuery, true
+				return memo.getURIPrefixedQuery(req), true
 			case "http.request.duration":
 				start := GetVar(req.Context(), "start_time").(time.Time)
 				return time.Since(start), true
@@ -274,22 +250,19 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
 				return or.URL.RawQuery, true
 			case "http.request.orig_uri.prefixed_query":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				if or.URL.RawQuery == "" {
-					return "", true
-				}
-				return "?" + or.URL.RawQuery, true
+				return memo.getOrigURIPrefixedQuery(req), true
 			}
 
 			// remote IP range/prefix (e.g. keep top 24 bits of 1.2.3.4  => "1.2.3.0/24")
 			// syntax: "/V4,V6" where V4 = IPv4 bits, and V6 = IPv6 bits; if no comma, then same bit length used for both
 			// (EXPERIMENTAL)
 			if strings.HasPrefix(key, "http.request.remote.host/") {
-				host, _, err := net.SplitHostPort(req.RemoteAddr)
-				if err != nil {
-					host = req.RemoteAddr // assume no port, I guess?
+				if prefixStr, ok := memo.getRemotePrefix(key); ok {
+					return prefixStr, true
 				}
-				addr, err := netip.ParseAddr(host)
+				host, _ := memo.getRemoteHostPort(req.RemoteAddr)
+				hostStr, _ := host.(string)
+				addr, err := netip.ParseAddr(hostStr)
 				if err != nil {
 					return host, true // not an IP address
 				}
@@ -309,7 +282,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil {
 					return "", true
 				}
-				return prefix.String(), true
+				prefixStr := prefix.String()
+				memo.setRemotePrefix(key, prefixStr)
+				return prefixStr, true
 			}
 
 			// hostname labels (case insensitive, so normalize to lowercase)
@@ -597,3 +572,138 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+type httpVarsMemo struct {
+	mu sync.Mutex
+
+	remoteParsed bool
+	remoteHost   any
+	remotePort   any
+
+	localParsed  bool
+	localAddrStr any
+	localHost    any
+	localPort    any
+
+	remotePrefixes map[string]any
+
+	uriPrefixedQueryParsed bool
+	uriPrefixedQuery       any
+
+	origURIPrefixedQueryParsed bool
+	origURIPrefixedQuery       any
+}
+
+func (m *httpVarsMemo) getRemoteHostPort(remoteAddr string) (any, any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.remoteParsed {
+		m.remoteParsed = true
+		if remoteAddr != "" {
+			host, port, err := net.SplitHostPort(remoteAddr)
+			if err != nil {
+				// req.RemoteAddr is host:port for tcp and udp sockets and /unix/socket.path
+				// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
+				// not unix sockets and will fail with the latter.
+				// We assume when net.SplitHostPort fails, req.RemoteAddr is a unix socket
+				// and thus already "split" and save to return.
+				m.remoteHost = remoteAddr
+				m.remotePort = ""
+			} else {
+				m.remoteHost = host
+				if portNum, err := strconv.Atoi(port); err == nil {
+					m.remotePort = portNum
+				} else {
+					m.remotePort = port
+				}
+			}
+		} else {
+			m.remoteHost = ""
+			m.remotePort = ""
+		}
+	}
+	return m.remoteHost, m.remotePort
+}
+
+func (m *httpVarsMemo) getLocalHostPort(req *http.Request) (any, any, any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.localParsed {
+		m.localParsed = true
+		localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+		if localAddr != nil {
+			m.localAddrStr = localAddr.String()
+			host, port, err := net.SplitHostPort(m.localAddrStr.(string))
+			if err != nil {
+				// localAddr is host:port for tcp and udp sockets and /unix/socket.path
+				// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
+				// not unix sockets and will fail with the latter.
+				// We assume when net.SplitHostPort fails, localAddr is a unix socket and thus
+				// already "split" and save to return.
+				m.localHost = m.localAddrStr
+				m.localPort = ""
+			} else {
+				m.localHost = host
+				if portNum, err := strconv.Atoi(port); err == nil {
+					m.localPort = portNum
+				} else {
+					m.localPort = port
+				}
+			}
+		} else {
+			m.localAddrStr = ""
+			m.localHost = ""
+			m.localPort = ""
+		}
+	}
+	return m.localAddrStr, m.localHost, m.localPort
+}
+
+func (m *httpVarsMemo) getURIPrefixedQuery(req *http.Request) any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.uriPrefixedQueryParsed {
+		m.uriPrefixedQueryParsed = true
+		if req.URL != nil && req.URL.RawQuery != "" {
+			m.uriPrefixedQuery = "?" + req.URL.RawQuery
+		} else {
+			m.uriPrefixedQuery = ""
+		}
+	}
+	return m.uriPrefixedQuery
+}
+
+func (m *httpVarsMemo) getOrigURIPrefixedQuery(req *http.Request) any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.origURIPrefixedQueryParsed {
+		m.origURIPrefixedQueryParsed = true
+		or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+		if or.URL != nil && or.URL.RawQuery != "" {
+			m.origURIPrefixedQuery = "?" + or.URL.RawQuery
+		} else {
+			m.origURIPrefixedQuery = ""
+		}
+	}
+	return m.origURIPrefixedQuery
+}
+
+func (m *httpVarsMemo) getRemotePrefix(key string) (any, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.remotePrefixes == nil {
+		return nil, false
+	}
+	prefixVal, ok := m.remotePrefixes[key]
+	return prefixVal, ok
+}
+
+func (m *httpVarsMemo) setRemotePrefix(key string, prefixVal any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.remotePrefixes == nil {
+		m.remotePrefixes = make(map[string]any)
+	}
+	m.remotePrefixes[key] = prefixVal
+}
+
