@@ -81,12 +81,8 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// cookies
 			if strings.HasPrefix(key, reqCookieReplPrefix) {
 				name := key[len(reqCookieReplPrefix):]
-				for _, cookie := range req.Cookies() {
-					if strings.EqualFold(name, cookie.Name) {
-						// always return true, since the cookie might
-						// be present only in some requests
-						return cookie.Value, true
-					}
+				if val, ok := fastCookieLookup(req, name); ok {
+					return val, true
 				}
 			}
 
@@ -319,56 +315,32 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil || idx < 0 {
 					return "", false
 				}
-				reqHost, _, err := net.SplitHostPort(req.Host)
-				if err != nil {
-					reqHost = req.Host // OK; assume there was no port
-				}
-				hostLabels := strings.Split(reqHost, ".")
-				if idx >= len(hostLabels) {
-					return "", true
-				}
-				return strings.ToLower(hostLabels[len(hostLabels)-idx-1]), true
+				return fastHostLabelLookup(req.Host, idx)
 			}
 
 			// path parts
 			if strings.HasPrefix(key, reqURIPathReplPrefix) {
 				idxStr := key[len(reqURIPathReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
-				if err != nil {
+				if err != nil || idx < 0 {
 					return "", false
 				}
-				pathParts := strings.Split(req.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
-				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
-					return "", true
-				}
-				return pathParts[idx], true
+				return fastPathPartLookup(req.URL.Path, idx)
 			}
 
 			// orig uri path parts
 			if strings.HasPrefix(key, reqOrigURIPathReplPrefix) {
 				idxStr := key[len(reqOrigURIPathReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
-				if err != nil {
+				if err != nil || idx < 0 {
 					return "", false
 				}
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				pathParts := strings.Split(or.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
+				var origPath string
+				if or.URL != nil {
+					origPath = or.URL.Path
 				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
-					return "", true
-				}
-				return pathParts[idx], true
+				return fastPathPartLookup(origPath, idx)
 			}
 
 			// middleware variables
@@ -597,3 +569,149 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+func fastCookieLookup(req *http.Request, name string) (string, bool) {
+	if req == nil || req.Header == nil {
+		return "", false
+	}
+	lines := req.Header["Cookie"]
+	if len(lines) == 0 {
+		for k, v := range req.Header {
+			if strings.EqualFold(k, "Cookie") {
+				lines = v
+				break
+			}
+		}
+	}
+	for _, line := range lines {
+		for len(line) > 0 {
+			var part string
+			if i := strings.IndexByte(line, ';'); i >= 0 {
+				part, line = line[:i], line[i+1:]
+			} else {
+				part, line = line, ""
+			}
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			cookieName, val, ok := strings.Cut(part, "=")
+			if !ok {
+				continue
+			}
+			cookieName = strings.TrimSpace(cookieName)
+			if !isCookieNameValid(cookieName) {
+				continue
+			}
+			if !strings.EqualFold(cookieName, name) {
+				continue
+			}
+			if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+				val = val[1 : len(val)-1]
+			}
+			if !validCookieValue(val) {
+				continue
+			}
+			return val, true
+		}
+	}
+	return "", false
+}
+
+func isCookieNameValid(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b <= 32 || b >= 127 || strings.IndexByte("()<>@,;:\\\"/[]?={}\t", b) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func validCookieValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		if b < 0x21 || b == '"' || b == ',' || b == ';' || b == '\\' || b >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func fastHostLabelLookup(host string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	host = stripPort(host)
+	curEnd := len(host)
+	for i := 0; i <= idx; i++ {
+		if curEnd < 0 {
+			return "", true
+		}
+		dot := strings.LastIndexByte(host[:curEnd], '.')
+		if i == idx {
+			var label string
+			if dot == -1 {
+				label = host[:curEnd]
+			} else {
+				label = host[dot+1 : curEnd]
+			}
+			return strings.ToLower(label), true
+		}
+		if dot == -1 {
+			return "", true
+		}
+		curEnd = dot
+	}
+	return "", true
+}
+
+func stripPort(hostport string) string {
+	if hostport == "" {
+		return ""
+	}
+	if hostport[0] == '[' {
+		if end := strings.IndexByte(hostport, ']'); end != -1 {
+			return hostport[1:end]
+		}
+		return hostport
+	}
+	if col := strings.LastIndexByte(hostport, ':'); col != -1 {
+		return hostport[:col]
+	}
+	return hostport
+}
+
+func fastPathPartLookup(p string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	if p == "" {
+		return "", true
+	}
+	s := p
+	if s[0] == '/' {
+		s = s[1:]
+	}
+	start := 0
+	for i := 0; i <= idx; i++ {
+		if start > len(s) {
+			return "", true
+		}
+		nextSlash := strings.IndexByte(s[start:], '/')
+		if i == idx {
+			if nextSlash == -1 {
+				return s[start:], true
+			}
+			return s[start : start+nextSlash], true
+		}
+		if nextSlash == -1 {
+			return "", true
+		}
+		start += nextSlash + 1
+	}
+	return "", true
+}
