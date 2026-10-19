@@ -484,6 +484,28 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+var sinkString string
+
+func TestReplacerAllocationBounds(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	// Static string replacements (without placeholders) must achieve zero heap allocations.
+	for _, staticInput := range []string{
+		"simple static string without placeholders",
+		"another static string with special characters !@#$%^&*()",
+		"back\\slashes and non-placeholder text",
+	} {
+		allocs := testing.AllocsPerRun(100, func() {
+			sinkString = rep.ReplaceAll(staticInput, "")
+		})
+		if allocs > 0 {
+			t.Errorf("expected 0 allocations for static string '%s', got %f", staticInput, allocs)
+		}
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
@@ -492,6 +514,10 @@ func BenchmarkReplacer(b *testing.B) {
 	rep := testReplacer()
 	rep.Set("str", "a string")
 	rep.Set("int", 123.456)
+	rep.Set("host", "example.com")
+	rep.Set("port", "8080")
+	rep.Set("path", "/api/v1/resource")
+	rep.Set("method", "GET")
 
 	for _, bm := range []testCase{
 		{
@@ -514,13 +540,42 @@ func BenchmarkReplacer(b *testing.B) {
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
+		{
+			name:  "multi placeholder sequential",
+			input: `method={method} host={host} port={port} path={path} str={str} int={int}`,
+		},
+		{
+			name:  "multi placeholder nested",
+			input: `\{"req": \{"method": "{method}", "host": "{host}", "port": "{port}", "path": "{path}", "str": "{str}"\}\}`,
+		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
 	}
+}
+
+func BenchmarkReplacerParallel(b *testing.B) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+	rep.Set("host", "example.com")
+	rep.Set("port", "8080")
+	rep.Set("path", "/api/v1/resource")
+	rep.Set("method", "GET")
+
+	input := "method={method} host={host} port={port} path={path} str={str} int={int}"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			rep.ReplaceAll(input, "")
+		}
+	})
 }
 
 func testReplacer() Replacer {

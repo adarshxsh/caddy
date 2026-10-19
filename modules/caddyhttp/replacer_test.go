@@ -296,3 +296,57 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkHTTPReplacer(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/foo/bar?a=1&b=2", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Host = "example.com:80"
+
+	b.Run("Setup", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			reqCopy := *req
+			_ = NewTestReplacer(&reqCopy)
+		}
+	})
+
+	b.Run("HeaderLookup", func(b *testing.B) {
+		b.ReportAllocs()
+		reqCopy := *req
+		repl := NewTestReplacer(&reqCopy)
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.header.User-Agent")
+		}
+	})
+
+	b.Run("QueryLookup", func(b *testing.B) {
+		b.ReportAllocs()
+		reqCopy := *req
+		repl := NewTestReplacer(&reqCopy)
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.uri.query.a")
+		}
+	})
+
+	b.Run("MultiPlaceholderEvaluation", func(b *testing.B) {
+		b.ReportAllocs()
+		reqCopy := *req
+		repl := NewTestReplacer(&reqCopy)
+		input := "method={http.request.method} host={http.request.host} ua={http.request.header.User-Agent} query={http.request.uri.query.a} uri={http.request.uri}"
+		for b.Loop() {
+			_ = repl.ReplaceAll(input, "")
+		}
+	})
+
+	b.Run("Parallel", func(b *testing.B) {
+		b.ReportAllocs()
+		reqCopy := *req
+		repl := NewTestReplacer(&reqCopy)
+		input := "method={http.request.method} host={http.request.host} ua={http.request.header.User-Agent} query={http.request.uri.query.a} uri={http.request.uri}"
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_ = repl.ReplaceAll(input, "")
+			}
+		})
+	})
+}
