@@ -239,7 +239,6 @@ func TestReplacerSet(t *testing.T) {
 
 func TestReplacerReplaceKnown(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		providers: []replacementProvider{
 			// split our possible vars to two functions (to test if both functions are called)
 			ReplacerFunc(func(key string) (val any, ok bool) {
@@ -312,7 +311,6 @@ func TestReplacerReplaceKnown(t *testing.T) {
 
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		static: map[string]any{
 			"key1": "val1",
 			"key2": "val2",
@@ -526,7 +524,53 @@ func BenchmarkReplacer(b *testing.B) {
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
-		static:    make(map[string]any),
-		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestReplacerLazyInit(t *testing.T) {
+	rep := NewReplacer()
+	if rep.static != nil {
+		t.Errorf("Expected static map to be nil initially, got %v", rep.static)
+	}
+
+	// Read on empty static map should return nil, false safely
+	if val, ok := rep.Get("unknown"); ok || val != nil {
+		t.Errorf("Expected nil, false for unknown key on nil map, got %v, %v", val, ok)
+	}
+
+	// Delete on empty static map should not panic
+	rep.Delete("foo")
+	rep.DeleteByPrefix("foo.")
+
+	// Set lazily initializes static map
+	rep.Set("foo", "bar")
+	if rep.static == nil {
+		t.Errorf("Expected static map to be initialized after Set")
+	}
+	if val, ok := rep.Get("foo"); !ok || val != "bar" {
+		t.Errorf("Expected 'bar', true for key 'foo', got %v, %v", val, ok)
+	}
+}
+
+func TestReplacerConcurrent(t *testing.T) {
+	rep := NewReplacer()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(3)
+		key := fmt.Sprintf("key%d", i)
+		go func() {
+			defer wg.Done()
+			rep.Set(key, "val")
+		}()
+		go func() {
+			defer wg.Done()
+			rep.Get(key)
+		}()
+		go func() {
+			defer wg.Done()
+			rep.Delete(key)
+		}()
+	}
+	wg.Wait()
+}
+
