@@ -99,6 +99,10 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    stream_buffer_size <size>
 //	    stream_timeout     <duration>
 //	    stream_close_delay <duration>
+//	    stream_keepalive   <duration> | {
+//	        probe <duration>
+//	        ping  <duration>
+//	    }
 //	    verbose_logs
 //
 //	    # request manipulation
@@ -701,6 +705,52 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("bad duration value '%s': %v", d.Val(), err)
 				}
 				h.StreamCloseDelay = caddy.Duration(dur)
+			}
+
+		case "stream_keepalive":
+			if h.StreamKeepAlive == nil {
+				h.StreamKeepAlive = new(StreamKeepAlive)
+			}
+			if d.NextArg() {
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad duration value '%s': %v", d.Val(), err)
+				}
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+				h.StreamKeepAlive.ProbeInterval = caddy.Duration(dur)
+				h.StreamKeepAlive.PingInterval = caddy.Duration(dur)
+			} else {
+				hasOption := false
+				for nesting := d.Nesting(); d.NextBlock(nesting); {
+					hasOption = true
+					switch d.Val() {
+					case "probe":
+						if !d.NextArg() {
+							return d.ArgErr()
+						}
+						dur, err := caddy.ParseDuration(d.Val())
+						if err != nil {
+							return d.Errf("bad duration value '%s': %v", d.Val(), err)
+						}
+						h.StreamKeepAlive.ProbeInterval = caddy.Duration(dur)
+					case "ping":
+						if !d.NextArg() {
+							return d.ArgErr()
+						}
+						dur, err := caddy.ParseDuration(d.Val())
+						if err != nil {
+							return d.Errf("bad duration value '%s': %v", d.Val(), err)
+						}
+						h.StreamKeepAlive.PingInterval = caddy.Duration(dur)
+					default:
+						return d.Errf("unrecognized stream_keepalive subdirective '%s'", d.Val())
+					}
+				}
+				if !hasOption {
+					return d.ArgErr()
+				}
 			}
 
 		case "trusted_proxies":
