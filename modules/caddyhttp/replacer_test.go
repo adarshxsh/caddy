@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -296,3 +297,166 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPVarsMemoization(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/path?foo=bar", nil)
+	localAddr, _ := net.ResolveTCPAddr("tcp", "10.0.0.1:8080")
+	ctx := context.WithValue(req.Context(), http.LocalAddrContextKey, localAddr)
+
+	origReq := *httptest.NewRequest(http.MethodGet, "/orig?baz=qux", nil)
+	ctx = context.WithValue(ctx, OriginalRequestCtxKey, origReq)
+
+	req = req.WithContext(ctx)
+	req.RemoteAddr = "192.168.1.100:54321"
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// First lookups
+	host, ok := repl.GetString("http.request.remote.host")
+	if !ok || host != "192.168.1.100" {
+		t.Fatalf("expected remote.host 192.168.1.100, got %q (ok=%t)", host, ok)
+	}
+	port, ok := repl.GetString("http.request.remote.port")
+	if !ok || port != "54321" {
+		t.Fatalf("expected remote.port 54321, got %q (ok=%t)", port, ok)
+	}
+	prefix, ok := repl.GetString("http.request.remote.host/24")
+	if !ok || prefix != "192.168.1.0/24" {
+		t.Fatalf("expected remote.host/24 192.168.1.0/24, got %q (ok=%t)", prefix, ok)
+	}
+
+	localHost, ok := repl.GetString("http.request.local.host")
+	if !ok || localHost != "10.0.0.1" {
+		t.Fatalf("expected local.host 10.0.0.1, got %q (ok=%t)", localHost, ok)
+	}
+	localPort, ok := repl.GetString("http.request.local.port")
+	if !ok || localPort != "8080" {
+		t.Fatalf("expected local.port 8080, got %q (ok=%t)", localPort, ok)
+	}
+	localAddrStr, ok := repl.GetString("http.request.local")
+	if !ok || localAddrStr != "10.0.0.1:8080" {
+		t.Fatalf("expected local 10.0.0.1:8080, got %q (ok=%t)", localAddrStr, ok)
+	}
+
+	prefixedQuery, ok := repl.GetString("http.request.uri.prefixed_query")
+	if !ok || prefixedQuery != "?foo=bar" {
+		t.Fatalf("expected uri.prefixed_query ?foo=bar, got %q (ok=%t)", prefixedQuery, ok)
+	}
+	origPrefixedQuery, ok := repl.GetString("http.request.orig_uri.prefixed_query")
+	if !ok || origPrefixedQuery != "?baz=qux" {
+		t.Fatalf("expected orig_uri.prefixed_query ?baz=qux, got %q (ok=%t)", origPrefixedQuery, ok)
+	}
+
+	// Mutate underlying request fields to verify cached values are retained
+	req.RemoteAddr = "1.1.1.1:9999"
+	req.URL.RawQuery = "foo=changed"
+
+	host2, _ := repl.GetString("http.request.remote.host")
+	if host2 != "192.168.1.100" {
+		t.Errorf("expected memoized remote.host 192.168.1.100, got %q", host2)
+	}
+	port2, _ := repl.GetString("http.request.remote.port")
+	if port2 != "54321" {
+		t.Errorf("expected memoized remote.port 54321, got %q", port2)
+	}
+	prefix2, _ := repl.GetString("http.request.remote.host/24")
+	if prefix2 != "192.168.1.0/24" {
+		t.Errorf("expected memoized remote.host/24 192.168.1.0/24, got %q", prefix2)
+	}
+	prefixedQuery2, _ := repl.GetString("http.request.uri.prefixed_query")
+	if prefixedQuery2 != "?foo=bar" {
+		t.Errorf("expected memoized uri.prefixed_query ?foo=bar, got %q", prefixedQuery2)
+	}
+}
+
+func TestHTTPVarsMemoizationConcurrency(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/path?a=1&b=2", nil)
+	localAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:80")
+	ctx := context.WithValue(req.Context(), http.LocalAddrContextKey, localAddr)
+	req = req.WithContext(ctx)
+	req.RemoteAddr = "10.0.0.5:12345"
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				repl.GetString("http.request.remote.host")
+				repl.GetString("http.request.remote.port")
+				repl.GetString("http.request.remote.host/16")
+				repl.GetString("http.request.local.host")
+				repl.GetString("http.request.local.port")
+				repl.GetString("http.request.uri.prefixed_query")
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestHTTPVarsMemoizationAllocations(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/path?a=1&b=2", nil)
+	localAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:80")
+	ctx := context.WithValue(req.Context(), http.LocalAddrContextKey, localAddr)
+	req = req.WithContext(ctx)
+	req.RemoteAddr = "10.0.0.5:12345"
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Warm up cache
+	repl.Get("http.request.remote.host")
+	repl.Get("http.request.remote.port")
+	repl.Get("http.request.remote.host/16")
+	repl.Get("http.request.local.host")
+	repl.Get("http.request.local.port")
+	repl.Get("http.request.uri.prefixed_query")
+
+	// Measure allocations on subsequent lookups
+	allocsHost := testing.AllocsPerRun(100, func() {
+		repl.Get("http.request.remote.host")
+	})
+	if allocsHost > 0 {
+		t.Errorf("expected 0 allocs for remote.host lookup, got %f", allocsHost)
+	}
+
+	allocsPort := testing.AllocsPerRun(100, func() {
+		repl.Get("http.request.remote.port")
+	})
+	if allocsPort > 0 {
+		t.Errorf("expected 0 allocs for remote.port lookup, got %f", allocsPort)
+	}
+
+	allocsPrefix := testing.AllocsPerRun(100, func() {
+		repl.Get("http.request.remote.host/16")
+	})
+	if allocsPrefix > 0 {
+		t.Errorf("expected 0 allocs for remote.host/16 lookup, got %f", allocsPrefix)
+	}
+
+	allocsLocalHost := testing.AllocsPerRun(100, func() {
+		repl.Get("http.request.local.host")
+	})
+	if allocsLocalHost > 0 {
+		t.Errorf("expected 0 allocs for local.host lookup, got %f", allocsLocalHost)
+	}
+
+	allocsLocalPort := testing.AllocsPerRun(100, func() {
+		repl.Get("http.request.local.port")
+	})
+	if allocsLocalPort > 0 {
+		t.Errorf("expected 0 allocs for local.port lookup, got %f", allocsLocalPort)
+	}
+
+	allocsPrefixedQuery := testing.AllocsPerRun(100, func() {
+		repl.Get("http.request.uri.prefixed_query")
+	})
+	if allocsPrefixedQuery > 0 {
+		t.Errorf("expected 0 allocs for uri.prefixed_query lookup, got %f", allocsPrefixedQuery)
+	}
+}
+
