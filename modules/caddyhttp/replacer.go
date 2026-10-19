@@ -36,6 +36,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -44,6 +45,12 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
+
+var bufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
 
 // NewTestReplacer creates a replacer for an http.Request
 // for use in tests that are not in this package
@@ -56,6 +63,9 @@ func NewTestReplacer(req *http.Request) *caddy.Replacer {
 }
 
 func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.ResponseWriter) {
+	if req != nil && req.Context().Value(VarsCtxKey) == nil {
+		*req = *req.WithContext(context.WithValue(req.Context(), VarsCtxKey, make(map[string]any)))
+	}
 	SetVar(req.Context(), "start_time", time.Now())
 	SetVar(req.Context(), "uuid", new(requestID))
 
@@ -222,35 +232,39 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 
 				return id.String(), true
 
-			case "http.request.body":
+			case "http.request.body", "http.request.body_base64":
 				if req.Body == nil {
 					return "", true
 				}
-				// normally net/http will close the body for us, but since we
-				// are replacing it with a fake one, we have to ensure we close
-				// the real body ourselves when we're done
-				defer req.Body.Close()
-				// read the request body into a buffer (can't pool because we
-				// don't know its lifetime and would have to make a copy anyway)
-				buf := new(bytes.Buffer)
-				_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-				req.Body = io.NopCloser(buf)  // replace real body with buffered data
-				return buf.String(), true
+				var bodyBytes []byte
+				if cached := GetVar(req.Context(), "http.request.body"); cached != nil {
+					switch b := cached.(type) {
+					case []byte:
+						bodyBytes = b
+					case string:
+						bodyBytes = []byte(b)
+					}
+				} else {
+					// normally net/http will close the body for us, but since we
+					// are replacing it with a fake one, we have to ensure we close
+					// the real body ourselves when we're done
+					defer req.Body.Close()
 
-			case "http.request.body_base64":
-				if req.Body == nil {
-					return "", true
+					buf := bufPool.Get().(*bytes.Buffer)
+					buf.Reset()
+					_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
+					bodyBytes = bytes.Clone(buf.Bytes())
+					buf.Reset()
+					bufPool.Put(buf)
+
+					SetVar(req.Context(), "http.request.body", bodyBytes)
+					req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 				}
-				// normally net/http will close the body for us, but since we
-				// are replacing it with a fake one, we have to ensure we close
-				// the real body ourselves when we're done
-				defer req.Body.Close()
-				// read the request body into a buffer (can't pool because we
-				// don't know its lifetime and would have to make a copy anyway)
-				buf := new(bytes.Buffer)
-				_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-				req.Body = io.NopCloser(buf)  // replace real body with buffered data
-				return base64.StdEncoding.EncodeToString(buf.Bytes()), true
+
+				if key == "http.request.body" {
+					return string(bodyBytes), true
+				}
+				return base64.StdEncoding.EncodeToString(bodyBytes), true
 
 			// original request, before any internal changes
 			case "http.request.orig_method":
