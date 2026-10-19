@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -275,9 +276,40 @@ func (m MatchExpression) caddyPlaceholderFunc(lhs, rhs ref.Val) ref.Val {
 	}
 
 	repl := celReq.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	val, _ := repl.Get(string(phStr))
+	key := string(phStr)
+	val, _ := repl.Get(key)
+
+	if strVal, ok := val.(string); ok {
+		if isNumericPlaceholder(key) {
+			if intVal, err := strconv.Atoi(strVal); err == nil {
+				return m.ta.NativeToValue(intVal)
+			}
+		}
+		if isBooleanPlaceholder(key) {
+			if boolVal, err := strconv.ParseBool(strVal); err == nil {
+				return m.ta.NativeToValue(boolVal)
+			}
+		}
+	}
 
 	return m.ta.NativeToValue(val)
+}
+
+func isNumericPlaceholder(key string) bool {
+	return strings.HasSuffix(key, "status_code") ||
+		strings.HasSuffix(key, "status") ||
+		strings.HasSuffix(key, "port") ||
+		strings.HasSuffix(key, "size") ||
+		strings.HasSuffix(key, "retries") ||
+		strings.HasSuffix(key, "max_requests") ||
+		strings.HasSuffix(key, "requests") ||
+		strings.HasSuffix(key, "fails")
+}
+
+func isBooleanPlaceholder(key string) bool {
+	return strings.HasPrefix(key, "is_") ||
+		strings.Contains(key, ".is_") ||
+		strings.HasSuffix(key, "enabled")
 }
 
 // httpRequestCELType is the type representation of a native HTTP request.

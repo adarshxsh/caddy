@@ -90,8 +90,69 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
+	switch v := value.(type) {
+	case string:
+		// already string
+	case int:
+		value = strconv.Itoa(v)
+	case int64:
+		value = strconv.FormatInt(v, 10)
+	case float64:
+		value = strconv.FormatFloat(v, 'f', -1, 64)
+	case bool:
+		if v {
+			value = "true"
+		} else {
+			value = "false"
+		}
+	case time.Duration:
+		value = v.String()
+	}
+
 	r.mapMutex.Lock()
 	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetString sets a custom variable to a string value.
+func (r *Replacer) SetString(variable string, value string) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetInt sets a custom variable to an integer value, converting it to a string.
+func (r *Replacer) SetInt(variable string, value int) {
+	s := strconv.Itoa(value)
+	r.mapMutex.Lock()
+	r.static[variable] = s
+	r.mapMutex.Unlock()
+}
+
+// SetInt64 sets a custom variable to an int64 value, converting it to a string.
+func (r *Replacer) SetInt64(variable string, value int64) {
+	s := strconv.FormatInt(value, 10)
+	r.mapMutex.Lock()
+	r.static[variable] = s
+	r.mapMutex.Unlock()
+}
+
+// SetFloat64 sets a custom variable to a float64 value, converting it to a string.
+func (r *Replacer) SetFloat64(variable string, value float64) {
+	s := strconv.FormatFloat(value, 'f', -1, 64)
+	r.mapMutex.Lock()
+	r.static[variable] = s
+	r.mapMutex.Unlock()
+}
+
+// SetBool sets a custom variable to a boolean value, converting it to a string.
+func (r *Replacer) SetBool(variable string, value bool) {
+	s := "false"
+	if value {
+		s = "true"
+	}
+	r.mapMutex.Lock()
+	r.static[variable] = s
 	r.mapMutex.Unlock()
 }
 
@@ -289,11 +350,13 @@ scan:
 // ToString returns val as a string, as efficiently as possible.
 // EXPERIMENTAL: may be changed or removed later.
 func ToString(val any) string {
-	switch v := val.(type) {
-	case nil:
+	if val == nil {
 		return ""
-	case string:
-		return v
+	}
+	if str, ok := val.(string); ok {
+		return str
+	}
+	switch v := val.(type) {
 	case fmt.Stringer:
 		return v.String()
 	case error:
@@ -309,7 +372,7 @@ func ToString(val any) string {
 	case int32:
 		return strconv.Itoa(int(v))
 	case int64:
-		return strconv.Itoa(int(v))
+		return strconv.FormatInt(v, 10)
 	case uint:
 		return strconv.FormatUint(uint64(v), 10)
 	case uint32:
