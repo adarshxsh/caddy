@@ -16,11 +16,14 @@ package caddy
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -521,6 +524,94 @@ func BenchmarkReplacer(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestTimeCache(t *testing.T) {
+	origNow := nowFunc
+	defer func() { nowFunc = origNow }()
+
+	fixedTime1 := time.Date(2025, time.June, 15, 12, 34, 56, 0, time.UTC)
+	nowFunc = func() time.Time { return fixedTime1 }
+
+	provider := globalDefaultReplacementProvider{}
+
+	expectedHTTP := fixedTime1.UTC().Format(http.TimeFormat)
+	expectedCommonLog := fixedTime1.Format("02/Jan/2006:15:04:05 -0700")
+	expectedYear := strconv.Itoa(fixedTime1.Year())
+	expectedUnix := strconv.FormatInt(fixedTime1.Unix(), 10)
+	expectedUnixMs := strconv.FormatInt(fixedTime1.UnixNano()/int64(time.Millisecond), 10)
+
+	if val, ok := provider.replace("time.now.http"); !ok || val != expectedHTTP {
+		t.Errorf("time.now.http: expected %q, got %q (ok=%v)", expectedHTTP, val, ok)
+	}
+	if val, ok := provider.replace("time.now.common_log"); !ok || val != expectedCommonLog {
+		t.Errorf("time.now.common_log: expected %q, got %q (ok=%v)", expectedCommonLog, val, ok)
+	}
+	if val, ok := provider.replace("time.now.year"); !ok || val != expectedYear {
+		t.Errorf("time.now.year: expected %q, got %q (ok=%v)", expectedYear, val, ok)
+	}
+	if val, ok := provider.replace("time.now.unix"); !ok || val != expectedUnix {
+		t.Errorf("time.now.unix: expected %q, got %q (ok=%v)", expectedUnix, val, ok)
+	}
+	if val, ok := provider.replace("time.now.unix_ms"); !ok || val != expectedUnixMs {
+		t.Errorf("time.now.unix_ms: expected %q, got %q (ok=%v)", expectedUnixMs, val, ok)
+	}
+
+	// Verify caching reuses same string value within the same second
+	val1, _ := provider.replace("time.now.http")
+	val2, _ := provider.replace("time.now.http")
+	if val1 != val2 {
+		t.Errorf("expected cached strings to match within same second")
+	}
+
+	// Verify nowFunc override updates cache when second changes
+	fixedTime2 := time.Date(2026, time.October, 20, 10, 0, 0, 0, time.UTC)
+	nowFunc = func() time.Time { return fixedTime2 }
+
+	expectedHTTP2 := fixedTime2.UTC().Format(http.TimeFormat)
+	if val, ok := provider.replace("time.now.http"); !ok || val != expectedHTTP2 {
+		t.Errorf("time.now.http after nowFunc override: expected %q, got %q", expectedHTTP2, val)
+	}
+
+	// Test zero allocations for 1-second granularity time placeholder lookups on hit paths
+	fixedTime3 := time.Date(2026, time.October, 20, 10, 0, 1, 0, time.UTC)
+	nowFunc = func() time.Time { return fixedTime3 }
+	// Warm up cache for fixedTime3
+	provider.replace("time.now.http")
+
+	var sink any
+	allocs := testing.AllocsPerRun(100, func() {
+		sink, _ = provider.replace("time.now.http")
+		sink, _ = provider.replace("time.now.common_log")
+		sink, _ = provider.replace("time.now.year")
+		sink, _ = provider.replace("time.now.unix")
+	})
+	_ = sink
+	if allocs > 0 {
+		t.Errorf("expected 0 allocs/op for cached time lookups, got %f", allocs)
+	}
+}
+
+func TestTimeCacheConcurrency(t *testing.T) {
+	provider := globalDefaultReplacementProvider{}
+	var wg sync.WaitGroup
+	workers := 10
+	iterations := 500
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				provider.replace("time.now.http")
+				provider.replace("time.now.common_log")
+				provider.replace("time.now.year")
+				provider.replace("time.now.unix")
+				provider.replace("time.now.unix_ms")
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func testReplacer() Replacer {
