@@ -18,10 +18,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -294,5 +297,81 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestHTTPRequestBodyPlaceholder(t *testing.T) {
+	bodyContent := "hello world"
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(bodyContent))
+	repl := NewTestReplacer(req)
+
+	// Evaluate http.request.body for the first time
+	val, ok := repl.GetString("http.request.body")
+	if !ok || val != bodyContent {
+		t.Fatalf("expected %q, got %q (ok=%t)", bodyContent, val, ok)
+	}
+
+	// Verify cached payload in context variable table
+	cachedVar := GetVar(req.Context(), "http.request.body")
+	cachedBytes, isBytes := cachedVar.([]byte)
+	if !isBytes || string(cachedBytes) != bodyContent {
+		t.Fatalf("expected cached body bytes %q, got %v", bodyContent, cachedVar)
+	}
+
+	// Evaluate http.request.body_base64 (should use cached bytes)
+	valB64, okB64 := repl.GetString("http.request.body_base64")
+	expectedB64 := base64.StdEncoding.EncodeToString([]byte(bodyContent))
+	if !okB64 || valB64 != expectedB64 {
+		t.Fatalf("expected %q, got %q (ok=%t)", expectedB64, valB64, okB64)
+	}
+
+	// Verify downstream handlers can still read req.Body from start
+	downstreamBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed reading req.Body downstream: %v", err)
+	}
+	if string(downstreamBytes) != bodyContent {
+		t.Fatalf("expected downstream req.Body to be %q, got %q", bodyContent, string(downstreamBytes))
+	}
+
+	// Repeat evaluation of http.request.body after downstream read
+	val2, ok2 := repl.GetString("http.request.body")
+	if !ok2 || val2 != bodyContent {
+		t.Fatalf("expected cached %q on second eval, got %q (ok=%t)", bodyContent, val2, ok2)
+	}
+}
+
+func TestHTTPRequestBodyPlaceholderEmptyAndNil(t *testing.T) {
+	// Test nil body
+	reqNil := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqNil.Body = nil
+	replNil := NewTestReplacer(reqNil)
+	valNil, okNil := replNil.GetString("http.request.body")
+	if !okNil || valNil != "" {
+		t.Fatalf("expected empty string for nil body, got %q (ok=%t)", valNil, okNil)
+	}
+
+	// Test empty body
+	reqEmpty := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+	replEmpty := NewTestReplacer(reqEmpty)
+	valEmpty, okEmpty := replEmpty.GetString("http.request.body")
+	if !okEmpty || valEmpty != "" {
+		t.Fatalf("expected empty string for empty body, got %q (ok=%t)", valEmpty, okEmpty)
+	}
+}
+
+func BenchmarkHTTPRequestBodyPlaceholder(b *testing.B) {
+	b.ReportAllocs()
+	bodyContent := "{\"test\":\"data\",\"number\":12345}"
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(bodyContent))
+		repl := NewTestReplacer(req)
+
+		// First evaluation reads stream into pooled buffer and caches
+		repl.GetString("http.request.body")
+		// Second evaluation uses context cache
+		repl.GetString("http.request.body")
+		// Third evaluation with base64 uses context cache
+		repl.GetString("http.request.body_base64")
 	}
 }
