@@ -84,6 +84,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		logger.Error("internal error: 101 switching protocols response with non-writable body")
 		return
 	}
+	backConn = &lockedReadWriteCloser{ReadWriteCloser: backConn}
 
 	// write header first, response headers should not be counted in size
 	// like the rest of handler chain.
@@ -142,6 +143,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			return
 		}
 	}
+	conn = &lockedReadWriteCloser{ReadWriteCloser: conn}
 
 	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
 	backConnCloseCh := make(chan struct{})
@@ -565,6 +567,25 @@ func newMaskKey() [4]byte {
 func isWebsocket(r *http.Request) bool {
 	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+// lockedReadWriteCloser wraps an io.ReadWriteCloser with a sync.Mutex
+// to serialize Write operations across active copy goroutines and graceful close handlers,
+// while leaving Read and Close operations unlocked.
+type lockedReadWriteCloser struct {
+	io.ReadWriteCloser
+	mu sync.Mutex
+}
+
+func (l *lockedReadWriteCloser) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	n, err := l.ReadWriteCloser.Write(p)
+	l.mu.Unlock()
+	return n, err
+}
+
+func (l *lockedReadWriteCloser) Unwrap() io.ReadWriteCloser {
+	return l.ReadWriteCloser
 }
 
 // openConnection maps an open connection to
