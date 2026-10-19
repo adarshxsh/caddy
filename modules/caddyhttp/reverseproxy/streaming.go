@@ -645,23 +645,31 @@ type switchProtocolCopier struct {
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	buf, poolBuf := c.buffer()
+	if poolBuf != nil {
+		defer streamingBufPool.Put(poolBuf)
+	}
+	_, err := io.CopyBuffer(c.user, c.backend, buf)
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	buf, poolBuf := c.buffer()
+	if poolBuf != nil {
+		defer streamingBufPool.Put(poolBuf)
+	}
+	_, err := io.CopyBuffer(c.backend, c.user, buf)
 	errc <- err
 	c.wg.Done()
 }
 
-func (c switchProtocolCopier) buffer() []byte {
-	size := c.bufferSize
-	if size <= 0 {
-		size = defaultBufferSize
+func (c switchProtocolCopier) buffer() ([]byte, *[]byte) {
+	if c.bufferSize <= 0 || c.bufferSize == defaultBufferSize {
+		bufPtr := streamingBufPool.Get().(*[]byte)
+		return *bufPtr, bufPtr
 	}
-	return make([]byte, size)
+	return make([]byte, c.bufferSize), nil
 }
 
 var streamingBufPool = sync.Pool{
