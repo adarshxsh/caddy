@@ -950,6 +950,8 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 			}
 		} else if clientIP != "" {
 			req.Header.Set("X-Forwarded-For", clientIP)
+		} else {
+			req.Header.Del("X-Forwarded-For")
 		}
 	}
 
