@@ -296,3 +296,89 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+var (
+	sinkAny  any
+	sinkBool bool
+	sinkStr  string
+)
+
+func TestToLowerASCII(t *testing.T) {
+	for _, tc := range []struct {
+		input    string
+		expected string
+	}{
+		{"version", "version"},
+		{"VERSION", "version"},
+		{"client.san.dns_names", "client.san.dns_names"},
+		{"Client.San.DNS_Names", "client.san.dns_names"},
+		{"", ""},
+		{"123_abc-XYZ", "123_abc-xyz"},
+	} {
+		got := toLowerASCII(tc.input)
+		if got != tc.expected {
+			t.Errorf("toLowerASCII(%q) = %q; want %q", tc.input, got, tc.expected)
+		}
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		sinkStr = toLowerASCII("already.lowercase.key")
+	})
+	if allocs > 0 {
+		t.Errorf("expected 0 allocs for toLowerASCII on lowercase string, got %f", allocs)
+	}
+}
+
+func TestHTTPVarReplacement_NoClientCert(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+		ServerName:  "example.com",
+	}
+
+	for _, key := range []string{
+		"http.request.tls.client.san.dns_names",
+		"http.request.tls.client.san.dns_names.0",
+		"http.request.tls.client.public_key",
+		"http.request.tls.client.issuer",
+		"http.request.tls.client.subject",
+	} {
+		val, ok := getReqTLSReplacement(req, key)
+		if !ok {
+			t.Errorf("expected placeholder %q to be recognized when client cert is absent", key)
+		}
+		_ = val
+	}
+}
+
+func TestTLSReplacerZeroAllocations(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+		ServerName:  "example.com",
+	}
+
+	keysToTest := []string{
+		"http.request.tls.client.public_key",
+		"http.request.tls.client.san.dns_names",
+		"http.request.tls.client.san.dns_names.0",
+		"http.request.tls.client.san.ips.0",
+		"http.request.tls.resumed",
+		"http.request.tls.proto_mutual",
+		"http.request.tls.ech",
+	}
+
+	for _, key := range keysToTest {
+		// Warm up
+		sinkAny, sinkBool = getReqTLSReplacement(req, key)
+
+		allocs := testing.AllocsPerRun(100, func() {
+			sinkAny, sinkBool = getReqTLSReplacement(req, key)
+		})
+		if allocs > 0 {
+			t.Errorf("expected 0 allocs evaluating %q, got %f", key, allocs)
+		}
+	}
+}
