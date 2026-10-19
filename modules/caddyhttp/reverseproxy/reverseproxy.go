@@ -827,11 +827,12 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
 		// that we support trailers. (We do, but we don't go out of our way to
 		// advertise that unless the incoming client request thought it was worth
 		// mentioning.)
-		if h == "Te" && httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
+		if strings.EqualFold(h, "Te") && httpguts.HeaderValuesContainsToken(getHeaderValuesCaseInsensitive(req.Header, "Te"), "trailers") {
+			deleteHeaderCaseInsensitive(req.Header, h)
 			req.Header.Set("Te", "trailers")
 			continue
 		}
-		req.Header.Del(h)
+		deleteHeaderCaseInsensitive(req.Header, h)
 	}
 
 	// After stripping all the hop-by-hop connection headers above, add back any
@@ -1226,7 +1227,7 @@ func (h *Handler) finalizeResponse(
 	removeConnectionHeaders(res.Header)
 
 	for _, h := range hopHeaders {
-		res.Header.Del(h)
+		deleteHeaderCaseInsensitive(res.Header, h)
 	}
 
 	// delete our Server header and use Via instead (see #6275)
@@ -1575,20 +1576,50 @@ func lastHeaderValue(h http.Header, field string) (value string, ok bool, omit b
 	return values[len(values)-1], true, false
 }
 
+// deleteHeaderCaseInsensitive deletes all header keys in h matching name case-insensitively.
+func deleteHeaderCaseInsensitive(h http.Header, name string) {
+	for k := range h {
+		if strings.EqualFold(k, name) {
+			delete(h, k)
+		}
+	}
+}
+
+// getHeaderValuesCaseInsensitive returns all values for header keys matching name case-insensitively.
+func getHeaderValuesCaseInsensitive(h http.Header, name string) []string {
+	var values []string
+	for k, vv := range h {
+		if strings.EqualFold(k, name) {
+			values = append(values, vv...)
+		}
+	}
+	return values
+}
+
+// getHeaderCaseInsensitive returns the first value for header keys matching name case-insensitively.
+func getHeaderCaseInsensitive(h http.Header, name string) string {
+	for k, vv := range h {
+		if strings.EqualFold(k, name) && len(vv) > 0 {
+			return vv[0]
+		}
+	}
+	return ""
+}
+
 func upgradeType(h http.Header) string {
-	if !httpguts.HeaderValuesContainsToken(h["Connection"], "Upgrade") {
+	if !httpguts.HeaderValuesContainsToken(getHeaderValuesCaseInsensitive(h, "Connection"), "Upgrade") {
 		return ""
 	}
-	return strings.ToLower(h.Get("Upgrade"))
+	return strings.ToLower(getHeaderCaseInsensitive(h, "Upgrade"))
 }
 
 // removeConnectionHeaders removes hop-by-hop headers listed in the "Connection" header of h.
 // See RFC 7230, section 6.1
 func removeConnectionHeaders(h http.Header) {
-	for _, f := range h["Connection"] {
+	for _, f := range getHeaderValuesCaseInsensitive(h, "Connection") {
 		for sf := range strings.SplitSeq(f, ",") {
 			if sf = textproto.TrimString(sf); sf != "" {
-				h.Del(sf)
+				deleteHeaderCaseInsensitive(h, sf)
 			}
 		}
 	}
