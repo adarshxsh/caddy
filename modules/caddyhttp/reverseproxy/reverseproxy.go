@@ -1024,9 +1024,11 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 			copyHeader(h, http.Header(header))
 			rw.WriteHeader(code)
 
-			// Clear headers coming from the backend
+			// Clear only 1xx headers coming from the backend, preserving outer middleware headers
 			// (it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses)
-			clear(h)
+			for k := range header {
+				h.Del(k)
+			}
 
 			return nil
 		},
