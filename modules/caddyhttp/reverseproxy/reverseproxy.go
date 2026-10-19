@@ -1343,7 +1343,8 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 	// HTTP request can be transmitted; but if the error is not
 	// specifically a dialer error, we need to be careful
 	if proxyErr != nil {
-		_, isDialError := proxyErr.(DialError)
+		var dialErr DialError
+		isDialError := errors.As(proxyErr, &dialErr)
 		_, isRetryableResponse := proxyErr.(retryableResponseError)
 		herr, isHandlerError := proxyErr.(caddyhttp.HandlerError)
 
@@ -1606,7 +1607,8 @@ func statusError(err error) error {
 	statusCode := http.StatusBadGateway
 
 	// timeout errors have a standard status code (see issue #4823)
-	if err, ok := err.(net.Error); ok && err.Timeout() {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		statusCode = http.StatusGatewayTimeout
 	}
 
@@ -1726,6 +1728,13 @@ var hopHeaders = []string{
 // DialError is an error that specifically occurs
 // in a call to Dial or DialContext.
 type DialError struct{ error }
+
+func (e DialError) Unwrap() error { return e.error }
+
+// NewDialError returns a DialError wrapping err.
+func NewDialError(err error) error {
+	return DialError{err}
+}
 
 // TLSTransport is implemented by transports
 // that are capable of using TLS.
