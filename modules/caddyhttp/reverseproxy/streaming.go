@@ -40,21 +40,17 @@ import (
 
 type h2ReadWriteCloser struct {
 	io.ReadCloser
-	http.ResponseWriter
+	*maxLatencyWriter
 }
 
-func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
-	n, err = rwc.ResponseWriter.Write(p)
-	if err != nil {
-		return 0, err
+func (rwc h2ReadWriteCloser) Close() error {
+	if rwc.maxLatencyWriter != nil {
+		rwc.maxLatencyWriter.stop()
 	}
-
-	//nolint:bodyclose
-	err = http.NewResponseController(rwc.ResponseWriter).Flush()
-	if err != nil {
-		return 0, err
+	if rwc.ReadCloser != nil {
+		return rwc.ReadCloser.Close()
 	}
-	return n, nil
+	return nil
 }
 
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
@@ -115,7 +111,29 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			}
 			return
 		}
-		conn = h2ReadWriteCloser{req.Body, rw}
+		flushInterval := time.Duration(h.FlushInterval)
+		if flushInterval == 0 {
+			flushInterval = defaultFlushInterval
+		}
+
+		var mlwLogger *zap.Logger
+		if h.VerboseLogs {
+			mlwLogger = logger.Named("max_latency_writer")
+		} else {
+			mlwLogger = zap.NewNop()
+		}
+		mlw := &maxLatencyWriter{
+			dst: rw,
+			//nolint:bodyclose
+			flush:   http.NewResponseController(rw).Flush,
+			latency: flushInterval,
+			logger:  mlwLogger,
+		}
+
+		conn = h2ReadWriteCloser{
+			ReadCloser:       req.Body,
+			maxLatencyWriter: mlw,
+		}
 		// bufio is not needed, use minimal buffer
 		brw = bufio.NewReadWriter(bufio.NewReaderSize(conn, 1), bufio.NewWriterSize(conn, 1))
 	} else {
@@ -630,8 +648,14 @@ func (m *maxLatencyWriter) delayedFlush() {
 func (m *maxLatencyWriter) stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.flushPending = false
-	if m.t != nil {
+	if m.flushPending {
+		m.flushPending = false
+		if m.t != nil {
+			m.t.Stop()
+		}
+		//nolint:errcheck
+		m.flush()
+	} else if m.t != nil {
 		m.t.Stop()
 	}
 }
@@ -676,6 +700,7 @@ var streamingBufPool = sync.Pool{
 }
 
 const (
-	defaultBufferSize = 32 * 1024
-	wordSize          = int(unsafe.Sizeof(uintptr(0)))
+	defaultBufferSize    = 32 * 1024
+	defaultFlushInterval = 250 * time.Millisecond
+	wordSize             = int(unsafe.Sizeof(uintptr(0)))
 )
