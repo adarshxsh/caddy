@@ -29,6 +29,7 @@ import (
 	"net/netip"
 	"net/textproto"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -897,9 +898,9 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 		// for security. If trusted, there is no peer IP to append to
 		// X-Forwarded-For, so clientIP stays empty.
 		if !trusted {
-			req.Header.Del("X-Forwarded-For")
-			req.Header.Del("X-Forwarded-Proto")
-			req.Header.Del("X-Forwarded-Host")
+			delHeaderFold(req.Header, "X-Forwarded-For")
+			delHeaderFold(req.Header, "X-Forwarded-Proto")
+			delHeaderFold(req.Header, "X-Forwarded-Host")
 			return nil
 		}
 	} else {
@@ -913,9 +914,9 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 		if err != nil {
 			// Remove the `X-Forwarded-*` headers to avoid upstreams
 			// potentially trusting a header that came from the client
-			req.Header.Del("X-Forwarded-For")
-			req.Header.Del("X-Forwarded-Proto")
-			req.Header.Del("X-Forwarded-Host")
+			delHeaderFold(req.Header, "X-Forwarded-For")
+			delHeaderFold(req.Header, "X-Forwarded-Proto")
+			delHeaderFold(req.Header, "X-Forwarded-Host")
 			return nil
 		}
 
@@ -941,16 +942,18 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 	// retain prior X-Forwarded-For information as a comma+space
 	// separated list and fold multiple headers into one.
 	prior, ok, omit := allHeaderValues(req.Header, "X-Forwarded-For")
-	if !omit {
-		if trusted && ok && prior != "" {
-			if clientIP != "" {
-				req.Header.Set("X-Forwarded-For", prior+", "+clientIP)
-			} else {
-				req.Header.Set("X-Forwarded-For", prior)
-			}
-		} else if clientIP != "" {
-			req.Header.Set("X-Forwarded-For", clientIP)
+	if omit {
+		delHeaderFold(req.Header, "X-Forwarded-For")
+	} else if trusted && ok && prior != "" {
+		if clientIP != "" {
+			setHeaderFold(req.Header, "X-Forwarded-For", prior+", "+clientIP)
+		} else {
+			setHeaderFold(req.Header, "X-Forwarded-For", prior)
 		}
+	} else if clientIP != "" {
+		setHeaderFold(req.Header, "X-Forwarded-For", clientIP)
+	} else {
+		delHeaderFold(req.Header, "X-Forwarded-For")
 	}
 
 	// Set X-Forwarded-Proto; many backend apps expect this,
@@ -964,8 +967,10 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 	if trusted && ok && prior != "" {
 		proto = prior
 	}
-	if !omit {
-		req.Header.Set("X-Forwarded-Proto", proto)
+	if omit {
+		delHeaderFold(req.Header, "X-Forwarded-Proto")
+	} else {
+		setHeaderFold(req.Header, "X-Forwarded-Proto", proto)
 	}
 
 	// Set X-Forwarded-Host; often this is redundant because
@@ -977,8 +982,10 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 	if trusted && ok && prior != "" {
 		host = prior
 	}
-	if !omit {
-		req.Header.Set("X-Forwarded-Host", host)
+	if omit {
+		delHeaderFold(req.Header, "X-Forwarded-Host")
+	} else {
+		setHeaderFold(req.Header, "X-Forwarded-Host", host)
 	}
 
 	return nil
@@ -1539,17 +1546,46 @@ func copyHeader(dst, src http.Header) {
 	}
 }
 
-// allHeaderValues gets all values for a given header field,
-// joined by a comma and space if more than one is set. If the
-// header field is nil, then the omit is true, meaning some
-// earlier logic in the server wanted to prevent this header from
-// getting written at all. If the header is empty, then ok is
-// false. Callers should still check that the value is not empty
+// delHeaderFold deletes all entries in h where key matches field case-insensitively.
+func delHeaderFold(h http.Header, field string) {
+	for k := range h {
+		if strings.EqualFold(k, field) {
+			delete(h, k)
+		}
+	}
+}
+
+// setHeaderFold deletes all case variants of field from h and sets the canonical field key to value.
+func setHeaderFold(h http.Header, field, value string) {
+	delHeaderFold(h, field)
+	h.Set(field, value)
+}
+
+// allHeaderValues gets all values for a given header field across any case variants,
+// joined by a comma and space if more than one is set. If any matching header field is nil,
+// then omit is true, meaning some earlier logic in the server wanted to prevent this header
+// from getting written at all. If no matching header is present or all matching headers are empty,
+// then ok is false. Callers should still check that the value is not empty
 // (the header field may be set but have an empty value).
 func allHeaderValues(h http.Header, field string) (value string, ok bool, omit bool) {
-	values, ok := h[http.CanonicalHeaderKey(field)]
-	if ok && values == nil {
-		return "", true, true
+	var keys []string
+	for k := range h {
+		if strings.EqualFold(k, field) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return "", false, false
+	}
+	sort.Strings(keys)
+
+	var values []string
+	for _, k := range keys {
+		vv := h[k]
+		if vv == nil {
+			return "", true, true
+		}
+		values = append(values, vv...)
 	}
 	if len(values) == 0 {
 		return "", false, false
@@ -1557,17 +1593,30 @@ func allHeaderValues(h http.Header, field string) (value string, ok bool, omit b
 	return strings.Join(values, ", "), true, false
 }
 
-// lastHeaderValue gets the last value for a given header field
-// if more than one is set. If the header field is nil, then
-// the omit is true, meaning some earlier logic in the server
-// wanted to prevent this header from getting written at all.
-// If the header is empty, then ok is false. Callers should
-// still check that the value is not empty (the header field
-// may be set but have an empty value).
+// lastHeaderValue gets the last value for a given header field across any case variants
+// if more than one is set. If any matching header field is nil, then omit is true,
+// meaning some earlier logic in the server wanted to prevent this header from getting written at all.
+// If no matching header is present or all matching headers are empty, then ok is false.
+// Callers should still check that the value is not empty (the header field may be set but have an empty value).
 func lastHeaderValue(h http.Header, field string) (value string, ok bool, omit bool) {
-	values, ok := h[http.CanonicalHeaderKey(field)]
-	if ok && values == nil {
-		return "", true, true
+	var keys []string
+	for k := range h {
+		if strings.EqualFold(k, field) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return "", false, false
+	}
+	sort.Strings(keys)
+
+	var values []string
+	for _, k := range keys {
+		vv := h[k]
+		if vv == nil {
+			return "", true, true
+		}
+		values = append(values, vv...)
 	}
 	if len(values) == 0 {
 		return "", false, false
