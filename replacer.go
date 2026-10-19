@@ -181,10 +181,19 @@ func (r *Replacer) replace(input, empty string,
 	}
 
 	var sb strings.Builder
-
-	// it is reasonable to assume that the output
-	// will be approximately as long as the input
-	sb.Grow(len(input))
+	var sbAllocated bool
+	writeString := func(s string) {
+		if len(s) == 0 {
+			return
+		}
+		if !sbAllocated {
+			// it is reasonable to assume that the output
+			// will be approximately as long as the input
+			sb.Grow(len(input))
+			sbAllocated = true
+		}
+		sb.WriteString(s)
+	}
 
 	// iterate the input to find each placeholder
 	var lastWriteCursor int
@@ -196,7 +205,7 @@ scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
-			sb.WriteString(input[lastWriteCursor : i-1])
+			writeString(input[lastWriteCursor : i-1])
 			lastWriteCursor = i
 			continue
 		}
@@ -229,9 +238,6 @@ scan:
 			end += nextEnd + 1
 		}
 
-		// write the substring from the last cursor to this point
-		sb.WriteString(input[lastWriteCursor:i])
-
 		// trim opening bracket
 		key := input[i+1 : end]
 
@@ -245,7 +251,6 @@ scan:
 			} else if !treatUnknownAsEmpty {
 				// if treatUnknownAsEmpty is true, we'll handle an empty
 				// val later; so only continue otherwise
-				lastWriteCursor = i
 				continue
 			}
 		}
@@ -269,10 +274,14 @@ scan:
 				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
 					string(phOpen), key, string(phClose))
 			} else if empty != "" {
-				sb.WriteString(empty)
+				writeString(input[lastWriteCursor:i])
+				writeString(empty)
+			} else {
+				writeString(input[lastWriteCursor:i])
 			}
 		} else {
-			sb.WriteString(valStr)
+			writeString(input[lastWriteCursor:i])
+			writeString(valStr)
 		}
 
 		// advance cursor to end of placeholder
@@ -280,8 +289,16 @@ scan:
 		lastWriteCursor = i + 1
 	}
 
+	if !sbAllocated && lastWriteCursor == 0 {
+		return input, nil
+	}
+
 	// flush any unwritten remainder
-	sb.WriteString(input[lastWriteCursor:])
+	writeString(input[lastWriteCursor:])
+
+	if !sbAllocated {
+		return "", nil
+	}
 
 	return sb.String(), nil
 }
