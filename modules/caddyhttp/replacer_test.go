@@ -296,3 +296,34 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLazyRequestIDAllocation(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+	req = req.WithContext(ctx)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Verify "uuid" context var is NOT set during initial setup
+	if GetVar(req.Context(), "uuid") != nil {
+		t.Errorf("Expected 'uuid' context var to be nil before placeholder evaluation")
+	}
+
+	// Evaluate {http.request.uuid}
+	val1, ok1 := repl.GetString("http.request.uuid")
+	if !ok1 || val1 == "" {
+		t.Fatalf("Expected http.request.uuid evaluation to succeed, got %q (ok=%t)", val1, ok1)
+	}
+
+	// Verify "uuid" context var IS set now
+	rawID := GetVar(req.Context(), "uuid")
+	if rawID == nil {
+		t.Fatalf("Expected 'uuid' context var to be set after placeholder evaluation")
+	}
+
+	// Evaluate {http.request.uuid} again
+	val2, ok2 := repl.GetString("http.request.uuid")
+	if !ok2 || val2 != val1 {
+		t.Fatalf("Expected http.request.uuid evaluation to be consistent, got %q vs %q", val1, val2)
+	}
+}
