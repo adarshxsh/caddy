@@ -3,10 +3,12 @@ package reverseproxy
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +82,103 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestFlushInterval(t *testing.T) {
+	tests := []struct {
+		name          string
+		flushInterval caddy.Duration
+		req           *http.Request
+		res           *http.Response
+		expected      time.Duration
+	}{
+		{
+			name:          "Positive FlushInterval with ContentLength == -1",
+			flushInterval: caddy.Duration(100 * time.Millisecond),
+			req:           httptest.NewRequest("GET", "/", nil),
+			res: &http.Response{
+				Header:        make(http.Header),
+				ContentLength: -1,
+			},
+			expected: 100 * time.Millisecond,
+		},
+		{
+			name:          "Explicit negative FlushInterval with ContentLength == -1",
+			flushInterval: caddy.Duration(-1),
+			req:           httptest.NewRequest("GET", "/", nil),
+			res: &http.Response{
+				Header:        make(http.Header),
+				ContentLength: -1,
+			},
+			expected: -1,
+		},
+		{
+			name:          "Unconfigured FlushInterval (0) with ContentLength == -1",
+			flushInterval: 0,
+			req:           httptest.NewRequest("GET", "/", nil),
+			res: &http.Response{
+				Header:        make(http.Header),
+				ContentLength: -1,
+			},
+			expected: -1,
+		},
+		{
+			name:          "Server-Sent Events overrides positive FlushInterval",
+			flushInterval: caddy.Duration(100 * time.Millisecond),
+			req:           httptest.NewRequest("GET", "/", nil),
+			res: &http.Response{
+				Header: http.Header{
+					"Content-Type": []string{"text/event-stream"},
+				},
+				ContentLength: -1,
+			},
+			expected: -1,
+		},
+		{
+			name:          "Bidirectional stream overrides positive FlushInterval",
+			flushInterval: caddy.Duration(100 * time.Millisecond),
+			req: &http.Request{
+				ProtoMajor: 2,
+				Header:     http.Header{"Accept-Encoding": []string{"identity"}},
+			},
+			res: &http.Response{
+				ProtoMajor:    2,
+				Header:        make(http.Header),
+				ContentLength: -1,
+			},
+			expected: -1,
+		},
+		{
+			name:          "Unconfigured FlushInterval (0) with known ContentLength",
+			flushInterval: 0,
+			req:           httptest.NewRequest("GET", "/", nil),
+			res: &http.Response{
+				Header:        make(http.Header),
+				ContentLength: 100,
+			},
+			expected: 0,
+		},
+		{
+			name:          "Positive FlushInterval with known ContentLength",
+			flushInterval: caddy.Duration(200 * time.Millisecond),
+			req:           httptest.NewRequest("GET", "/", nil),
+			res: &http.Response{
+				Header:        make(http.Header),
+				ContentLength: 100,
+			},
+			expected: 200 * time.Millisecond,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := Handler{
+				FlushInterval: tt.flushInterval,
+			}
+			got := h.flushInterval(tt.req, tt.res)
+			if got != tt.expected {
+				t.Errorf("flushInterval() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
