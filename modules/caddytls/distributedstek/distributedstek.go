@@ -104,7 +104,11 @@ func (s *Provider) Initialize(config *caddytls.SessionTicketService) ([][32]byte
 
 	// create timer for the remaining time on the interval;
 	// this timer is cleaned up only when rotate() returns
-	s.timer = time.NewTimer(time.Until(dstek.NextRotation))
+	nextInterval := time.Until(dstek.NextRotation)
+	if nextInterval <= 0 {
+		nextInterval = time.Duration(s.stekConfig.RotationInterval)
+	}
+	s.timer = time.NewTimer(nextInterval)
 
 	return dstek.Keys, nil
 }
@@ -216,7 +220,8 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 			dstek, err := s.getSTEK()
 			if err != nil {
 				// TODO: improve this handling
-				log.Printf("[ERROR] Loading STEK: %v", err)
+				log.Printf("[ERROR] Loading STEK: %v (retrying in %v)", err, retryInterval)
+				s.timer.Reset(retryInterval)
 				continue
 			}
 
@@ -224,7 +229,11 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 			keysChan <- dstek.Keys
 
 			// timer channel is already drained, so reset directly (see godoc)
-			s.timer.Reset(time.Until(dstek.NextRotation))
+			nextInterval := time.Until(dstek.NextRotation)
+			if nextInterval <= 0 {
+				nextInterval = time.Duration(s.stekConfig.RotationInterval)
+			}
+			s.timer.Reset(nextInterval)
 
 		case <-doneChan:
 			// again, see godocs for why timer is stopped this way
@@ -245,6 +254,8 @@ const (
 	stekLockName = "stek_check"
 	stekFileName = "stek/stek.bin"
 )
+
+var retryInterval = 1 * time.Minute
 
 // Interface guard
 var _ caddytls.STEKProvider = (*Provider)(nil)

@@ -100,7 +100,8 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			keysCopy, err = s.stekConfig.RotateSTEKs(keysCopy)
 			if err != nil {
 				// TODO: improve this handling
-				log.Printf("[ERROR] Generating STEK: %v", err)
+				log.Printf("[ERROR] Generating STEK: %v (retrying in %v)", err, retryInterval)
+				s.timer.Reset(retryInterval)
 				continue
 			}
 
@@ -128,9 +129,10 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 }
 
 var (
-	lastRotation time.Time
-	keys         [][32]byte
-	mutex        sync.RWMutex // protects keys and lastRotation
+	lastRotation  time.Time
+	keys          [][32]byte
+	mutex         sync.RWMutex // protects keys and lastRotation
+	retryInterval = 1 * time.Minute
 )
 
 // Interface guard
