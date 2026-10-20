@@ -15,6 +15,7 @@
 package caddyhttp
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
@@ -56,7 +57,10 @@ func (r LoggableHTTPRequest) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 		enc.AddArray("transfer_encoding", internal.LoggableStringArray(r.TransferEncoding))
 	}
 	if r.TLS != nil {
-		enc.AddObject("tls", LoggableTLSConnState(*r.TLS))
+		enc.AddObject("tls", LoggableTLSConnState{
+			ConnectionState: *r.TLS,
+			Ctx:             r.Context(),
+		})
 	}
 	return nil
 }
@@ -68,7 +72,10 @@ type LoggableHTTPHeader = internal.LoggableHTTPHeader
 type LoggableStringArray = internal.LoggableStringArray
 
 // LoggableTLSConnState makes a TLS connection state loggable with zap.Object().
-type LoggableTLSConnState tls.ConnectionState
+type LoggableTLSConnState struct {
+	tls.ConnectionState
+	Ctx context.Context
+}
 
 // MarshalLogObject satisfies the zapcore.ObjectMarshaler interface.
 func (t LoggableTLSConnState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
@@ -82,6 +89,18 @@ func (t LoggableTLSConnState) MarshalLogObject(enc zapcore.ObjectEncoder) error 
 		enc.AddString("client_common_name", t.PeerCertificates[0].Subject.CommonName)
 		enc.AddString("client_serial", t.PeerCertificates[0].SerialNumber.String())
 	}
+	var earlyDataAccepted, earlyDataRejected bool
+	if t.Ctx != nil {
+		if info, ok := t.Ctx.Value(EarlyDataCtxKey).(EarlyDataInfo); ok {
+			if info.Used0RTT || info.Status == "accepted" {
+				earlyDataAccepted = true
+			} else if info.Status == "rejected_fallback_1rtt" || info.Status == "rejected" {
+				earlyDataRejected = true
+			}
+		}
+	}
+	enc.AddBool("early_data_accepted", earlyDataAccepted)
+	enc.AddBool("early_data_rejected", earlyDataRejected)
 	return nil
 }
 
