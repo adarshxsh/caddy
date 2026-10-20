@@ -263,6 +263,9 @@ type Server struct {
 	// don't perform a retry, so disabling 0-RTT can smooth it out.
 	Allow0RTT *bool `json:"allow_0rtt,omitempty"`
 
+	// Configures policies for handling 0-RTT early data requests.
+	EarlyData *EarlyDataConfig `json:"early_data,omitempty"`
+
 	// If set, metrics observations will be enabled.
 	// This setting is EXPERIMENTAL and subject to change.
 	// DEPRECATED: Use the app-level `metrics` field.
@@ -306,6 +309,29 @@ var (
 	ServerHeader = "Caddy"
 	serverHeader = []string{ServerHeader}
 )
+
+// EarlyDataConfig defines policy for HTTP 0-RTT early data according to RFC 8470.
+type EarlyDataConfig struct {
+	Policy string `json:"policy,omitempty"`
+}
+
+const (
+	// EarlyDataPolicyRejectUnsafe automatically rejects unsafe early data requests with HTTP 425 (default).
+	EarlyDataPolicyRejectUnsafe = "reject_unsafe"
+	// EarlyDataPolicyAllowAll allows all early data requests regardless of method safety.
+	EarlyDataPolicyAllowAll = "allow_all"
+	// EarlyDataPolicyDisable0RTT rejects all early data requests with HTTP 425 and disables 0-RTT on listeners.
+	EarlyDataPolicyDisable0RTT = "disable_0rtt"
+)
+
+func isSafeMethod(method string) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
 
 // ServeHTTP is the entry point for all HTTP requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -354,7 +380,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Request:              r.Clone(r.Context()),
 		ShouldLogCredentials: shouldLogCredentials,
 	})
-	errLog := s.errorLogger.WithLazy(loggableReq)
+	errLogger := s.errorLogger
+	if errLogger == nil {
+		errLogger = zap.NewNop()
+	}
+	errLog := errLogger.WithLazy(loggableReq)
 
 	var duration time.Duration
 
@@ -505,6 +535,33 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) error {
 				c.Write(zap.String("header", k))
 			}
 		}
+	}
+
+	// RFC 8470: Early data method safety enforcement and header sanitization
+	if r.TLS != nil && !r.TLS.HandshakeComplete {
+		policy := EarlyDataPolicyRejectUnsafe
+		if s.EarlyData != nil && s.EarlyData.Policy != "" {
+			policy = s.EarlyData.Policy
+		}
+
+		if policy == EarlyDataPolicyDisable0RTT || (s.Allow0RTT != nil && !*s.Allow0RTT) {
+			return HandlerError{
+				Err:        errors.New("0-RTT early data is disabled"),
+				StatusCode: http.StatusTooEarly,
+			}
+		}
+
+		if policy == EarlyDataPolicyRejectUnsafe && !isSafeMethod(r.Method) {
+			return HandlerError{
+				Err:        fmt.Errorf("unsafe HTTP method %s in 0-RTT early data", r.Method),
+				StatusCode: http.StatusTooEarly,
+			}
+		}
+
+		r.Header.Set("Early-Data", "1")
+	} else {
+		// RFC 8470 Section 5: Intermediaries MUST remove any Early-Data header field received from client on 1-RTT
+		r.Header.Del("Early-Data")
 	}
 
 	// execute the primary handler chain
@@ -674,7 +731,12 @@ func (s *Server) serveHTTP3(addr caddy.NetworkAddress, tlsCfg *tls.Config) error
 		return fmt.Errorf("starting HTTP/3 QUIC listener: %v", err)
 	}
 	addr.Network = h3net
-	h3ln, err := addr.ListenQUIC(s.ctx, 0, net.ListenConfig{}, tlsCfg, s.packetConnWrappers, s.Allow0RTT)
+	allow0rtt := s.Allow0RTT
+	if s.EarlyData != nil && s.EarlyData.Policy == EarlyDataPolicyDisable0RTT {
+		f := false
+		allow0rtt = &f
+	}
+	h3ln, err := addr.ListenQUIC(s.ctx, 0, net.ListenConfig{}, tlsCfg, s.packetConnWrappers, allow0rtt)
 	if err != nil {
 		return fmt.Errorf("starting HTTP/3 QUIC listener: %v", err)
 	}
