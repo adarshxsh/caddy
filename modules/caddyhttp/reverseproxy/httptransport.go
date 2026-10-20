@@ -517,7 +517,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 					if err != nil {
 						return nil, err
 					}
-					return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+					return h.quicTransport.Dial(ctx, udpAddr, tlsCfg, cfg)
 				}
 			}
 		}
