@@ -19,7 +19,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"testing"
 )
 
@@ -239,7 +238,6 @@ func TestReplacerSet(t *testing.T) {
 
 func TestReplacerReplaceKnown(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		providers: []replacementProvider{
 			// split our possible vars to two functions (to test if both functions are called)
 			ReplacerFunc(func(key string) (val any, ok bool) {
@@ -312,7 +310,6 @@ func TestReplacerReplaceKnown(t *testing.T) {
 
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		static: map[string]any{
 			"key1": "val1",
 			"key2": "val2",
@@ -526,7 +523,54 @@ func BenchmarkReplacer(b *testing.B) {
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
-		static:    make(map[string]any),
-		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestReplacerLazyStaticMap(t *testing.T) {
+	rep := NewReplacer()
+	if rep.static != nil {
+		t.Errorf("Expected static map to be nil initially, got %v", rep.static)
+	}
+
+	// Read on uninitialized static map
+	val, found := rep.Get("unknown")
+	if found || val != nil {
+		t.Errorf("Expected nil, false from Get on empty replacer, got %v, %v", val, found)
+	}
+
+	// Delete on uninitialized static map
+	rep.Delete("nonexistent")
+	rep.DeleteByPrefix("nonexistent_")
+	if rep.static != nil {
+		t.Errorf("Expected static map to remain nil after Delete on empty replacer")
+	}
+
+	// Set lazily allocates static map
+	rep.Set("foo", "bar")
+	if rep.static == nil {
+		t.Errorf("Expected static map to be allocated after Set")
+	}
+	if val, found := rep.Get("foo"); !found || val != "bar" {
+		t.Errorf("Expected 'bar', true from Get, got %v, %v", val, found)
+	}
+
+	// Test zero-value Replacer does not panic
+	var zeroRep Replacer
+	zeroRep.Delete("foo")
+	zeroRep.DeleteByPrefix("foo")
+	if _, ok := zeroRep.Get("foo"); ok {
+		t.Errorf("Expected false for Get on zero-value Replacer")
+	}
+	zeroRep.Set("zeroKey", "zeroVal")
+	if zeroRep.static["zeroKey"] != "zeroVal" {
+		t.Errorf("Expected 'zeroVal' in static map for zero-value Replacer after Set")
+	}
+}
+
+func BenchmarkNewReplacer(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = NewReplacer()
+	}
+}
+
