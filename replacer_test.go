@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -523,6 +524,22 @@ func BenchmarkReplacer(b *testing.B) {
 	}
 }
 
+func BenchmarkFileReplacer(b *testing.B) {
+	tmpDir := b.TempDir()
+	tmpFile := filepath.Join(tmpDir, "bench.txt")
+	if err := os.WriteFile(tmpFile, []byte("bench content\n"), 0644); err != nil {
+		b.Fatalf("failed to write tmp file: %v", err)
+	}
+
+	rep := NewReplacer()
+	ph := "{file." + tmpFile + "}"
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rep.ReplaceAll(ph, "")
+	}
+}
+
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
@@ -530,3 +547,116 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestFileReplacementCacheHitAndExpiry(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "test.txt")
+
+	if err := os.WriteFile(tmpFile, []byte("hello v1\n"), 0644); err != nil {
+		t.Fatalf("failed to write tmp file: %v", err)
+	}
+
+	provider := fileReplacementProvider{
+		cache: newFileCache(10, 100*time.Millisecond),
+	}
+
+	// First lookup (cache miss)
+	val, ok := provider.replace("file." + tmpFile)
+	if !ok || val != "hello v1" {
+		t.Fatalf("expected 'hello v1', got %v (ok=%v)", val, ok)
+	}
+
+	// Update file on disk
+	if err := os.WriteFile(tmpFile, []byte("hello v2\n"), 0644); err != nil {
+		t.Fatalf("failed to update tmp file: %v", err)
+	}
+
+	// Second lookup immediately (cache hit)
+	val2, ok2 := provider.replace("file." + tmpFile)
+	if !ok2 || val2 != "hello v1" {
+		t.Fatalf("expected cached 'hello v1', got %v (ok=%v)", val2, ok2)
+	}
+
+	// Wait for TTL to expire
+	time.Sleep(120 * time.Millisecond)
+
+	// Third lookup after TTL expiry (cache miss)
+	val3, ok3 := provider.replace("file." + tmpFile)
+	if !ok3 || val3 != "hello v2" {
+		t.Fatalf("expected updated 'hello v2' after TTL expiry, got %v (ok=%v)", val3, ok3)
+	}
+}
+
+func TestFileReplacementCacheBoundedCapacity(t *testing.T) {
+	maxEntries := 5
+	cache := newFileCache(maxEntries, 10*time.Second)
+
+	for i := 1; i <= 10; i++ {
+		key := fmt.Sprintf("/path/file%d.txt", i)
+		cache.set(key, fmt.Sprintf("content%d", i))
+		cache.mu.RLock()
+		itemCount := len(cache.items)
+		cache.mu.RUnlock()
+		if itemCount > maxEntries {
+			t.Fatalf("cache size %d exceeded maxEntries %d after inserting %s", itemCount, maxEntries, key)
+		}
+	}
+
+	cache.mu.RLock()
+	finalCount := len(cache.items)
+	cache.mu.RUnlock()
+	if finalCount != maxEntries {
+		t.Fatalf("expected final cache count %d, got %d", maxEntries, finalCount)
+	}
+
+	if val, ok := cache.get("/path/file10.txt"); !ok || val != "content10" {
+		t.Fatalf("expected content10 for file10.txt, got %v (ok=%v)", val, ok)
+	}
+}
+
+func TestFileReplacementCacheConcurrency(t *testing.T) {
+	provider := fileReplacementProvider{
+		cache: newFileCache(20, 50*time.Millisecond),
+	}
+
+	tmpDir := t.TempDir()
+	var files []string
+	for i := 0; i < 10; i++ {
+		fPath := filepath.Join(tmpDir, fmt.Sprintf("file%d.txt", i))
+		_ = os.WriteFile(fPath, []byte(fmt.Sprintf("data-%d", i)), 0644)
+		files = append(files, fPath)
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 20; g++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			for iter := 0; iter < 100; iter++ {
+				fPath := files[(goroutineID+iter)%len(files)]
+				val, ok := provider.replace("file." + fPath)
+				if !ok {
+					t.Errorf("expected ok for file %s", fPath)
+				}
+				_ = val
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
+func TestFileReplacementErrorHandling(t *testing.T) {
+	provider := fileReplacementProvider{
+		cache: newFileCache(10, 1*time.Second),
+	}
+
+	nonExistentPath := filepath.Join(t.TempDir(), "does_not_exist.txt")
+	val, ok := provider.replace("file." + nonExistentPath)
+	if !ok {
+		t.Fatalf("expected ok=true for file replacement error handling, got ok=%v", ok)
+	}
+	if val != nil {
+		t.Fatalf("expected nil value for missing file, got %v", val)
+	}
+}
+
