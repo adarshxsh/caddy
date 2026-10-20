@@ -1343,6 +1343,12 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 	// HTTP request can be transmitted; but if the error is not
 	// specifically a dialer error, we need to be careful
 	if proxyErr != nil {
+		// if the request body was partially or fully read for an unbuffered
+		// request, we cannot retry because the body stream cannot be rewound
+		if bodyBuf, ok := req.Body.(*bodyNopCloserIfNotRead); ok && bodyBuf.read != 0 {
+			return false
+		}
+
 		_, isDialError := proxyErr.(DialError)
 		_, isRetryableResponse := proxyErr.(retryableResponseError)
 		herr, isHandlerError := proxyErr.(caddyhttp.HandlerError)
