@@ -3,6 +3,7 @@ package caddytls
 import (
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
 )
@@ -33,5 +34,19 @@ func TestAutomationPolicyImplicitTailscaleManagersOnlyCatchAll(t *testing.T) {
 	}
 	if ap.implicitTailscaleManagersOnly() {
 		t.Fatal("expected catch-all manager policy to remain outside tailscale-only special case")
+	}
+}
+
+func TestTLSStopIdempotent(t *testing.T) {
+	tls := &TLS{
+		logger: zap.NewNop(),
+		ctx:    caddy.Context{},
+	}
+	tls.keepStorageClean()
+	if err := tls.Stop(); err != nil {
+		t.Fatalf("first Stop() failed: %v", err)
+	}
+	if err := tls.Stop(); err != nil {
+		t.Fatalf("second Stop() failed: %v", err)
 	}
 }
