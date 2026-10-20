@@ -36,6 +36,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -223,34 +224,18 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return id.String(), true
 
 			case "http.request.body":
-				if req.Body == nil {
+				if req.Body == nil && GetVar(req.Context(), RequestBodyVarKey) == nil {
 					return "", true
 				}
-				// normally net/http will close the body for us, but since we
-				// are replacing it with a fake one, we have to ensure we close
-				// the real body ourselves when we're done
-				defer req.Body.Close()
-				// read the request body into a buffer (can't pool because we
-				// don't know its lifetime and would have to make a copy anyway)
-				buf := new(bytes.Buffer)
-				_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-				req.Body = io.NopCloser(buf)  // replace real body with buffered data
-				return buf.String(), true
+				bodyBytes := readAndCacheRequestBody(req)
+				return string(bodyBytes), true
 
 			case "http.request.body_base64":
-				if req.Body == nil {
+				if req.Body == nil && GetVar(req.Context(), RequestBodyVarKey) == nil {
 					return "", true
 				}
-				// normally net/http will close the body for us, but since we
-				// are replacing it with a fake one, we have to ensure we close
-				// the real body ourselves when we're done
-				defer req.Body.Close()
-				// read the request body into a buffer (can't pool because we
-				// don't know its lifetime and would have to make a copy anyway)
-				buf := new(bytes.Buffer)
-				_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-				req.Body = io.NopCloser(buf)  // replace real body with buffered data
-				return base64.StdEncoding.EncodeToString(buf.Bytes()), true
+				bodyBytes := readAndCacheRequestBody(req)
+				return base64.StdEncoding.EncodeToString(bodyBytes), true
 
 			// original request, before any internal changes
 			case "http.request.orig_method":
@@ -597,3 +582,33 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+var bufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+func readAndCacheRequestBody(req *http.Request) []byte {
+	if cachedBytes, ok := GetVar(req.Context(), RequestBodyVarKey).([]byte); ok {
+		return cachedBytes
+	}
+	if req.Body == nil {
+		return nil
+	}
+	if req.Context().Value(VarsCtxKey) == nil {
+		*req = *req.WithContext(context.WithValue(req.Context(), VarsCtxKey, make(map[string]any)))
+	}
+	// normally net/http will close the body for us, but since we
+	// are replacing it with a fake one, we have to ensure we close
+	// the real body ourselves when we're done
+	defer req.Body.Close()
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
+	cachedBytes := bytes.Clone(buf.Bytes())
+	bufPool.Put(buf)
+	SetVar(req.Context(), RequestBodyVarKey, cachedBytes)
+	req.Body = io.NopCloser(bytes.NewReader(cachedBytes)) // replace real body with buffered data
+	return cachedBytes
+}

@@ -15,10 +15,13 @@
 package caddyhttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -295,4 +298,70 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
 	}
+}
+
+func TestRequestBodyCaching(t *testing.T) {
+	bodyContent := "Hello, Caddy Request Body Caching!"
+	req := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(bytes.NewBufferString(bodyContent)))
+	repl := NewTestReplacer(req)
+
+	// 1. Initial evaluation of {http.request.body}
+	val, ok := repl.GetString("http.request.body")
+	if !ok || val != bodyContent {
+		t.Fatalf("Expected body placeholder to return %q, got %q (ok=%t)", bodyContent, val, ok)
+	}
+
+	// Verify that RequestBodyVarKey is stored in request context
+	cachedBytes, isSlice := GetVar(req.Context(), RequestBodyVarKey).([]byte)
+	if !isSlice || string(cachedBytes) != bodyContent {
+		t.Fatalf("Expected cached bytes in context to be %q, got %q (ok=%t)", bodyContent, string(cachedBytes), isSlice)
+	}
+
+	// 2. Evaluation of {http.request.body_base64} reuses cached bytes
+	expectedBase64 := base64.StdEncoding.EncodeToString([]byte(bodyContent))
+	b64Val, b64Ok := repl.GetString("http.request.body_base64")
+	if !b64Ok || b64Val != expectedBase64 {
+		t.Fatalf("Expected base64 body placeholder to return %q, got %q (ok=%t)", expectedBase64, b64Val, b64Ok)
+	}
+
+	// 3. Verify downstream handler can read req.Body completely
+	bodyRead, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("Error reading req.Body after placeholder evaluation: %v", err)
+	}
+	if string(bodyRead) != bodyContent {
+		t.Fatalf("Expected downstream req.Body read to return %q, got %q", bodyContent, string(bodyRead))
+	}
+
+	// 4. Repeated placeholder evaluation after req.Body consumed still returns cached value
+	valAfterRead, okAfterRead := repl.GetString("http.request.body")
+	if !okAfterRead || valAfterRead != bodyContent {
+		t.Fatalf("Expected body placeholder after req.Body read to return %q, got %q (ok=%t)", bodyContent, valAfterRead, okAfterRead)
+	}
+
+	// 5. Test req.Body == nil case
+	nilReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	nilReq.Body = nil
+	nilRepl := NewTestReplacer(nilReq)
+	nilVal, nilOk := nilRepl.GetString("http.request.body")
+	if !nilOk || nilVal != "" {
+		t.Fatalf("Expected empty string for nil req.Body, got %q (ok=%t)", nilVal, nilOk)
+	}
+}
+
+func TestRequestBodyCachingAllocations(t *testing.T) {
+	bodyContent := "Testing allocation behavior during repeated body placeholder lookups."
+	req := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(bytes.NewBufferString(bodyContent)))
+	repl := NewTestReplacer(req)
+
+	// Initial call reads body, gets buffer from pool, caches in context
+	_, _ = repl.GetString("http.request.body")
+
+	// Measure allocations on subsequent calls (should re-use cached context bytes)
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = repl.GetString("http.request.body")
+		_, _ = repl.GetString("http.request.body_base64")
+	})
+
+	t.Logf("Allocs per run for cached body placeholder lookups: %f", allocs)
 }
