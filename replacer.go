@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -401,17 +402,8 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 		return runtime.GOARCH, true
 	case "time.now":
 		return nowFunc(), true
-	case "time.now.http":
-		// According to the comment for http.TimeFormat, the timezone must be in UTC
-		// to generate the correct format.
-		// https://github.com/caddyserver/caddy/issues/5773
-		return nowFunc().UTC().Format(http.TimeFormat), true
-	case "time.now.common_log":
-		return nowFunc().Format("02/Jan/2006:15:04:05 -0700"), true
-	case "time.now.year":
-		return strconv.Itoa(nowFunc().Year()), true
-	case "time.now.unix":
-		return strconv.FormatInt(nowFunc().Unix(), 10), true
+	case "time.now.http", "time.now.common_log", "time.now.year", "time.now.unix":
+		return getCachedTimeString(key)
 	case "time.now.unix_ms":
 		return strconv.FormatInt(nowFunc().UnixNano()/int64(time.Millisecond), 10), true
 	}
@@ -444,6 +436,62 @@ type ReplacementFunc func(variable string, val any) (any, error)
 // nowFunc is a variable so tests can change it
 // in order to obtain a deterministic time.
 var nowFunc = time.Now
+
+type timeCache struct {
+	unixSec   int64
+	loc       *time.Location
+	http      any
+	commonLog any
+	year      any
+	unix      any
+}
+
+var globalTimeCache atomic.Pointer[timeCache]
+
+func getCachedTimeString(key string) (any, bool) {
+	now := nowFunc()
+	unixSec := now.Unix()
+	loc := now.Location()
+
+	if c := globalTimeCache.Load(); c != nil && c.unixSec == unixSec && c.loc == loc {
+		switch key {
+		case "time.now.http":
+			return c.http, true
+		case "time.now.common_log":
+			return c.commonLog, true
+		case "time.now.year":
+			return c.year, true
+		case "time.now.unix":
+			return c.unix, true
+		}
+	}
+
+	// According to the comment for http.TimeFormat, the timezone must be in UTC
+	// to generate the correct format.
+	// https://github.com/caddyserver/caddy/issues/5773
+	newCache := &timeCache{
+		unixSec:   unixSec,
+		loc:       loc,
+		http:      any(now.UTC().Format(http.TimeFormat)),
+		commonLog: any(now.Format("02/Jan/2006:15:04:05 -0700")),
+		year:      any(strconv.Itoa(now.Year())),
+		unix:      any(strconv.FormatInt(unixSec, 10)),
+	}
+	globalTimeCache.Store(newCache)
+
+	switch key {
+	case "time.now.http":
+		return newCache.http, true
+	case "time.now.common_log":
+		return newCache.commonLog, true
+	case "time.now.year":
+		return newCache.year, true
+	case "time.now.unix":
+		return newCache.unix, true
+	}
+
+	return nil, false
+}
 
 // ReplacerCtxKey is the context key for a replacer.
 const ReplacerCtxKey CtxKey = "replacer"
