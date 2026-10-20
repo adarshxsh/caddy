@@ -147,6 +147,7 @@ type TLS struct {
 	// set of subjects with managed certificates,
 	// and hashes of manually-loaded certificates
 	// (managing's value is an optional issuer key, for distinction)
+	managingMu       sync.RWMutex
 	managing, loaded map[string]string
 }
 
@@ -493,7 +494,22 @@ func (t *TLS) Cleanup() error {
 		var noLongerManaged []certmagic.SubjectIssuer
 		var noLongerLoaded []string
 		reManage := make(map[string]struct{})
-		for subj, currentIssuerKey := range t.managing {
+
+		t.managingMu.RLock()
+		managingCopy := make(map[string]string, len(t.managing))
+		for k, v := range t.managing {
+			managingCopy[k] = v
+		}
+		t.managingMu.RUnlock()
+
+		nextTLSApp.managingMu.RLock()
+		nextManagingCopy := make(map[string]string, len(nextTLSApp.managing))
+		for k, v := range nextTLSApp.managing {
+			nextManagingCopy[k] = v
+		}
+		nextTLSApp.managingMu.RUnlock()
+
+		for subj, currentIssuerKey := range managingCopy {
 			// It's a bit nuanced: managed certs can sometimes be different enough that we have to
 			// swap them out for a different one, even if they are for the same subject/domain.
 			// We consider "private" certs (internal CA/locally-trusted/etc) to be significantly
@@ -504,14 +520,12 @@ func (t *TLS) Cleanup() error {
 			// Anyway, if the next TLS app does not manage a cert for this name at all, definitely
 			// remove it from the cache. But if it does, and it's not the same kind of issuer/CA
 			// as we have, also remove it, so that it can swap it out for the right one.
-			if nextIssuerKey, ok := nextTLSApp.managing[subj]; !ok || nextIssuerKey != currentIssuerKey {
-				// next app is not managing a cert for this domain at all or is using a different issuer, so remove it
+			if nextIssuerKey, ok := nextManagingCopy[subj]; !ok {
+				// next app is not managing a cert for this domain at all, so remove it
 				noLongerManaged = append(noLongerManaged, certmagic.SubjectIssuer{Subject: subj, IssuerKey: currentIssuerKey})
-
-				// then, if the next app is managing a cert for this name, but with a different issuer, re-manage it
-				if ok && nextIssuerKey != currentIssuerKey {
-					reManage[subj] = struct{}{}
-				}
+			} else if nextIssuerKey != currentIssuerKey {
+				// next app is managing a cert for this name, but with a different issuer, re-manage it
+				reManage[subj] = struct{}{}
 			}
 		}
 		for hash := range t.loaded {
@@ -519,12 +533,6 @@ func (t *TLS) Cleanup() error {
 				noLongerLoaded = append(noLongerLoaded, hash)
 			}
 		}
-
-		// remove the certs
-		certCacheMu.RLock()
-		certCache.RemoveManaged(noLongerManaged)
-		certCache.Remove(noLongerLoaded)
-		certCacheMu.RUnlock()
 
 		// give the new TLS app a "kick" to manage certs that it is configured for
 		// with its own configuration instead of the one we just evicted
@@ -536,17 +544,22 @@ func (t *TLS) Cleanup() error {
 				)
 			}
 		}
+
+		// remove the certs
+		certCacheMu.Lock()
+		if certCache != nil {
+			certCache.RemoveManaged(noLongerManaged)
+			certCache.Remove(noLongerLoaded)
+		}
+		certCacheMu.Unlock()
 	} else {
 		// no more TLS app running, so delete in-memory cert cache, if it was created yet
-		certCacheMu.RLock()
-		hasCache := certCache != nil
-		certCacheMu.RUnlock()
-		if hasCache {
+		certCacheMu.Lock()
+		if certCache != nil {
 			certCache.Stop()
-			certCacheMu.Lock()
 			certCache = nil
-			certCacheMu.Unlock()
 		}
+		certCacheMu.Unlock()
 	}
 
 	return nil
@@ -605,7 +618,9 @@ func (t *TLS) Manage(subjects map[string]struct{}) error {
 					issuerKey = intIss.IssuerKey()
 				}
 			}
+			t.managingMu.Lock()
 			t.managing[name] = issuerKey
+			t.managingMu.Unlock()
 		}
 	}
 
@@ -617,6 +632,8 @@ func (t *TLS) Manage(subjects map[string]struct{}) error {
 // names that it IS managing certs for, from the otherSubjsToManage which includes names
 // that WILL be managed, or from names configured in the 'automate' loader.
 func (t *TLS) managingWildcardFor(subj string, otherSubjsToManage map[string]struct{}) bool {
+	t.managingMu.RLock()
+	defer t.managingMu.RUnlock()
 	// TODO: we could also consider manually-loaded certs using t.HasCertificateForSubject(),
 	// but that does not account for how manually-loaded certs may be restricted as to which
 	// hostnames or ClientHellos they can be used with by tags, etc; I don't *think* anyone
@@ -881,13 +898,22 @@ func (t *TLS) getAutomationPolicyForName(name string) *AutomationPolicy {
 func AllMatchingCertificates(san string) []certmagic.Certificate {
 	certCacheMu.RLock()
 	defer certCacheMu.RUnlock()
+	if certCache == nil {
+		return nil
+	}
 	return certCache.AllMatchingCertificates(san)
 }
 
 func (t *TLS) HasCertificateForSubject(subject string) bool {
 	certCacheMu.RLock()
-	allMatchingCerts := certCache.AllMatchingCertificates(subject)
+	var allMatchingCerts []certmagic.Certificate
+	if certCache != nil {
+		allMatchingCerts = certCache.AllMatchingCertificates(subject)
+	}
 	certCacheMu.RUnlock()
+
+	t.managingMu.RLock()
+	defer t.managingMu.RUnlock()
 	for _, cert := range allMatchingCerts {
 		// check if the cert is manually loaded by this config
 		if _, ok := t.loaded[cert.Hash()]; ok {
