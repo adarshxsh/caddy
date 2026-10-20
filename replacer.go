@@ -349,7 +349,17 @@ type replacementProvider interface {
 
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
-type fileReplacementProvider struct{}
+type fileReplacementProvider struct {
+	cache *fileCache
+	ttl   time.Duration
+}
+
+func (f fileReplacementProvider) getCache() *fileCache {
+	if f.cache != nil {
+		return f.cache
+	}
+	return defaultFileCache
+}
 
 func (f fileReplacementProvider) replace(key string) (any, bool) {
 	if !strings.HasPrefix(key, filePrefix) {
@@ -357,20 +367,126 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 	}
 
 	filename := key[len(filePrefix):]
+	cleanPath := filepath.Clean(filename)
+
+	cache := f.getCache()
+	if val, ok := cache.get(cleanPath); ok {
+		return val, true
+	}
+
 	maxSize := 1024 * 1024
 	body, err := readFileIntoBuffer(filename, maxSize)
 	if err != nil {
-		wd, _ := os.Getwd()
 		Log().Error("placeholder: failed to read file",
 			zap.String("file", filename),
-			zap.String("working_dir", wd),
 			zap.Error(err))
 		return nil, true
 	}
 	body = bytes.TrimSuffix(body, []byte("\n"))
 	body = bytes.TrimSuffix(body, []byte("\r"))
-	return string(body), true
+	val := string(body)
+
+	cache.set(cleanPath, val)
+	return val, true
 }
+
+type fileCacheEntry struct {
+	value     string
+	createdAt time.Time
+}
+
+type fileCache struct {
+	mu         sync.RWMutex
+	items      map[string]fileCacheEntry
+	maxEntries int
+	ttl        time.Duration
+}
+
+func newFileCache(maxEntries int, ttl time.Duration) *fileCache {
+	if maxEntries <= 0 {
+		maxEntries = defaultFileCacheMaxEntries
+	}
+	if ttl <= 0 {
+		ttl = defaultFileCacheTTL
+	}
+	return &fileCache{
+		items:      make(map[string]fileCacheEntry),
+		maxEntries: maxEntries,
+		ttl:        ttl,
+	}
+}
+
+func (c *fileCache) get(key string) (string, bool) {
+	c.mu.RLock()
+	entry, ok := c.items[key]
+	c.mu.RUnlock()
+
+	if !ok {
+		return "", false
+	}
+
+	if time.Since(entry.createdAt) >= c.ttl {
+		return "", false
+	}
+
+	return entry.value, true
+}
+
+func (c *fileCache) set(key string, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.items[key]; ok {
+		c.items[key] = fileCacheEntry{
+			value:     value,
+			createdAt: time.Now(),
+		}
+		return
+	}
+
+	if len(c.items) >= c.maxEntries {
+		now := time.Now()
+		for k, item := range c.items {
+			if now.Sub(item.createdAt) >= c.ttl {
+				delete(c.items, k)
+			}
+		}
+	}
+
+	if len(c.items) >= c.maxEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, item := range c.items {
+			if first || item.createdAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = item.createdAt
+				first = false
+			}
+		}
+		if !first {
+			delete(c.items, oldestKey)
+		}
+	}
+
+	c.items[key] = fileCacheEntry{
+		value:     value,
+		createdAt: time.Now(),
+	}
+}
+
+func (c *fileCache) clear() {
+	c.mu.Lock()
+	c.items = make(map[string]fileCacheEntry)
+	c.mu.Unlock()
+}
+
+const (
+	defaultFileCacheMaxEntries = 100
+	defaultFileCacheTTL        = 2 * time.Second
+)
+
+var defaultFileCache = newFileCache(defaultFileCacheMaxEntries, defaultFileCacheTTL)
 
 // globalDefaultReplacementProvider handles replacements
 // that can be used in any context, such as system variables,
