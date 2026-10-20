@@ -15,7 +15,9 @@
 package caddy
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 	"reflect"
 	"testing"
 
@@ -190,7 +192,7 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 		},
 	}
 
-	sqs := newSharedQUICState(initialConfig)
+	sqs := newSharedQUICState(initialConfig, nil)
 
 	keys, err := sqs.getEncryptedClientHelloKeys(hello)
 	if err != nil {
@@ -209,7 +211,7 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 		},
 	}
 
-	_, cancel := sqs.addState(updatedConfig)
+	_, cancel := sqs.addState(updatedConfig, nil)
 	sqs.rmu.Lock()
 	sqs.activeTlsConf = updatedConfig
 	sqs.rmu.Unlock()
@@ -230,6 +232,142 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(keys, initialKeys) {
 		t.Fatalf("unexpected restored ECH keys: got %#v, want %#v", keys, initialKeys)
+	}
+}
+
+func TestSharedQUICState_0RTT(t *testing.T) {
+	falseVal := false
+	trueVal := true
+
+	configA := &tls.Config{ServerName: "serverA"}
+	configB := &tls.Config{ServerName: "serverB"}
+	configC := &tls.Config{ServerName: "serverC"}
+
+	// 1. Initial state with default (nil) 0-RTT setting -> Allow0RTT should be true
+	sqs := newSharedQUICState(configA, nil)
+	qconf, err := sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if !qconf.Allow0RTT {
+		t.Errorf("expected Allow0RTT = true for default configuration, got false")
+	}
+
+	// 2. Add Server B with allow0rtt = &true -> Allow0RTT should remain true
+	_, cancelB := sqs.addState(configB, &trueVal)
+	qconf, err = sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if !qconf.Allow0RTT {
+		t.Errorf("expected Allow0RTT = true when all servers allow 0-RTT, got false")
+	}
+
+	// 3. Add Server C with allow0rtt = &false -> Allow0RTT should become false
+	_, cancelC := sqs.addState(configC, &falseVal)
+	qconf, err = sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if qconf.Allow0RTT {
+		t.Errorf("expected Allow0RTT = false when Server C disallows 0-RTT, got true")
+	}
+
+	// 4. Cancel Server C -> Allow0RTT should revert back to true
+	cancelC(nil)
+	qconf, err = sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if !qconf.Allow0RTT {
+		t.Errorf("expected Allow0RTT = true after Server C is removed, got false")
+	}
+
+	// 5. Update Server A to allow0rtt = &false -> Allow0RTT should become false
+	sqs.addState(configA, &falseVal)
+	qconf, err = sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if qconf.Allow0RTT {
+		t.Errorf("expected Allow0RTT = false after updating Server A to false, got true")
+	}
+
+	// 6. Cleanup Server B
+	cancelB(nil)
+}
+
+func TestListenQUIC_0RTT(t *testing.T) {
+	falseVal := false
+	trueVal := true
+
+	na, err := ParseNetworkAddress("udp/127.0.0.1:18443")
+	if err != nil {
+		t.Fatalf("ParseNetworkAddress error: %v", err)
+	}
+
+	tlsConfig1 := &tls.Config{ServerName: "site1.example"}
+	tlsConfig2 := &tls.Config{ServerName: "site2.example"}
+
+	// Listen 1: allow0rtt = &true
+	ln1, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, tlsConfig1, nil, &trueVal)
+	if err != nil {
+		t.Fatalf("ListenQUIC 1 error: %v", err)
+	}
+	defer func() {
+		_ = ln1.Close()
+		_ = ln1.Close()
+	}()
+
+	fakeLn1, ok := ln1.(*fakeCloseQuicListener)
+	if !ok {
+		t.Fatalf("expected *fakeCloseQuicListener, got %T", ln1)
+	}
+
+	// Check initial 0-RTT policy
+	qconf, err := fakeLn1.sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if !qconf.Allow0RTT {
+		t.Errorf("expected Allow0RTT = true for ln1, got false")
+	}
+
+	// Listen 2: on same address, allow0rtt = &false
+	ln2, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, tlsConfig2, nil, &falseVal)
+	if err != nil {
+		t.Fatalf("ListenQUIC 2 error: %v", err)
+	}
+
+	fakeLn2, ok := ln2.(*fakeCloseQuicListener)
+	if !ok {
+		t.Fatalf("expected *fakeCloseQuicListener, got %T", ln2)
+	}
+
+	// Both fakeLn1 and fakeLn2 share the same underlying sqs
+	if fakeLn1.sqs != fakeLn2.sqs {
+		t.Fatalf("expected shared sqs between shared QUIC listeners")
+	}
+
+	// Dynamic policy should now be false because ln2 disables 0-RTT
+	qconf, err = fakeLn1.sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if qconf.Allow0RTT {
+		t.Errorf("expected Allow0RTT = false when ln2 is active, got true")
+	}
+
+	// Close ln2 (simulating server shutdown or reload)
+	_ = ln2.Close()
+
+	// Dynamic policy should revert to true
+	qconf, err = fakeLn1.sqs.getQuicConfigForClient(nil)
+	if err != nil {
+		t.Fatalf("getQuicConfigForClient error: %v", err)
+	}
+	if !qconf.Allow0RTT {
+		t.Errorf("expected Allow0RTT = true after closing ln2, got false")
 	}
 }
 
