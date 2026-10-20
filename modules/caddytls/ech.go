@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -69,9 +70,18 @@ type ECH struct {
 	// DNS RRs. (This also typically requires that they use DoH or DoT.)
 	Publication []*ECHPublication `json:"publication,omitempty"`
 
-	configsMu   *sync.RWMutex                 // protects both configs and the list of configs/keys the standard library uses
-	configs     map[string][]echConfig        // map of public_name to list of configs
-	stdlibReady []tls.EncryptedClientHelloKey // ECH configs+keys in a format the standard library can use
+	configsMu   *sync.RWMutex                                  // protects configs map
+	configs     map[string][]echConfig                         // map of public_name to list of configs
+	stdlibReady atomic.Pointer[[]tls.EncryptedClientHelloKey] // ECH configs+keys in a format the standard library can use
+}
+
+// GetEncryptedClientHelloKeys returns active ECH keys for standard library TLS handshakes lock-freely.
+func (ech *ECH) GetEncryptedClientHelloKeys(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+	keys := ech.stdlibReady.Load()
+	if keys == nil {
+		return nil, nil
+	}
+	return *keys, nil
 }
 
 // Provision loads or creates ECH configs and returns outer names (for certificate
@@ -106,10 +116,7 @@ func (ech *ECH) Provision(ctx caddy.Context) ([]string, error) {
 		}
 	}()
 
-	ech.configsMu.Lock()
-	defer ech.configsMu.Unlock()
-
-	outerNames, err := ech.setConfigsFromStorage(ctx, logger)
+	loadedConfigs, outerNames, err := loadConfigsFromStorage(ctx, logger)
 	if err != nil {
 		return nil, fmt.Errorf("loading configs from storage: %w", err)
 	}
@@ -118,7 +125,7 @@ func (ech *ECH) Provision(ctx caddy.Context) ([]string, error) {
 	for _, cfg := range ech.Configs {
 		publicName := strings.ToLower(strings.TrimSpace(cfg.PublicName))
 
-		if list, ok := ech.configs[publicName]; !ok || len(list) == 0 {
+		if list, ok := loadedConfigs[publicName]; !ok || len(list) == 0 {
 			// no config with this public name was loaded, so create one
 			echCfg, err := generateAndStoreECHConfig(ctx, publicName)
 			if err != nil {
@@ -127,13 +134,15 @@ func (ech *ECH) Provision(ctx caddy.Context) ([]string, error) {
 			logger.Debug("generated new ECH config",
 				zap.String("public_name", echCfg.RawPublicName),
 				zap.Uint8("id", echCfg.ConfigID))
-			ech.configs[publicName] = append(ech.configs[publicName], echCfg)
+			loadedConfigs[publicName] = append(loadedConfigs[publicName], echCfg)
 			outerNames = append(outerNames, publicName)
 		}
 	}
 
-	// convert the configs into a structure ready for the std lib to use
+	ech.configsMu.Lock()
+	ech.configs = loadedConfigs
 	ech.updateKeyList()
+	ech.configsMu.Unlock()
 
 	// ensure any old keys are rotated out
 	if err = ech.rotateECHKeys(ctx, logger, true); err != nil {
@@ -143,13 +152,10 @@ func (ech *ECH) Provision(ctx caddy.Context) ([]string, error) {
 	return outerNames, nil
 }
 
-// setConfigsFromStorage sets the ECH configs in memory to those in storage.
-// It must be called in a write lock on ech.configsMu.
-func (ech *ECH) setConfigsFromStorage(ctx caddy.Context, logger *zap.Logger) ([]string, error) {
+// loadConfigsFromStorage loads all ECH configs currently in storage.
+func loadConfigsFromStorage(ctx caddy.Context, logger *zap.Logger) (map[string][]echConfig, []string, error) {
 	storage := ctx.Storage()
-
-	ech.configs = make(map[string][]echConfig)
-
+	configs := make(map[string][]echConfig)
 	var outerNames []string
 
 	// start by loading all the existing configs (even the older ones on the way out,
@@ -157,12 +163,12 @@ func (ech *ECH) setConfigsFromStorage(ctx caddy.Context, logger *zap.Logger) ([]
 	// new configs)
 	cfgKeys, err := storage.List(ctx, echConfigsKey, false)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) { // OK if dir doesn't exist; it will be created
-		return nil, err
+		return nil, nil, err
 	}
 	for _, cfgKey := range cfgKeys {
 		cfg, err := loadECHConfig(ctx, path.Base(cfgKey))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// if any part of the config's folder was corrupted, the load function will
 		// clean it up and not return an error, since configs are immutable and
@@ -173,20 +179,33 @@ func (ech *ECH) setConfigsFromStorage(ctx caddy.Context, logger *zap.Logger) ([]
 		logger.Debug("loaded ECH config",
 			zap.String("public_name", cfg.RawPublicName),
 			zap.Uint8("id", cfg.ConfigID))
-		if _, seen := ech.configs[cfg.RawPublicName]; !seen {
+		if _, seen := configs[cfg.RawPublicName]; !seen {
 			outerNames = append(outerNames, cfg.RawPublicName)
 		}
-		ech.configs[cfg.RawPublicName] = append(ech.configs[cfg.RawPublicName], cfg)
+		configs[cfg.RawPublicName] = append(configs[cfg.RawPublicName], cfg)
 	}
+
+	return configs, outerNames, nil
+}
+
+// setConfigsFromStorage sets the ECH configs in memory to those in storage.
+func (ech *ECH) setConfigsFromStorage(ctx caddy.Context, logger *zap.Logger) ([]string, error) {
+	configs, outerNames, err := loadConfigsFromStorage(ctx, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	ech.configsMu.Lock()
+	ech.configs = configs
+	ech.updateKeyList()
+	ech.configsMu.Unlock()
 
 	return outerNames, nil
 }
 
 // rotateECHKeys updates the ECH keys/configs that are outdated if rotation is needed.
-// It should be called in a write lock on ech.configsMu. If a lock is already obtained
-// in storage, then pass true for storageSynced.
-//
-// This function sets/updates the stdlib-ready key list only if a rotation occurs.
+// Storage locking and operations run without holding memory locks. Memory pointers
+// are updated atomically after storage operations succeed.
 func (ech *ECH) rotateECHKeys(ctx caddy.Context, logger *zap.Logger, storageSynced bool) error {
 	storage := ctx.Storage()
 
@@ -215,14 +234,15 @@ func (ech *ECH) rotateECHKeys(ctx caddy.Context, logger *zap.Logger, storageSync
 	}
 
 	// update what storage has, in case another instance already updated things
-	if _, err := ech.setConfigsFromStorage(ctx, logger); err != nil {
+	loadedConfigs, _, err := loadConfigsFromStorage(ctx, logger)
+	if err != nil {
 		return fmt.Errorf("updating ECH keys from storage: %v", err)
 	}
 
 	// iterate the updated list and do any updates as needed
-	for publicName := range ech.configs {
-		for i := 0; i < len(ech.configs[publicName]); i++ {
-			cfg := ech.configs[publicName][i]
+	for publicName := range loadedConfigs {
+		for i := 0; i < len(loadedConfigs[publicName]); i++ {
+			cfg := loadedConfigs[publicName][i]
 			if time.Since(cfg.meta.Created) >= rotationInterval && cfg.meta.Replaced.IsZero() {
 				// key is due for rotation and it hasn't been replaced yet; do that now
 				logger.Debug("ECH config is due for rotation",
@@ -239,10 +259,10 @@ func (ech *ECH) rotateECHKeys(ctx caddy.Context, logger *zap.Logger, storageSync
 				}
 
 				// mark the key as replaced so we don't rotate it again, and instead delete it later
-				ech.configs[publicName][i].meta.Replaced = time.Now()
+				loadedConfigs[publicName][i].meta.Replaced = time.Now()
 
 				// persist the updated metadata
-				metaBytes, err := json.Marshal(ech.configs[publicName][i].meta)
+				metaBytes, err := json.Marshal(loadedConfigs[publicName][i].meta)
 				if err != nil {
 					return fmt.Errorf("marshaling updated ECH config metadata: %v", err)
 				}
@@ -250,7 +270,7 @@ func (ech *ECH) rotateECHKeys(ctx caddy.Context, logger *zap.Logger, storageSync
 					return fmt.Errorf("storing updated ECH config metadata: %v", err)
 				}
 
-				ech.configs[publicName] = append(ech.configs[publicName], newCfg)
+				loadedConfigs[publicName] = append(loadedConfigs[publicName], newCfg)
 
 				logger.Debug("rotated ECH key",
 					zap.String("public_name", cfg.RawPublicName),
@@ -263,7 +283,7 @@ func (ech *ECH) rotateECHKeys(ctx caddy.Context, logger *zap.Logger, storageSync
 					return fmt.Errorf("deleting expired ECH config: %v", err)
 				}
 
-				ech.configs[publicName] = append(ech.configs[publicName][:i], ech.configs[publicName][i+1:]...)
+				loadedConfigs[publicName] = append(loadedConfigs[publicName][:i], loadedConfigs[publicName][i+1:]...)
 				i--
 
 				logger.Debug("deleted expired ECH key",
@@ -274,15 +294,18 @@ func (ech *ECH) rotateECHKeys(ctx caddy.Context, logger *zap.Logger, storageSync
 		}
 	}
 
+	ech.configsMu.Lock()
+	ech.configs = loadedConfigs
 	ech.updateKeyList()
+	ech.configsMu.Unlock()
 
 	return nil
 }
 
 // rotationNeeded returns true if any ECH key needs to be replaced, or deleted.
-// It must be called inside a read or write lock of ech.configsMu (probably a
-// write lock, so that the rotation can occur correctly in the same lock).)
 func (ech *ECH) rotationNeeded(rotationInterval, deleteAfter time.Duration) bool {
+	ech.configsMu.RLock()
+	defer ech.configsMu.RUnlock()
 	for publicName := range ech.configs {
 		for i := 0; i < len(ech.configs[publicName]); i++ {
 			cfg := ech.configs[publicName][i]
@@ -296,18 +319,18 @@ func (ech *ECH) rotationNeeded(rotationInterval, deleteAfter time.Duration) bool
 }
 
 // updateKeyList updates the list of ECH keys the std lib uses to serve ECH.
-// It must be called inside a write lock on ech.configsMu.
 func (ech *ECH) updateKeyList() {
-	ech.stdlibReady = []tls.EncryptedClientHelloKey{}
+	var keys []tls.EncryptedClientHelloKey
 	for _, cfgs := range ech.configs {
 		for _, cfg := range cfgs {
-			ech.stdlibReady = append(ech.stdlibReady, tls.EncryptedClientHelloKey{
+			keys = append(keys, tls.EncryptedClientHelloKey{
 				Config:      cfg.configBin,
 				PrivateKey:  cfg.privKeyBin,
 				SendAsRetry: cfg.meta.Replaced.IsZero(), // only send during retries if key has not been rotated out
 			})
 		}
 	}
+	ech.stdlibReady.Store(&keys)
 }
 
 // publishECHConfigs publishes any configs that are configured for publication and which haven't been published already.
