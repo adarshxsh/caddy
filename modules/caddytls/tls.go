@@ -664,8 +664,15 @@ func (t *TLS) managingWildcardFor(subj string, otherSubjsToManage map[string]str
 //
 // EXPERIMENTAL: This function and its semantics/behavior are subject to change.
 func (t *TLS) RegisterServerNames(dnsNames, alpnValues []string) {
+	if t == nil || t.serverNamesMu == nil {
+		return
+	}
 	t.serverNamesMu.Lock()
 	defer t.serverNamesMu.Unlock()
+
+	if t.serverNames == nil {
+		t.serverNames = make(map[string]serverNameRegistration)
+	}
 
 	for _, name := range dnsNames {
 		host, _, err := net.SplitHostPort(name)
@@ -698,6 +705,9 @@ func (t *TLS) RegisterServerNames(dnsNames, alpnValues []string) {
 }
 
 func (t *TLS) alpnValuesForServerNames(dnsNames []string) map[string][]string {
+	if t == nil || t.serverNamesMu == nil {
+		return nil
+	}
 	t.serverNamesMu.Lock()
 	defer t.serverNamesMu.Unlock()
 
@@ -720,6 +730,20 @@ func (t *TLS) alpnValuesForServerNames(dnsNames []string) map[string][]string {
 	}
 
 	return result
+}
+
+func (t *TLS) serverNamesKeys() []string {
+	if t == nil || t.serverNamesMu == nil {
+		return nil
+	}
+	t.serverNamesMu.Lock()
+	defer t.serverNamesMu.Unlock()
+
+	keys := make([]string, 0, len(t.serverNames))
+	for name := range t.serverNames {
+		keys = append(keys, name)
+	}
+	return keys
 }
 
 // OrderedHTTPSRRALPN returns the HTTPS RR ALPN values in preferred order.

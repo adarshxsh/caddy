@@ -2,6 +2,7 @@ package caddytls
 
 import (
 	"encoding/base64"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -62,4 +63,58 @@ func TestECHDNSPublisherPublishedSvcParams(t *testing.T) {
 	if !reflect.DeepEqual(got["ech"], []string{wantECH}) {
 		t.Fatalf("unexpected ECH params: got %v want %v", got["ech"], wantECH)
 	}
+}
+
+func TestConcurrentServerNamesRegistrationAndReading(t *testing.T) {
+	tlsApp := &TLS{
+		serverNames:   make(map[string]serverNameRegistration),
+		serverNamesMu: new(sync.Mutex),
+	}
+
+	var wg sync.WaitGroup
+	const numGoroutines = 10
+	const iterations = 100
+
+	// Writer goroutines
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				domain := fmt.Sprintf("sub%d-%d.example.com:443", id, j)
+				tlsApp.RegisterServerNames([]string{domain}, []string{"h2", "h3"})
+			}
+		}(i)
+	}
+
+	// Reader goroutines (serverNamesKeys)
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				_ = tlsApp.serverNamesKeys()
+			}
+		}()
+	}
+
+	// Reader goroutines (alpnValuesForServerNames)
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				domain := fmt.Sprintf("sub%d-%d.example.com", id, j)
+				_ = tlsApp.alpnValuesForServerNames([]string{domain})
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify uninitialized TLS struct does not panic
+	var uninitializedTLS TLS
+	uninitializedTLS.RegisterServerNames([]string{"test.com"}, []string{"h2"})
+	_ = uninitializedTLS.alpnValuesForServerNames([]string{"test.com"})
+	_ = uninitializedTLS.serverNamesKeys()
 }
