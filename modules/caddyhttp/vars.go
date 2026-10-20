@@ -30,6 +30,9 @@ import (
 
 var stringSliceType = reflect.TypeFor[[]string]()
 
+// RequestBodyVarKey is the variable name key used to store the evaluated request body bytes in context.
+const RequestBodyVarKey = "request_body"
+
 func init() {
 	caddy.RegisterModule(VarsMiddleware{})
 	caddy.RegisterModule(VarsMatcher{})
