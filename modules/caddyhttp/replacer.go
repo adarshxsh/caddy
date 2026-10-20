@@ -114,13 +114,13 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				}
 				return req.Proto, true
 			case "http.request.host":
-				host, _, err := net.SplitHostPort(req.Host)
+				host, _, err := splitHostPort(req.Host)
 				if err != nil {
 					return req.Host, true // OK; there probably was no port
 				}
 				return host, true
 			case "http.request.port":
-				_, port, _ := net.SplitHostPort(req.Host)
+				_, port, _ := splitHostPort(req.Host)
 				if portNum, err := strconv.Atoi(port); err == nil {
 					return portNum, true
 				}
@@ -132,7 +132,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return localAddr.String(), true
 			case "http.request.local.host":
 				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-				host, _, err := net.SplitHostPort(localAddr.String())
+				host, _, err := splitHostPort(localAddr.String())
 				if err != nil {
 					// localAddr is host:port for tcp and udp sockets and /unix/socket.path
 					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
@@ -144,7 +144,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return host, true
 			case "http.request.local.port":
 				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-				_, port, _ := net.SplitHostPort(localAddr.String())
+				_, port, _ := splitHostPort(localAddr.String())
 				if portNum, err := strconv.Atoi(port); err == nil {
 					return portNum, true
 				}
@@ -160,7 +160,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 					// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
 					return nil, true
 				}
-				host, _, err := net.SplitHostPort(req.RemoteAddr)
+				host, _, err := splitHostPort(req.RemoteAddr)
 				if err != nil {
 					// req.RemoteAddr is host:port for tcp and udp sockets and /unix/socket.path
 					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
@@ -171,7 +171,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				}
 				return host, true
 			case "http.request.remote.port":
-				_, port, _ := net.SplitHostPort(req.RemoteAddr)
+				_, port, _ := splitHostPort(req.RemoteAddr)
 				if portNum, err := strconv.Atoi(port); err == nil {
 					return portNum, true
 				}
@@ -204,7 +204,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if req.URL.RawQuery == "" {
 					return "", true
 				}
-				return "?" + req.URL.RawQuery, true
+				res := "?" + req.URL.RawQuery
+				repl.Set(key, res)
+				return res, true
 			case "http.request.duration":
 				start := GetVar(req.Context(), "start_time").(time.Time)
 				return time.Since(start), true
@@ -278,23 +280,32 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if or.URL.RawQuery == "" {
 					return "", true
 				}
-				return "?" + or.URL.RawQuery, true
+				res := "?" + or.URL.RawQuery
+				repl.Set(key, res)
+				return res, true
 			}
 
 			// remote IP range/prefix (e.g. keep top 24 bits of 1.2.3.4  => "1.2.3.0/24")
 			// syntax: "/V4,V6" where V4 = IPv4 bits, and V6 = IPv6 bits; if no comma, then same bit length used for both
 			// (EXPERIMENTAL)
 			if strings.HasPrefix(key, "http.request.remote.host/") {
-				host, _, err := net.SplitHostPort(req.RemoteAddr)
-				if err != nil {
-					host = req.RemoteAddr // assume no port, I guess?
-				}
-				addr, err := netip.ParseAddr(host)
-				if err != nil {
-					return host, true // not an IP address
+				var addr netip.Addr
+				if ap, err := netip.ParseAddrPort(req.RemoteAddr); err == nil {
+					addr = ap.Addr()
+				} else {
+					host, _, err := splitHostPort(req.RemoteAddr)
+					if err != nil {
+						host = req.RemoteAddr // assume no port, I guess?
+					}
+					var parseErr error
+					addr, parseErr = netip.ParseAddr(host)
+					if parseErr != nil {
+						repl.Set(key, host)
+						return host, true // not an IP address
+					}
 				}
 				// extract the bits from the end of the placeholder (start after "/") then split on ","
-				bitsBoth := key[strings.Index(key, "/")+1:]
+				bitsBoth := key[len("http.request.remote.host/"):]
 				ipv4BitsStr, ipv6BitsStr, cutOK := strings.Cut(bitsBoth, ",")
 				bitsStr := ipv4BitsStr
 				if addr.Is6() && cutOK {
@@ -303,13 +314,17 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				// convert to integer then compute prefix
 				bits, err := strconv.Atoi(bitsStr)
 				if err != nil {
+					repl.Set(key, "")
 					return "", true
 				}
 				prefix, err := addr.Prefix(bits)
 				if err != nil {
+					repl.Set(key, "")
 					return "", true
 				}
-				return prefix.String(), true
+				res := prefix.String()
+				repl.Set(key, res)
+				return res, true
 			}
 
 			// hostname labels (case insensitive, so normalize to lowercase)
@@ -319,7 +334,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil || idx < 0 {
 					return "", false
 				}
-				reqHost, _, err := net.SplitHostPort(req.Host)
+				reqHost, _, err := splitHostPort(req.Host)
 				if err != nil {
 					reqHost = req.Host // OK; assume there was no port
 				}
@@ -597,3 +612,32 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+// splitHostPort splits a network address of the form "host:port",
+// "host%zone:port", "[host]:port" or "[host%zone]:port" into host or
+// port without allocating string memory.
+func splitHostPort(hostport string) (host, port string, err error) {
+	if strings.HasPrefix(hostport, "[") {
+		// IPv6 bracketed host
+		closingIndex := strings.LastIndexByte(hostport, ']')
+		if closingIndex < 1 || closingIndex >= len(hostport)-1 || hostport[closingIndex+1] != ':' {
+			return "", "", errMissingPort
+		}
+		return hostport[1:closingIndex], hostport[closingIndex+2:], nil
+	}
+
+	i := strings.LastIndexByte(hostport, ':')
+	if i < 0 {
+		return "", "", errMissingPort
+	}
+	if strings.IndexByte(hostport[:i], ':') >= 0 {
+		return "", "", errTooManyColons
+	}
+	return hostport[:i], hostport[i+1:], nil
+}
+
+var (
+	errMissingPort   = &net.AddrError{Err: "missing port in address"}
+	errTooManyColons = &net.AddrError{Err: "too many colons in address"}
+)
+

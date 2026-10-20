@@ -296,3 +296,114 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitHostPort(t *testing.T) {
+	for _, tc := range []struct {
+		input      string
+		expectHost string
+		expectPort string
+		expectErr  bool
+	}{
+		{input: "1.2.3.4:80", expectHost: "1.2.3.4", expectPort: "80"},
+		{input: "[2001:db8::1]:8080", expectHost: "2001:db8::1", expectPort: "8080"},
+		{input: "example.com:443", expectHost: "example.com", expectPort: "443"},
+		{input: "1.2.3.4", expectErr: true},
+		{input: "/unix/socket.path", expectErr: true},
+		{input: "[2001:db8::1]", expectErr: true},
+		{input: "[2001:db8::1]:", expectHost: "2001:db8::1", expectPort: ""},
+		{input: "2001:db8::1", expectErr: true},
+		{input: "", expectErr: true},
+	} {
+		host, port, err := splitHostPort(tc.input)
+		if tc.expectErr {
+			if err == nil {
+				t.Errorf("splitHostPort(%q): expected error, got host=%q, port=%q", tc.input, host, port)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("splitHostPort(%q): unexpected error %v", tc.input, err)
+			}
+			if host != tc.expectHost || port != tc.expectPort {
+				t.Errorf("splitHostPort(%q): expected host=%q port=%q, got host=%q port=%q", tc.input, tc.expectHost, tc.expectPort, host, port)
+			}
+		}
+	}
+}
+
+func TestReplacerMemoization(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/path?foo=bar", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, OriginalRequestCtxKey, *req)
+	req = req.WithContext(ctx)
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// First lookup
+	v1, ok1 := repl.GetString("http.request.uri.prefixed_query")
+	if !ok1 || v1 != "?foo=bar" {
+		t.Fatalf("expected ?foo=bar, got %q (ok=%t)", v1, ok1)
+	}
+
+	// Verify static map now contains memoized value
+	if val, ok := repl.Get("http.request.uri.prefixed_query"); !ok || val != "?foo=bar" {
+		t.Fatalf("expected memoized value in static map, got %v (ok=%t)", val, ok)
+	}
+
+	// First lookup for orig_uri.prefixed_query
+	v2, ok2 := repl.GetString("http.request.orig_uri.prefixed_query")
+	if !ok2 || v2 != "?foo=bar" {
+		t.Fatalf("expected ?foo=bar, got %q (ok=%t)", v2, ok2)
+	}
+
+	// First lookup for remote.host/24
+	v3, ok3 := repl.GetString("http.request.remote.host/24")
+	if !ok3 || v3 != "10.0.0.0/24" {
+		t.Fatalf("expected 10.0.0.0/24, got %q (ok=%t)", v3, ok3)
+	}
+
+	// Second lookup should return memoized results from static map
+	v1Secondary, _ := repl.GetString("http.request.uri.prefixed_query")
+	v2Secondary, _ := repl.GetString("http.request.orig_uri.prefixed_query")
+	v3Secondary, _ := repl.GetString("http.request.remote.host/24")
+
+	if v1Secondary != "?foo=bar" || v2Secondary != "?foo=bar" || v3Secondary != "10.0.0.0/24" {
+		t.Fatalf("secondary lookups failed: v1=%q v2=%q v3=%q", v1Secondary, v2Secondary, v3Secondary)
+	}
+}
+
+func BenchmarkReplacerLookups(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/path?foo=bar", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, OriginalRequestCtxKey, *req)
+	req = req.WithContext(ctx)
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Warm up first lookups (so they get memoized)
+	_, _ = repl.GetString("http.request.uri.prefixed_query")
+	_, _ = repl.GetString("http.request.orig_uri.prefixed_query")
+	_, _ = repl.GetString("http.request.remote.host/24")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.uri.prefixed_query")
+		_, _ = repl.GetString("http.request.orig_uri.prefixed_query")
+		_, _ = repl.GetString("http.request.remote.host/24")
+	}
+}
+
+func BenchmarkSplitHostPort(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _, _ = splitHostPort("192.168.1.1:8080")
+		_, _, _ = splitHostPort("[2001:db8::1]:8080")
+		_, _, _ = splitHostPort("example.com:443")
+	}
+}
+
