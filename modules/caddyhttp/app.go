@@ -419,6 +419,15 @@ func (app *App) Validate() error {
 				}
 			}
 		}
+
+		// validate early data policy if specified
+		if srv.EarlyData != nil && srv.EarlyData.Policy != "" {
+			switch srv.EarlyData.Policy {
+			case EarlyDataPolicyRejectUnsafe, EarlyDataPolicyAllowAll, EarlyDataPolicyDisable0RTT:
+			default:
+				return fmt.Errorf("server %s: invalid early_data policy '%s'", srvName, srv.EarlyData.Policy)
+			}
+		}
 	}
 	return nil
 }
