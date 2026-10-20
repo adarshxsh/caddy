@@ -24,6 +24,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/caddyserver/caddy/v2"
 )
 
@@ -294,5 +296,48 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestLazyUUIDGeneration(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	repl := caddy.NewReplacer()
+	req = PrepareRequest(req, repl, nil, nil)
+
+	// Verify requestID was not allocated initially
+	if idVal := GetVar(req.Context(), "uuid"); idVal != nil {
+		t.Fatalf("expected uuid to be nil in context initially, got: %v", idVal)
+	}
+
+	// Evaluate placeholder
+	uuid1, ok1 := repl.GetString("http.request.uuid")
+	if !ok1 || uuid1 == "" {
+		t.Fatalf("expected http.request.uuid placeholder to return valid value, got ok=%t val=%q", ok1, uuid1)
+	}
+
+	if _, err := uuid.Parse(uuid1); err != nil {
+		t.Fatalf("expected valid UUID string, got: %s (err: %v)", uuid1, err)
+	}
+
+	// Verify requestID is now set in context
+	idVal := GetVar(req.Context(), "uuid")
+	if idVal == nil {
+		t.Fatalf("expected uuid to be cached in context after evaluation")
+	}
+
+	// Evaluate placeholder again and verify same value is returned
+	uuid2, ok2 := repl.GetString("http.request.uuid")
+	if !ok2 || uuid2 != uuid1 {
+		t.Fatalf("expected second evaluation to return cached UUID %q, got %q (ok=%t)", uuid1, uuid2, ok2)
+	}
+}
+
+func BenchmarkAddHTTPVarsToReplacer(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/foo", nil)
+	repl := caddy.NewReplacer()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		addHTTPVarsToReplacer(repl, req, nil)
 	}
 }
