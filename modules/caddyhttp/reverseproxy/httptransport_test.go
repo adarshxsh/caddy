@@ -2,6 +2,7 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -278,4 +279,63 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPTransport_DialCallbacks_WithoutReplacerInContext(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// 1. DialTLSContext with placeholder ServerName and bare context (no replacer)
+	t.Run("DialTLSContext without replacer", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen failed: %v", err)
+		}
+		defer ln.Close()
+
+		ht := &HTTPTransport{
+			TLS: &TLSConfig{
+				ServerName: "{http.request.host}",
+			},
+		}
+
+		rt, err := ht.NewTransport(caddyCtx)
+		if err != nil {
+			t.Fatalf("NewTransport failed: %v", err)
+		}
+
+		if rt.DialTLSContext == nil {
+			t.Fatalf("expected DialTLSContext to be set")
+		}
+
+		// Execute DialTLSContext with context.Background() (no replacer attached)
+		// Should not panic on interface conversion
+		conn, err := rt.DialTLSContext(context.Background(), "tcp", ln.Addr().String())
+		if conn != nil {
+			conn.Close()
+		}
+	})
+
+	// 2. HTTP/3 Dial with placeholder ServerName and bare context (no replacer)
+	t.Run("HTTP/3 Dial without replacer", func(t *testing.T) {
+		ht := &HTTPTransport{
+			Versions: []string{"3"},
+			TLS: &TLSConfig{
+				ServerName: "{http.request.host}",
+			},
+		}
+
+		_, err := ht.NewTransport(caddyCtx)
+		if err != nil {
+			t.Fatalf("NewTransport failed: %v", err)
+		}
+
+		if ht.h3Transport == nil || ht.h3Transport.Dial == nil {
+			t.Fatalf("expected h3Transport.Dial callback to be set")
+		}
+
+		// Execute h3Transport.Dial with context.Background() (no replacer attached)
+		// Should not panic on interface conversion
+		_, _ = ht.h3Transport.Dial(context.Background(), "127.0.0.1:12345", &tls.Config{ServerName: "{http.request.host}"}, nil)
+	})
 }

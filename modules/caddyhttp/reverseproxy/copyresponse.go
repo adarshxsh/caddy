@@ -56,7 +56,7 @@ func (h *CopyResponseHandler) Provision(ctx caddy.Context) error {
 
 // ServeHTTP implements the Handler interface.
 func (h CopyResponseHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request, _ caddyhttp.Handler) error {
-	repl := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl := caddy.ReplacerFromContext(req.Context())
 	hrc, ok := req.Context().Value(proxyHandleResponseContextCtxKey).(*handleResponseContext)
 
 	// don't allow this to be used outside of handle_response routes

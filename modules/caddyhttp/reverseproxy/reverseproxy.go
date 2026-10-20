@@ -483,7 +483,7 @@ func (b *bodyNopCloserIfNotRead) Close() error {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl := caddy.ReplacerFromContext(r.Context())
 
 	// prepare the request for proxying; this is needed only once
 	clonedReq, err := h.prepareRequest(r, repl)
@@ -1361,11 +1361,9 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 
 			// set transport error flag so CEL expressions can use
 			// {rp.is_transport_error} to decide whether to retry
-			repl, _ := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-			if repl != nil {
-				repl.Set("http.reverse_proxy.is_transport_error", true)
-				defer repl.Delete("http.reverse_proxy.is_transport_error")
-			}
+			repl := caddy.ReplacerFromContext(req.Context())
+			repl.Set("http.reverse_proxy.is_transport_error", true)
+			defer repl.Delete("http.reverse_proxy.is_transport_error")
 
 			match, err := lb.RetryMatch.AnyMatchWithError(req)
 			if err != nil {

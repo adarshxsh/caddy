@@ -229,7 +229,7 @@ func (su SRVUpstreams) String() string {
 // service, the service; proto, the protocol; and name, the name.
 // If su.Service and su.Proto are empty, name will be returned as addr instead.
 func (su SRVUpstreams) expandedAddr(r *http.Request) (addr, service, proto, name string) {
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl := caddy.ReplacerFromContext(r.Context())
 	name = repl.ReplaceAll(su.Name, "")
 	if su.Service == "" && su.Proto == "" {
 		addr = name
@@ -355,7 +355,7 @@ func (au *AUpstreams) Provision(ctx caddy.Context) error {
 }
 
 func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl := caddy.ReplacerFromContext(r.Context())
 
 	// Map ipVersion early, so we can use it as part of the cache-key.
 	// This should be fairly inexpensive and comes and the upside of

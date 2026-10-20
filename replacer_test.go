@@ -15,6 +15,7 @@
 package caddy
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -528,5 +529,42 @@ func testReplacer() Replacer {
 		providers: make([]replacementProvider, 0),
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
+	}
+}
+
+func TestReplacerFromContext(t *testing.T) {
+	// 1. nil context returns default replacer
+	if repl := ReplacerFromContext(nil); repl == nil {
+		t.Errorf("ReplacerFromContext(nil) returned nil")
+	}
+
+	// 2. context without replacer returns default replacer
+	bgCtx := context.Background()
+	if repl := ReplacerFromContext(bgCtx); repl == nil {
+		t.Errorf("ReplacerFromContext(bgCtx) returned nil")
+	}
+
+	// 3. context with non-replacer value returns default replacer
+	invalidCtx := context.WithValue(bgCtx, ReplacerCtxKey, "not a replacer")
+	if repl := ReplacerFromContext(invalidCtx); repl == nil {
+		t.Errorf("ReplacerFromContext(invalidCtx) returned nil")
+	}
+
+	// 4. context with typed nil *Replacer returns default replacer
+	nilReplCtx := context.WithValue(bgCtx, ReplacerCtxKey, (*Replacer)(nil))
+	if repl := ReplacerFromContext(nilReplCtx); repl == nil {
+		t.Errorf("ReplacerFromContext(nilReplCtx) returned nil")
+	}
+
+	// 5. context with valid *Replacer returns that replacer
+	existingRepl := NewReplacer()
+	existingRepl.Set("foo", "bar")
+	validCtx := context.WithValue(bgCtx, ReplacerCtxKey, existingRepl)
+	gotRepl := ReplacerFromContext(validCtx)
+	if gotRepl != existingRepl {
+		t.Errorf("ReplacerFromContext(validCtx) = %v, want %v", gotRepl, existingRepl)
+	}
+	if val, _ := gotRepl.Get("foo"); val != "bar" {
+		t.Errorf("gotRepl.Get(\"foo\") = %v, want \"bar\"", val)
 	}
 }
