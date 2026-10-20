@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -360,4 +362,76 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetEncryptedClientHelloKeysConcurrentRotation(t *testing.T) {
+	ech := &ECH{
+		configsMu: new(sync.RWMutex),
+		configs: map[string][]echConfig{
+			"example.com": {
+				{
+					configBin:  []byte("config1"),
+					privKeyBin: []byte("key1"),
+				},
+			},
+		},
+	}
+	ech.updateKeyList()
+
+	tlsApp := &TLS{
+		EncryptedClientHello: ech,
+	}
+
+	getEncryptedClientHelloKeys := func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+		tlsApp.EncryptedClientHello.configsMu.RLock()
+		defer tlsApp.EncryptedClientHello.configsMu.RUnlock()
+		return slices.Clone(tlsApp.EncryptedClientHello.stdlibReady), nil
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	// Writer goroutines rotating keys
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 100; j++ {
+				ech.configsMu.Lock()
+				ech.configs["example.com"] = []echConfig{
+					{
+						configBin:  []byte(fmt.Sprintf("config-%d-%d", id, j)),
+						privKeyBin: []byte(fmt.Sprintf("key-%d-%d", id, j)),
+					},
+				}
+				ech.updateKeyList()
+				ech.configsMu.Unlock()
+			}
+		}(i)
+	}
+
+	// Reader goroutines fetching keys and reading elements (simulating crypto/tls handshake)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 100; j++ {
+				keys, err := getEncryptedClientHelloKeys(nil)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				for _, key := range keys {
+					_ = len(key.Config)
+					_ = len(key.PrivateKey)
+					_ = key.SendAsRetry
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
 }
