@@ -356,16 +356,16 @@ func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
 		if publication.Configs == nil {
 			// by default, publish all configs
 			for _, configs := range t.EncryptedClientHello.configs {
-				echCfgList = append(echCfgList, configs...)
 				for _, c := range configs {
+					echCfgList = append(echCfgList, c.Clone())
 					configIDs = append(configIDs, c.ConfigID)
 				}
 			}
 		} else {
 			for _, cfgOuterName := range publication.Configs {
 				if cfgList, ok := t.EncryptedClientHello.configs[cfgOuterName]; ok {
-					echCfgList = append(echCfgList, cfgList...)
 					for _, c := range cfgList {
+						echCfgList = append(echCfgList, c.Clone())
 						configIDs = append(configIDs, c.ConfigID)
 					}
 				}
@@ -488,23 +488,48 @@ func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
 					zap.Strings("domains", successNames),
 					zap.Uint8s("config_ids", configIDs))
 
-				for _, cfg := range echCfgList {
-					if cfg.meta.Publications == nil {
-						cfg.meta.Publications = make(publicationHistory)
+				updateErr := func() error {
+					t.EncryptedClientHello.configsMu.Lock()
+					defer t.EncryptedClientHello.configsMu.Unlock()
+
+					for _, cfg := range echCfgList {
+						var liveCfg *echConfig
+						for publicName, cfgs := range t.EncryptedClientHello.configs {
+							for i := range cfgs {
+								if cfgs[i].ConfigID == cfg.ConfigID {
+									liveCfg = &t.EncryptedClientHello.configs[publicName][i]
+									break
+								}
+							}
+							if liveCfg != nil {
+								break
+							}
+						}
+						if liveCfg == nil {
+							continue
+						}
+
+						if liveCfg.meta.Publications == nil {
+							liveCfg.meta.Publications = make(publicationHistory)
+						}
+						if _, ok := liveCfg.meta.Publications[publisherKey]; !ok {
+							liveCfg.meta.Publications[publisherKey] = make(map[string]time.Time)
+						}
+						for _, name := range successNames {
+							liveCfg.meta.Publications[publisherKey][name] = pubTime
+						}
+						metaBytes, err := json.Marshal(liveCfg.meta)
+						if err != nil {
+							return fmt.Errorf("marshaling ECH config metadata: %v", err)
+						}
+						if err := t.ctx.Storage().Store(t.ctx, echMetaKey(liveCfg.ConfigID), metaBytes); err != nil {
+							return fmt.Errorf("storing updated ECH config metadata: %v", err)
+						}
 					}
-					if _, ok := cfg.meta.Publications[publisherKey]; !ok {
-						cfg.meta.Publications[publisherKey] = make(map[string]time.Time)
-					}
-					for _, name := range successNames {
-						cfg.meta.Publications[publisherKey][name] = pubTime
-					}
-					metaBytes, err := json.Marshal(cfg.meta)
-					if err != nil {
-						return fmt.Errorf("marshaling ECH config metadata: %v", err)
-					}
-					if err := t.ctx.Storage().Store(t.ctx, echMetaKey(cfg.ConfigID), metaBytes); err != nil {
-						return fmt.Errorf("storing updated ECH config metadata: %v", err)
-					}
+					return nil
+				}()
+				if updateErr != nil {
+					return updateErr
 				}
 			} else {
 				logger.Error("all domains failed to publish ECH configuration list (see earlier errors)",
@@ -953,6 +978,12 @@ type echConfig struct {
 	meta       echConfigMeta
 }
 
+func (c echConfig) Clone() echConfig {
+	c2 := c
+	c2.meta.Publications = c.meta.Publications.Clone()
+	return c2
+}
+
 func (echCfg echConfig) MarshalBinary() ([]byte, error) {
 	var b cryptobyte.Builder
 	if err := echCfg.marshalBinary(&b); err != nil {
@@ -1194,6 +1225,25 @@ func echMetaKey(configID uint8) string {
 // publicationHistory is a map of publisher key to
 // map of inner name to timestamp
 type publicationHistory map[string]map[string]time.Time
+
+func (p publicationHistory) Clone() publicationHistory {
+	if p == nil {
+		return nil
+	}
+	p2 := make(publicationHistory, len(p))
+	for k, v := range p {
+		if v == nil {
+			p2[k] = nil
+			continue
+		}
+		inner := make(map[string]time.Time, len(v))
+		for k2, v2 := range v {
+			inner[k2] = v2
+		}
+		p2[k] = inner
+	}
+	return p2
+}
 
 // echStorageLockName is the name of the storage lock to sync ECH updates.
 const echStorageLockName = "ech_rotation"
