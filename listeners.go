@@ -15,6 +15,7 @@
 package caddy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -521,16 +522,16 @@ type contextAndCancelFunc struct {
 // sharedQUICState manages GetConfigForClient
 // see issue: https://github.com/caddyserver/caddy/pull/4849
 type sharedQUICState struct {
-	rmu           sync.RWMutex
-	tlsConfs      map[*tls.Config]contextAndCancelFunc
-	activeTlsConf *tls.Config
+	rmu      sync.RWMutex
+	tlsConfs map[*tls.Config]contextAndCancelFunc
+	configs  []*tls.Config
 }
 
 // newSharedQUICState creates a new sharedQUICState
 func newSharedQUICState(tlsConfig *tls.Config) *sharedQUICState {
 	sqtc := &sharedQUICState{
-		tlsConfs:      make(map[*tls.Config]contextAndCancelFunc),
-		activeTlsConf: tlsConfig,
+		tlsConfs: make(map[*tls.Config]contextAndCancelFunc),
+		configs:  make([]*tls.Config, 0, 2),
 	}
 	sqtc.addState(tlsConfig)
 	return sqtc
@@ -539,22 +540,72 @@ func newSharedQUICState(tlsConfig *tls.Config) *sharedQUICState {
 // getConfigForClient is used as tls.Config's GetConfigForClient field
 func (sqs *sharedQUICState) getConfigForClient(ch *tls.ClientHelloInfo) (*tls.Config, error) {
 	sqs.rmu.RLock()
-	defer sqs.rmu.RUnlock()
-	return sqs.activeTlsConf.GetConfigForClient(ch)
+	configs := make([]*tls.Config, len(sqs.configs))
+	copy(configs, sqs.configs)
+	sqs.rmu.RUnlock()
+
+	var lastErr error
+	for _, cfg := range configs {
+		if cfg == nil {
+			continue
+		}
+		if cfg.GetConfigForClient == nil {
+			return cfg, nil
+		}
+		res, err := cfg.GetConfigForClient(ch)
+		if err == nil && res != nil {
+			return res, nil
+		}
+		if err != nil {
+			if strings.Contains(err.Error(), "dropping connection") {
+				return nil, err
+			}
+			lastErr = err
+		}
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no server TLS configuration available for ClientHello: %+v", ch)
 }
 
 // getEncryptedClientHelloKeys is used as tls.Config's GetEncryptedClientHelloKeys field.
 func (sqs *sharedQUICState) getEncryptedClientHelloKeys(ch *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
 	sqs.rmu.RLock()
-	defer sqs.rmu.RUnlock()
-	if sqs.activeTlsConf.GetEncryptedClientHelloKeys == nil {
-		return nil, nil
+	configs := make([]*tls.Config, len(sqs.configs))
+	copy(configs, sqs.configs)
+	sqs.rmu.RUnlock()
+
+	var allKeys []tls.EncryptedClientHelloKey
+	for _, cfg := range configs {
+		if cfg == nil || cfg.GetEncryptedClientHelloKeys == nil {
+			continue
+		}
+		keys, err := cfg.GetEncryptedClientHelloKeys(ch)
+		if err != nil {
+			return nil, err
+		}
+		for _, k := range keys {
+			if !containsECHKey(allKeys, k) {
+				allKeys = append(allKeys, k)
+			}
+		}
 	}
-	return sqs.activeTlsConf.GetEncryptedClientHelloKeys(ch)
+	return allKeys, nil
+}
+
+func containsECHKey(keys []tls.EncryptedClientHelloKey, k tls.EncryptedClientHelloKey) bool {
+	for _, existing := range keys {
+		if bytes.Equal(existing.Config, k.Config) && bytes.Equal(existing.PrivateKey, k.PrivateKey) {
+			return true
+		}
+	}
+	return false
 }
 
 // addState adds tls.Config and activeRequests to the map if not present and returns the corresponding context and its cancelFunc
-// so that when cancelled, the active tls.Config will change
+// so that when cancelled, the tls.Config will be unregistered from the dispatch registry
 func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, context.CancelCauseFunc) {
 	sqs.rmu.Lock()
 	defer sqs.rmu.Unlock()
@@ -571,16 +622,16 @@ func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, co
 		defer sqs.rmu.Unlock()
 
 		delete(sqs.tlsConfs, tlsConfig)
-		if sqs.activeTlsConf == tlsConfig {
-			// select another tls.Config, if there is none,
-			// related sharedQuicListener will be destroyed anyway
-			for tc := range sqs.tlsConfs {
-				sqs.activeTlsConf = tc
+		for i, cfg := range sqs.configs {
+			if cfg == tlsConfig {
+				sqs.configs = append(sqs.configs[:i], sqs.configs[i+1:]...)
 				break
 			}
 		}
 	}
 	sqs.tlsConfs[tlsConfig] = contextAndCancelFunc{ctx, wrappedCancel}
+	sqs.configs = append(sqs.configs, tlsConfig)
+
 	// there should be at most 2 tls.Configs
 	if len(sqs.tlsConfs) > 2 {
 		Log().Warn("quic listener tls configs are more than 2", zap.Int("number of configs", len(sqs.tlsConfs)))
