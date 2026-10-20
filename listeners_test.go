@@ -16,7 +16,9 @@ package caddy
 
 import (
 	"crypto/tls"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/internal"
@@ -210,16 +212,14 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 
 	_, cancel := sqs.addState(updatedConfig)
-	sqs.rmu.Lock()
-	sqs.activeTlsConf = updatedConfig
-	sqs.rmu.Unlock()
 
 	keys, err = sqs.getEncryptedClientHelloKeys(hello)
 	if err != nil {
 		t.Fatalf("getting updated ECH keys: %v", err)
 	}
-	if !reflect.DeepEqual(keys, updatedKeys) {
-		t.Fatalf("unexpected updated ECH keys: got %#v, want %#v", keys, updatedKeys)
+	expectedKeys := append(append([]tls.EncryptedClientHelloKey{}, initialKeys...), updatedKeys...)
+	if !reflect.DeepEqual(keys, expectedKeys) {
+		t.Fatalf("unexpected combined ECH keys: got %#v, want %#v", keys, expectedKeys)
 	}
 
 	cancel(nil)
@@ -230,6 +230,123 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(keys, initialKeys) {
 		t.Fatalf("unexpected restored ECH keys: got %#v, want %#v", keys, initialKeys)
+	}
+}
+
+func TestSharedQUICStateGetConfigForClient_MultiConfig(t *testing.T) {
+	targetConfig1 := &tls.Config{ServerName: "example.com"}
+	targetConfig2 := &tls.Config{ServerName: "api.example.net"}
+
+	cfg1 := &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			if hello.ServerName == "example.com" {
+				return targetConfig1, nil
+			}
+			return nil, fmt.Errorf("no server TLS configuration available for ClientHello: %+v", hello)
+		},
+	}
+
+	cfg2 := &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			if hello.ServerName == "api.example.net" {
+				return targetConfig2, nil
+			}
+			if hello.ServerName == "drop.com" {
+				return nil, fmt.Errorf("dropping connection")
+			}
+			return nil, fmt.Errorf("no server TLS configuration available for ClientHello: %+v", hello)
+		},
+	}
+
+	sqs := newSharedQUICState(cfg1)
+	ctx2, cancel2 := sqs.addState(cfg2)
+	_ = ctx2
+
+	// Test ClientHello matching first server block
+	hello1 := &tls.ClientHelloInfo{ServerName: "example.com"}
+	res1, err := sqs.getConfigForClient(hello1)
+	if err != nil {
+		t.Fatalf("expected match for example.com, got error: %v", err)
+	}
+	if res1 != targetConfig1 {
+		t.Fatalf("expected targetConfig1, got %v", res1)
+	}
+
+	// Test ClientHello matching second server block
+	hello2 := &tls.ClientHelloInfo{ServerName: "api.example.net"}
+	res2, err := sqs.getConfigForClient(hello2)
+	if err != nil {
+		t.Fatalf("expected match for api.example.net, got error: %v", err)
+	}
+	if res2 != targetConfig2 {
+		t.Fatalf("expected targetConfig2, got %v", res2)
+	}
+
+	// Test connection drop
+	helloDrop := &tls.ClientHelloInfo{ServerName: "drop.com"}
+	_, errDrop := sqs.getConfigForClient(helloDrop)
+	if errDrop == nil || !strings.Contains(errDrop.Error(), "dropping connection") {
+		t.Fatalf("expected connection drop error, got: %v", errDrop)
+	}
+
+	// Test unmatched hostname
+	helloUnknown := &tls.ClientHelloInfo{ServerName: "unknown.com"}
+	_, errUnknown := sqs.getConfigForClient(helloUnknown)
+	if errUnknown == nil {
+		t.Fatalf("expected error for unknown hostname, got nil")
+	}
+
+	// Test cancellation of second config
+	cancel2(nil)
+	_, errAfterCancel := sqs.getConfigForClient(hello2)
+	if errAfterCancel == nil {
+		t.Fatalf("expected error for api.example.net after cancellation, got nil")
+	}
+	// cfg1 should still work
+	res1After, err1After := sqs.getConfigForClient(hello1)
+	if err1After != nil || res1After != targetConfig1 {
+		t.Fatalf("expected cfg1 to still match example.com after cfg2 cancellation, got res: %v, err: %v", res1After, err1After)
+	}
+}
+
+func TestSharedQUICStateGetEncryptedClientHelloKeys_MultiConfig(t *testing.T) {
+	keyA := tls.EncryptedClientHelloKey{Config: []byte("configA"), PrivateKey: []byte("keyA")}
+	keyB := tls.EncryptedClientHelloKey{Config: []byte("configB"), PrivateKey: []byte("keyB")}
+
+	cfg1 := &tls.Config{
+		GetEncryptedClientHelloKeys: func(*tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+			return []tls.EncryptedClientHelloKey{keyA}, nil
+		},
+	}
+
+	cfg2 := &tls.Config{
+		GetEncryptedClientHelloKeys: func(*tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+			return []tls.EncryptedClientHelloKey{keyA, keyB}, nil
+		},
+	}
+
+	sqs := newSharedQUICState(cfg1)
+	_, cancel2 := sqs.addState(cfg2)
+
+	hello := &tls.ClientHelloInfo{ServerName: "example.com"}
+	keys, err := sqs.getEncryptedClientHelloKeys(hello)
+	if err != nil {
+		t.Fatalf("unexpected error getting ECH keys: %v", err)
+	}
+
+	expected := []tls.EncryptedClientHelloKey{keyA, keyB}
+	if !reflect.DeepEqual(keys, expected) {
+		t.Fatalf("unexpected deduplicated ECH keys: got %#v, want %#v", keys, expected)
+	}
+
+	cancel2(nil)
+	keysAfter, err := sqs.getEncryptedClientHelloKeys(hello)
+	if err != nil {
+		t.Fatalf("unexpected error getting ECH keys after cancellation: %v", err)
+	}
+	expectedAfter := []tls.EncryptedClientHelloKey{keyA}
+	if !reflect.DeepEqual(keysAfter, expectedAfter) {
+		t.Fatalf("unexpected ECH keys after cancellation: got %#v, want %#v", keysAfter, expectedAfter)
 	}
 }
 
