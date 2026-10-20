@@ -542,6 +542,16 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 		return req.TLS.ServerName, true
 	case "ech":
 		return req.TLS.ECHAccepted, true
+	case "used_0rtt":
+		if info, ok := req.Context().Value(EarlyDataCtxKey).(EarlyDataInfo); ok {
+			return info.Used0RTT, true
+		}
+		return false, true
+	case "early_data_status":
+		if info, ok := req.Context().Value(EarlyDataCtxKey).(EarlyDataInfo); ok {
+			return info.Status, true
+		}
+		return "none", true
 	}
 	return nil, false
 }

@@ -629,3 +629,62 @@ func BenchmarkSingleRouteMetrics(b *testing.B) {
 		ih.ServeHTTP(w, r)
 	}
 }
+
+func TestHTTP3EarlyDataMetrics(t *testing.T) {
+	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
+	metrics := &Metrics{
+		init:        sync.Once{},
+		httpMetrics: &httpMetrics{},
+	}
+
+	handler := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+
+	ih := newMetricsInstrumentedRoute(ctx, "test_handler", handler, metrics)
+
+	tests := []struct {
+		name string
+		info EarlyDataInfo
+	}{
+		{
+			name: "accepted early data",
+			info: EarlyDataInfo{
+				Used0RTT: true,
+				Status:   "accepted",
+			},
+		},
+		{
+			name: "rejected early data fallback 1rtt",
+			info: EarlyDataInfo{
+				Used0RTT: false,
+				Status:   "rejected_fallback_1rtt",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "/", nil)
+			reqCtx := context.WithValue(r.Context(), EarlyDataCtxKey, tt.info)
+			r = r.WithContext(reqCtx)
+			w := httptest.NewRecorder()
+
+			if err := ih.ServeHTTP(w, r); err != nil {
+				t.Fatalf("unexpected error serving HTTP: %v", err)
+			}
+		})
+	}
+
+	expectedMetrics := `
+	# HELP caddy_http_http3_early_data_total Counter of HTTP/3 0-RTT early data attempts by status.
+	# TYPE caddy_http_http3_early_data_total counter
+	caddy_http_http3_early_data_total{server="UNKNOWN",status="accepted"} 1
+	caddy_http_http3_early_data_total{server="UNKNOWN",status="rejected"} 1
+	`
+
+	if err := testutil.GatherAndCompare(ctx.GetMetricsRegistry(), strings.NewReader(expectedMetrics), "caddy_http_http3_early_data_total"); err != nil {
+		t.Errorf("metrics comparison failed: %v", err)
+	}
+}

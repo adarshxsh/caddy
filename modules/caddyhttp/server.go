@@ -693,6 +693,21 @@ func (s *Server) serveHTTP3(addr caddy.NetworkAddress, tlsCfg *tls.Config) error
 		}
 	}
 
+	s.h3server.ConnContext = func(ctx context.Context, c *quic.Conn) context.Context {
+		cs := c.ConnectionState()
+		info := EarlyDataInfo{
+			Used0RTT: cs.Used0RTT,
+		}
+		if cs.Used0RTT {
+			info.Status = "accepted"
+		} else if cs.TLS.DidResume {
+			info.Status = "rejected_fallback_1rtt"
+		} else {
+			info.Status = "none"
+		}
+		return context.WithValue(ctx, EarlyDataCtxKey, info)
+	}
+
 	s.quicListeners = append(s.quicListeners, h3ln)
 
 	//nolint:errcheck
@@ -985,10 +1000,15 @@ func PrepareRequest(r *http.Request, repl *caddy.Replacer, w http.ResponseWriter
 	ctx = context.WithValue(ctx, ServerCtxKey, s)
 
 	trusted, clientIP := determineTrustedProxy(r, s)
-	ctx = context.WithValue(ctx, VarsCtxKey, map[string]any{
+	varsMap := map[string]any{
 		TrustedProxyVarKey: trusted,
 		ClientIPVarKey:     clientIP,
-	})
+	}
+	if info, ok := r.Context().Value(EarlyDataCtxKey).(EarlyDataInfo); ok {
+		varsMap["http.request.tls.used_0rtt"] = info.Used0RTT
+		varsMap["http.request.tls.early_data_status"] = info.Status
+	}
+	ctx = context.WithValue(ctx, VarsCtxKey, varsMap)
 
 	ctx = context.WithValue(ctx, routeGroupCtxKey, make(map[string]struct{}))
 
@@ -1188,6 +1208,12 @@ func (r *lengthReader) Close() error {
 	return r.Source.Close()
 }
 
+// EarlyDataInfo holds details about HTTP/3 0-RTT early data state.
+type EarlyDataInfo struct {
+	Used0RTT bool
+	Status   string // "accepted", "rejected_fallback_1rtt", or "none"
+}
+
 // Context keys for HTTP request context values.
 const (
 	// For referencing the server instance
@@ -1195,6 +1221,9 @@ const (
 
 	// For the request's variable table
 	VarsCtxKey caddy.CtxKey = "vars"
+
+	// For HTTP/3 0-RTT early data state
+	EarlyDataCtxKey caddy.CtxKey = "early_data"
 
 	// For a partial copy of the unmodified request that
 	// originally came into the server's entry handler

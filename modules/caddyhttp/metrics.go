@@ -90,13 +90,14 @@ type Metrics struct {
 }
 
 type httpMetrics struct {
-	requestInFlight  *prometheus.GaugeVec
-	requestCount     *prometheus.CounterVec
-	requestErrors    *prometheus.CounterVec
-	requestDuration  *prometheus.HistogramVec
-	requestSize      *prometheus.HistogramVec
-	responseSize     *prometheus.HistogramVec
-	responseDuration *prometheus.HistogramVec
+	requestInFlight     *prometheus.GaugeVec
+	requestCount        *prometheus.CounterVec
+	requestErrors       *prometheus.CounterVec
+	requestDuration     *prometheus.HistogramVec
+	requestSize         *prometheus.HistogramVec
+	responseSize        *prometheus.HistogramVec
+	responseDuration    *prometheus.HistogramVec
+	http3EarlyDataTotal *prometheus.CounterVec
 }
 
 func initHTTPMetrics(ctx caddy.Context, metrics *Metrics) {
@@ -161,6 +162,12 @@ func initHTTPMetrics(ctx caddy.Context, metrics *Metrics) {
 		Help:      "Histogram of times to first byte in response bodies.",
 		Buckets:   durationBuckets,
 	}, httpLabels)
+	metrics.httpMetrics.http3EarlyDataTotal = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns,
+		Subsystem: sub,
+		Name:      "http3_early_data_total",
+		Help:      "Counter of HTTP/3 0-RTT early data attempts by status.",
+	}, []string{"server", "status"})
 }
 
 // provisionOTLP wires a MeterProvider that periodically reads the process-wide
@@ -366,6 +373,23 @@ func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		h.metrics.httpMetrics.requestDuration.With(statusLabels).Observe(dur)
 		h.metrics.httpMetrics.requestSize.With(statusLabels).Observe(float64(computeApproximateRequestSize(r)))
 		h.metrics.httpMetrics.responseSize.With(statusLabels).Observe(float64(wrec.Size()))
+
+		if h.metrics != nil && h.metrics.httpMetrics != nil && h.metrics.httpMetrics.http3EarlyDataTotal != nil {
+			if info, ok := r.Context().Value(EarlyDataCtxKey).(EarlyDataInfo); ok {
+				var statusStr string
+				switch info.Status {
+				case "accepted":
+					statusStr = "accepted"
+				case "rejected", "rejected_fallback_1rtt":
+					statusStr = "rejected"
+				case "fallback":
+					statusStr = "fallback"
+				}
+				if statusStr != "" {
+					h.metrics.httpMetrics.http3EarlyDataTotal.With(prometheus.Labels{"server": server, "status": statusStr}).Inc()
+				}
+			}
+		}
 	}
 
 	if err != nil {
