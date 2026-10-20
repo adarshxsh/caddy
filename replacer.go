@@ -16,6 +16,7 @@ package caddy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -447,6 +448,17 @@ var nowFunc = time.Now
 
 // ReplacerCtxKey is the context key for a replacer.
 const ReplacerCtxKey CtxKey = "replacer"
+
+// ReplacerFromContext returns the Replacer associated with ctx,
+// or a new default Replacer if ctx is nil or does not contain a Replacer.
+func ReplacerFromContext(ctx context.Context) *Replacer {
+	if ctx != nil {
+		if repl, ok := ctx.Value(ReplacerCtxKey).(*Replacer); ok && repl != nil {
+			return repl
+		}
+	}
+	return NewReplacer()
+}
 
 const phOpen, phClose, phEscape = '{', '}', '\\'
 
