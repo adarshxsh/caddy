@@ -222,8 +222,9 @@ func TestReplacerSet(t *testing.T) {
 
 		// test if key is added
 		if val, ok := rep.static[tc.variable]; ok {
-			if val != tc.value {
-				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
+			expectedVal := ToString(tc.value)
+			if val != expectedVal {
+				t.Errorf("Expected value '%s' for key '%s' got '%s'", expectedVal, tc.variable, val)
 			}
 		} else {
 			t.Errorf("Expected existing key '%s' found nothing", tc.variable)
@@ -233,7 +234,52 @@ func TestReplacerSet(t *testing.T) {
 	// test if all keys are still there (by length)
 	length := len(rep.static)
 	if len(rep.static) != 8 {
-		t.Errorf("Expected length '%v' got '%v'", 7, length)
+		t.Errorf("Expected length '%v' got '%v'", 8, length)
+	}
+}
+
+func TestTypedSetters(t *testing.T) {
+	rep := NewEmptyReplacer()
+
+	rep.SetString("str_key", "hello world")
+	if val, found := rep.GetString("str_key"); !found || val != "hello world" {
+		t.Errorf("SetString failed: expected 'hello world', got '%s' (found=%v)", val, found)
+	}
+
+	rep.SetInt("int_key", 42)
+	if val, found := rep.GetString("int_key"); !found || val != "42" {
+		t.Errorf("SetInt failed: expected '42', got '%s' (found=%v)", val, found)
+	}
+
+	rep.SetBool("bool_true", true)
+	if val, found := rep.GetString("bool_true"); !found || val != "true" {
+		t.Errorf("SetBool failed: expected 'true', got '%s' (found=%v)", val, found)
+	}
+
+	rep.SetBool("bool_false", false)
+	if val, found := rep.GetString("bool_false"); !found || val != "false" {
+		t.Errorf("SetBool failed: expected 'false', got '%s' (found=%v)", val, found)
+	}
+
+	// Test Set with scalar primitives
+	rep.Set("int_val", 100)
+	if val, found := rep.GetString("int_val"); !found || val != "100" {
+		t.Errorf("Set int failed: expected '100', got '%s' (found=%v)", val, found)
+	}
+
+	rep.Set("float_val", 3.14)
+	if val, found := rep.GetString("float_val"); !found || val != "3.14" {
+		t.Errorf("Set float failed: expected '3.14', got '%s' (found=%v)", val, found)
+	}
+
+	rep.Set("bool_val", true)
+	if val, found := rep.GetString("bool_val"); !found || val != "true" {
+		t.Errorf("Set bool failed: expected 'true', got '%s' (found=%v)", val, found)
+	}
+
+	// Verify pre-rendered strings stored directly in static map
+	if raw, ok := rep.static["int_val"]; !ok || raw != "100" {
+		t.Errorf("Expected pre-rendered string '100' in static map, got %v (%T)", raw, raw)
 	}
 }
 
@@ -489,9 +535,11 @@ func BenchmarkReplacer(b *testing.B) {
 		name, input, empty string
 	}
 
-	rep := testReplacer()
-	rep.Set("str", "a string")
-	rep.Set("int", 123.456)
+	rep := NewEmptyReplacer()
+	rep.SetString("str", "a string")
+	rep.SetInt("int", 123)
+	rep.Set("int_set", 456)
+	rep.SetBool("bool", true)
 
 	for _, bm := range []testCase{
 		{
@@ -505,6 +553,14 @@ func BenchmarkReplacer(b *testing.B) {
 		{
 			name:  "int replacement",
 			input: `int={int}`,
+		},
+		{
+			name:  "int set replacement",
+			input: `int={int_set}`,
+		},
+		{
+			name:  "bool replacement",
+			input: `bool={bool}`,
 		},
 		{
 			name:  "placeholder",
