@@ -88,11 +88,64 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 	r.providers = append(r.providers, mapFunc)
 }
 
-// Set sets a custom variable to a static value.
-func (r *Replacer) Set(variable string, value any) {
+// SetString sets a custom variable to a string value.
+func (r *Replacer) SetString(variable, value string) {
 	r.mapMutex.Lock()
 	r.static[variable] = value
 	r.mapMutex.Unlock()
+}
+
+// SetInt sets a custom variable to an int64 value.
+func (r *Replacer) SetInt(variable string, value int64) {
+	r.SetString(variable, strconv.FormatInt(value, 10))
+}
+
+// SetBool sets a custom variable to a bool value.
+func (r *Replacer) SetBool(variable string, value bool) {
+	if value {
+		r.SetString(variable, "true")
+	} else {
+		r.SetString(variable, "false")
+	}
+}
+
+// Set sets a custom variable to a static value.
+// Scalar primitives are pre-rendered to string values to avoid allocations during replacement.
+func (r *Replacer) Set(variable string, value any) {
+	switch v := value.(type) {
+	case string:
+		r.SetString(variable, v)
+	case int:
+		r.SetString(variable, strconv.Itoa(v))
+	case int8:
+		r.SetString(variable, strconv.FormatInt(int64(v), 10))
+	case int16:
+		r.SetString(variable, strconv.FormatInt(int64(v), 10))
+	case int32:
+		r.SetString(variable, strconv.Itoa(int(v)))
+	case int64:
+		r.SetInt(variable, v)
+	case uint:
+		r.SetString(variable, strconv.FormatUint(uint64(v), 10))
+	case uint8:
+		r.SetString(variable, strconv.FormatUint(uint64(v), 10))
+	case uint16:
+		r.SetString(variable, strconv.FormatUint(uint64(v), 10))
+	case uint32:
+		r.SetString(variable, strconv.FormatUint(uint64(v), 10))
+	case uint64:
+		r.SetString(variable, strconv.FormatUint(v, 10))
+	case float32:
+		r.SetString(variable, strconv.FormatFloat(float64(v), 'f', -1, 32))
+	case float64:
+		r.SetString(variable, strconv.FormatFloat(v, 'f', -1, 64))
+	case bool:
+		r.SetBool(variable, v)
+	default:
+		r.mapMutex.Lock()
+		r.static[variable] = value
+		r.mapMutex.Unlock()
+	}
 }
 
 // Get gets a value from the replacer. It returns
