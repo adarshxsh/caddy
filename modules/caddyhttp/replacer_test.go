@@ -296,3 +296,129 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestToLowerASCII(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"version", "version"},
+		{"VERSION", "version"},
+		{"Version", "version"},
+		{"client.san.dns_names", "client.san.dns_names"},
+		{"Client.SAN.DNS_Names", "client.san.dns_names"},
+		{"", ""},
+	}
+	for _, tc := range tests {
+		got := toLowerASCII(tc.input)
+		if got != tc.expected {
+			t.Errorf("toLowerASCII(%q) = %q, expected %q", tc.input, got, tc.expected)
+		}
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = toLowerASCII("client.san.dns_names")
+	})
+	if allocs > 0 {
+		t.Errorf("toLowerASCII: expected 0 allocs for lowercase string, got %f", allocs)
+	}
+}
+
+func TestTLSReplacerKeyCasing(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:            tls.VersionTLS13,
+		CipherSuite:        tls.TLS_AES_256_GCM_SHA384,
+		ServerName:         "example.com",
+		NegotiatedProtocol: "h2",
+	}
+
+	testCases := []struct {
+		key         string
+		expected    any
+		expectFound bool
+	}{
+		{"http.request.tls.version", "tls1.3", true},
+		{"http.request.tls.VERSION", "tls1.3", true},
+		{"http.request.tls.Version", "tls1.3", true},
+		{"http.request.tls.cipher_suite", "TLS_AES_256_GCM_SHA384", true},
+		{"http.request.tls.CIPHER_SUITE", "TLS_AES_256_GCM_SHA384", true},
+		{"http.request.tls.server_name", "example.com", true},
+		{"http.request.tls.SERVER_NAME", "example.com", true},
+		{"http.request.tls.proto", "h2", true},
+		{"http.request.tls.PROTO", "h2", true},
+		{"http.request.tls.invalid_key", nil, false},
+	}
+
+	for _, tc := range testCases {
+		val, found := getReqTLSReplacement(req, tc.key)
+		if found != tc.expectFound {
+			t.Errorf("key %q: expected found=%t, got %t", tc.key, tc.expectFound, found)
+		}
+		if val != tc.expected {
+			t.Errorf("key %q: expected value %v, got %v", tc.key, tc.expected, val)
+		}
+	}
+}
+
+func TestTLSReplacerNoClientCert(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+	}
+
+	// Evaluating client cert placeholders when no peer certificates are present
+	// should not panic and should return expected sentinel zero values.
+	val, found := getReqTLSReplacement(req, "http.request.tls.client.san.dns_names")
+	if !found {
+		t.Errorf("expected client.san.dns_names to be found (handled) for missing client cert")
+	}
+	dnsNames, ok := val.([]string)
+	if !ok {
+		t.Errorf("expected []string type for DNSNames, got %T", val)
+	}
+	if len(dnsNames) != 0 {
+		t.Errorf("expected empty DNSNames slice for missing client cert, got %v", dnsNames)
+	}
+
+	val, found = getReqTLSReplacement(req, "http.request.tls.client.san.dns_names.0")
+	if !found {
+		t.Errorf("expected client.san.dns_names.0 to be found (handled) for missing client cert")
+	}
+	if val != nil {
+		t.Errorf("expected nil for out of bounds DNSNames index, got %v", val)
+	}
+}
+
+func TestTLSReplacerAllocs(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:            tls.VersionTLS13,
+		CipherSuite:        tls.TLS_AES_256_GCM_SHA384,
+		ServerName:         "example.com",
+		NegotiatedProtocol: "h2",
+	}
+
+	// Placeholders that produce 0 allocations when evaluated
+	zeroAllocKeys := []string{
+		"http.request.tls.resumed",
+		"http.request.tls.proto_mutual",
+		"http.request.tls.ech",
+		"http.request.tls.client.san.dns_names",
+		"http.request.tls.client.san.emails",
+		"http.request.tls.client.san.ips",
+		"http.request.tls.client.san.uris",
+		"http.request.tls.client.public_key",
+	}
+
+	for _, key := range zeroAllocKeys {
+		allocs := testing.AllocsPerRun(100, func() {
+			_, _ = getReqTLSReplacement(req, key)
+		})
+		if allocs > 0 {
+			t.Errorf("key %q: expected 0 allocs/op, got %f", key, allocs)
+		}
+	}
+}
+
