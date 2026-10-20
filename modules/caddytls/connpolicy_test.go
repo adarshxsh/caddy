@@ -19,7 +19,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -360,4 +362,60 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+type mockHandshakeContext struct{}
+
+func (m mockHandshakeContext) HandshakeContext(hello *tls.ClientHelloInfo) (context.Context, error) {
+	ctx := hello.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, "testKey", "testVal"), nil
+}
+
+func TestGetCertificateConcurrentHandshakeContext(t *testing.T) {
+	cfg := &caddy.Config{
+		AppsRaw: caddy.ModuleMap{
+			"tls": json.RawMessage(`{
+				"automation": {
+					"policies": [{}]
+				}
+			}`),
+		},
+	}
+	ctx, err := caddy.ProvisionContext(cfg)
+	if err != nil {
+		t.Fatalf("ProvisionContext failed: %v", err)
+	}
+
+	pol := &ConnectionPolicy{
+		handshakeContext: mockHandshakeContext{},
+	}
+	if err := pol.buildStandardTLSConfig(ctx); err != nil {
+		t.Fatalf("buildStandardTLSConfig failed: %v", err)
+	}
+
+	conn1, conn2 := net.Pipe()
+	defer conn1.Close()
+	defer conn2.Close()
+
+	var wg sync.WaitGroup
+	const numGoroutines = 50
+	const callsPerGoroutine = 20
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			hello := &tls.ClientHelloInfo{
+				ServerName: "example.com",
+				Conn:       conn1,
+			}
+			for j := 0; j < callsPerGoroutine; j++ {
+				_, _ = pol.TLSConfig.GetCertificate(hello)
+			}
+		}()
+	}
+	wg.Wait()
 }
