@@ -296,3 +296,85 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHeaderAndQueryReplacerOptimizations(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/test?single=v1&multi=a&multi=b", nil)
+	req.Header.Set("User-Agent", "TestAgent")
+	req.Header.Add("X-Forwarded-For", "10.0.0.1")
+	req.Header.Add("X-Forwarded-For", "10.0.0.2")
+
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "text/plain")
+	rec.Header().Add("Set-Cookie", "c1=v1")
+	rec.Header().Add("Set-Cookie", "c2=v2")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, rec)
+
+	tests := []struct {
+		key    string
+		expect string
+		found  bool
+	}{
+		// Request header lookups
+		{key: "http.request.header.User-Agent", expect: "TestAgent", found: true},
+		{key: "http.request.header.user-agent", expect: "TestAgent", found: true},
+		{key: "http.request.header.X-Forwarded-For", expect: "10.0.0.1,10.0.0.2", found: true},
+		{key: "http.request.header.X-Missing", expect: "", found: true},
+
+		// Response header lookups
+		{key: "http.response.header.Content-Type", expect: "text/plain", found: true},
+		{key: "http.response.header.content-type", expect: "text/plain", found: true},
+		{key: "http.response.header.Set-Cookie", expect: "c1=v1,c2=v2", found: true},
+		{key: "http.response.header.X-Missing-Resp", expect: "", found: true},
+
+		// Query parameter lookups
+		{key: "http.request.uri.query.single", expect: "v1", found: true},
+		{key: "http.request.uri.query.multi", expect: "a,b", found: true},
+		{key: "http.request.uri.query.missing", expect: "", found: true},
+	}
+
+	for _, tc := range tests {
+		val, ok := repl.GetString(tc.key)
+		if ok != tc.found {
+			t.Errorf("key %s: expected found=%t, got %t", tc.key, tc.found, ok)
+		}
+		if val != tc.expect {
+			t.Errorf("key %s: expected %q, got %q", tc.key, tc.expect, val)
+		}
+		// Repeat lookup to test lazy caching path
+		val2, _ := repl.GetString(tc.key)
+		if val2 != tc.expect {
+			t.Errorf("key %s (2nd lookup): expected %q, got %q", tc.key, tc.expect, val2)
+		}
+	}
+}
+
+func BenchmarkHeaderLookupDirect(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("User-Agent", "TestAgent")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.header.User-Agent")
+	}
+}
+
+func BenchmarkQueryLookupCached(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/test?foo=bar", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Warm cache
+	_, _ = repl.GetString("http.request.uri.query.foo")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.uri.query.foo")
+	}
+}
+
