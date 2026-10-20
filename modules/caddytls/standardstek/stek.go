@@ -87,6 +87,7 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			log.Printf("[PANIC] standard STEK rotation: %v\n%s", err, debug.Stack())
 		}
 	}()
+	var errCount int
 	for {
 		select {
 		case now := <-s.timer.C:
@@ -99,10 +100,14 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			var err error
 			keysCopy, err = s.stekConfig.RotateSTEKs(keysCopy)
 			if err != nil {
-				// TODO: improve this handling
-				log.Printf("[ERROR] Generating STEK: %v", err)
+				errCount++
+				backoff := stekBackoffDelay(errCount)
+				log.Printf("[ERROR] Generating STEK: %v (consecutive errors: %d, backoff delay: %v)", err, errCount, backoff)
+				s.timer.Reset(backoff)
 				continue
 			}
+
+			errCount = 0
 
 			// replace keys slice with updated value and
 			// record the timestamp of rotation
@@ -125,6 +130,27 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			return
 		}
 	}
+}
+
+const (
+	stekInitialBackoff = 5 * time.Second
+	stekMaxBackoff     = 5 * time.Minute
+)
+
+// stekBackoffDelay calculates the exponential backoff duration for the given number
+// of consecutive failures, starting at 5 seconds and doubling up to a cap of 5 minutes.
+func stekBackoffDelay(errCount int) time.Duration {
+	if errCount <= 0 {
+		return stekInitialBackoff
+	}
+	if errCount > 30 {
+		return stekMaxBackoff
+	}
+	delay := stekInitialBackoff * time.Duration(1<<(errCount-1))
+	if delay > stekMaxBackoff || delay < 0 {
+		return stekMaxBackoff
+	}
+	return delay
 }
 
 var (
