@@ -57,7 +57,9 @@ func (s *standardSTEKProvider) Initialize(config *caddytls.SessionTicketService)
 	since := time.Since(lastRotation)
 	if lastRotation.IsZero() || since > itvl {
 		var err error
-		keys, err = s.stekConfig.RotateSTEKs(keys)
+		keysCopy := make([][32]byte, len(keys))
+		copy(keysCopy, keys)
+		keys, err = s.stekConfig.RotateSTEKs(keysCopy)
 		if err != nil {
 			return nil, err
 		}
@@ -90,9 +92,10 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 	for {
 		select {
 		case now := <-s.timer.C:
-			// copy the slice header to avoid races
+			// deep copy the key slice backing array to avoid races
 			mutex.RLock()
-			keysCopy := keys
+			keysCopy := make([][32]byte, len(keys))
+			copy(keysCopy, keys)
 			mutex.RUnlock()
 
 			// generate a new key, rotating old ones
