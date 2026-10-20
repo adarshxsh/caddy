@@ -1054,10 +1054,26 @@ var (
 	storageCleanMu sync.Mutex
 )
 
+// RegisterSessionTicket registers cfg with the TLS app's SessionTicketService if configured.
+func (t *TLS) RegisterSessionTicket(cfg *tls.Config) {
+	if t.SessionTickets != nil {
+		t.SessionTickets.RegisterSessionTicket(cfg)
+	}
+}
+
+// UnregisterSessionTicket unregisters cfg from the TLS app's SessionTicketService if configured.
+func (t *TLS) UnregisterSessionTicket(cfg *tls.Config) {
+	if t.SessionTickets != nil {
+		t.SessionTickets.UnregisterSessionTicket(cfg)
+	}
+}
+
 // Interface guards
 var (
-	_ caddy.App          = (*TLS)(nil)
-	_ caddy.Provisioner  = (*TLS)(nil)
-	_ caddy.Validator    = (*TLS)(nil)
-	_ caddy.CleanerUpper = (*TLS)(nil)
+	_ caddy.App                     = (*TLS)(nil)
+	_ caddy.Provisioner             = (*TLS)(nil)
+	_ caddy.Validator               = (*TLS)(nil)
+	_ caddy.CleanerUpper            = (*TLS)(nil)
+	_ caddy.SessionTicketRegisterer = (*TLS)(nil)
+	_ caddy.SessionTicketRegisterer = (*SessionTicketService)(nil)
 )

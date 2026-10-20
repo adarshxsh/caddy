@@ -459,13 +459,20 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 			}
 		}
 
-		sqs := newSharedQUICState(tlsConf)
+		sqs := newSharedQUICState(tlsConf, ctx)
 		// http3.ConfigureTLSConfig only uses this field and tls App sets this field as well
 		//nolint:gosec
 		quicTlsConfig := &tls.Config{
 			GetConfigForClient:          sqs.getConfigForClient,
 			GetEncryptedClientHelloKeys: sqs.getEncryptedClientHelloKeys,
 		}
+		sqs.quicTlsConfig = quicTlsConfig
+
+		// Register quicTlsConfig with the active SessionTicketService before ListenEarly
+		if reg := getSessionTicketRegisterer(ctx); reg != nil {
+			reg.RegisterSessionTicket(quicTlsConfig)
+		}
+
 		// Require clients to verify their source address when we're handling more than 1000 handshakes per second.
 		// TODO: make tunable?
 		limiter := rate.NewLimiter(1000, 1000)
@@ -497,13 +504,41 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 
 	sql := sharedEarlyListener.(*sharedQuicListener)
 	// add current tls.Config to sqs, so GetConfigForClient will always return the latest tls.Config in case of context cancellation
-	ctx, cancel := sql.sqs.addState(tlsConf)
+	reqCtx, cancel := sql.sqs.addState(tlsConf, ctx)
 
 	return &fakeCloseQuicListener{
 		sharedQuicListener: sql,
-		context:            ctx,
+		context:            reqCtx,
 		contextCancel:      cancel,
 	}, nil
+}
+
+// SessionTicketRegisterer is an interface for registering TLS configurations for session ticket key updates.
+type SessionTicketRegisterer interface {
+	RegisterSessionTicket(cfg *tls.Config)
+	UnregisterSessionTicket(cfg *tls.Config)
+}
+
+// getSessionTicketRegisterer retrieves the SessionTicketRegisterer from ctx or the active context.
+func getSessionTicketRegisterer(ctx context.Context) SessionTicketRegisterer {
+	if ctx == nil {
+		return nil
+	}
+	var caddyCtx Context
+	if c, ok := ctx.(Context); ok {
+		caddyCtx = c
+	} else if c, ok := ctx.(*Context); ok && c != nil {
+		caddyCtx = *c
+	} else {
+		caddyCtx = ActiveContext()
+	}
+
+	if tlsAppIface, err := caddyCtx.AppIfConfigured("tls"); err == nil {
+		if str, ok := tlsAppIface.(SessionTicketRegisterer); ok {
+			return str
+		}
+	}
+	return nil
 }
 
 // ListenerUsage returns the current usage count of the given listener address.
@@ -524,15 +559,16 @@ type sharedQUICState struct {
 	rmu           sync.RWMutex
 	tlsConfs      map[*tls.Config]contextAndCancelFunc
 	activeTlsConf *tls.Config
+	quicTlsConfig *tls.Config
 }
 
 // newSharedQUICState creates a new sharedQUICState
-func newSharedQUICState(tlsConfig *tls.Config) *sharedQUICState {
+func newSharedQUICState(tlsConfig *tls.Config, ctx ...context.Context) *sharedQUICState {
 	sqtc := &sharedQUICState{
 		tlsConfs:      make(map[*tls.Config]contextAndCancelFunc),
 		activeTlsConf: tlsConfig,
 	}
-	sqtc.addState(tlsConfig)
+	sqtc.addState(tlsConfig, ctx...)
 	return sqtc
 }
 
@@ -555,7 +591,7 @@ func (sqs *sharedQUICState) getEncryptedClientHelloKeys(ch *tls.ClientHelloInfo)
 
 // addState adds tls.Config and activeRequests to the map if not present and returns the corresponding context and its cancelFunc
 // so that when cancelled, the active tls.Config will change
-func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, context.CancelCauseFunc) {
+func (sqs *sharedQUICState) addState(tlsConfig *tls.Config, ctx ...context.Context) (context.Context, context.CancelCauseFunc) {
 	sqs.rmu.Lock()
 	defer sqs.rmu.Unlock()
 
@@ -563,12 +599,27 @@ func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, co
 		return cacc.Context, cacc.CancelCauseFunc
 	}
 
-	ctx, cancel := context.WithCancelCause(context.Background())
+	var parentCtx context.Context = context.Background()
+	var registerer SessionTicketRegisterer
+	if len(ctx) > 0 && ctx[0] != nil {
+		parentCtx = ctx[0]
+		registerer = getSessionTicketRegisterer(parentCtx)
+	}
+
+	if registerer != nil && sqs.quicTlsConfig != nil {
+		registerer.RegisterSessionTicket(sqs.quicTlsConfig)
+	}
+
+	reqCtx, cancel := context.WithCancelCause(parentCtx)
 	wrappedCancel := func(cause error) {
 		cancel(cause)
 
 		sqs.rmu.Lock()
 		defer sqs.rmu.Unlock()
+
+		if registerer != nil && sqs.quicTlsConfig != nil {
+			registerer.UnregisterSessionTicket(sqs.quicTlsConfig)
+		}
 
 		delete(sqs.tlsConfs, tlsConfig)
 		if sqs.activeTlsConf == tlsConfig {
@@ -580,12 +631,12 @@ func (sqs *sharedQUICState) addState(tlsConfig *tls.Config) (context.Context, co
 			}
 		}
 	}
-	sqs.tlsConfs[tlsConfig] = contextAndCancelFunc{ctx, wrappedCancel}
+	sqs.tlsConfs[tlsConfig] = contextAndCancelFunc{reqCtx, wrappedCancel}
 	// there should be at most 2 tls.Configs
 	if len(sqs.tlsConfs) > 2 {
 		Log().Warn("quic listener tls configs are more than 2", zap.Int("number of configs", len(sqs.tlsConfs)))
 	}
-	return ctx, wrappedCancel
+	return reqCtx, wrappedCancel
 }
 
 // sharedQuicListener is like sharedListener, but for quic.EarlyListeners.
