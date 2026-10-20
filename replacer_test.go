@@ -530,3 +530,31 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestReplacerZeroAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("foo", "bar")
+
+	inputs := []string{
+		"no braces at all",
+		"unclosed { brace",
+		`{"json": "object"}`,
+		"unknown {placeholder} key",
+	}
+
+	for _, input := range inputs {
+		allocs := testing.AllocsPerRun(100, func() {
+			_ = rep.ReplaceKnown(input, "")
+		})
+		if allocs != 0 {
+			t.Errorf("ReplaceKnown('%s'): expected 0 allocs, got %f", input, allocs)
+		}
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll(`{"json": "object"}`, "")
+	})
+	if allocs != 0 {
+		t.Errorf("ReplaceAll('{\"json\": \"object\"}'): expected 0 allocs, got %f", allocs)
+	}
+}
