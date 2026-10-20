@@ -19,7 +19,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -359,5 +361,113 @@ func TestClientAuthenticationProvision(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+type mockHandshakeContext struct {
+	err error
+}
+
+func (m mockHandshakeContext) HandshakeContext(hello *tls.ClientHelloInfo) (context.Context, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	parent := hello.Context()
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithValue(parent, "testKey", "testValue"), nil
+}
+
+func TestConnectionPolicy_GetCertificate_HandshakeContext_Concurrent(t *testing.T) {
+	ctx, err := caddy.ProvisionContext(nil)
+	if err != nil {
+		t.Fatalf("ProvisionContext() error = %v", err)
+	}
+
+	tlsAppIface, err := ctx.App("tls")
+	if err != nil {
+		t.Fatalf("ctx.App('tls') error = %v", err)
+	}
+	tlsApp := tlsAppIface.(*TLS)
+	if err := tlsApp.Provision(ctx); err != nil {
+		t.Fatalf("tlsApp.Provision() error = %v", err)
+	}
+
+	pol := &ConnectionPolicy{
+		handshakeContext: mockHandshakeContext{},
+	}
+	policies := ConnectionPolicies{pol}
+
+	err = policies.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	var wg sync.WaitGroup
+	const numGoroutines = 50
+	const numIterations = 20
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numIterations; j++ {
+				hello := &tls.ClientHelloInfo{
+					ServerName: "example.com",
+					Conn:       serverConn,
+				}
+				_, _ = pol.TLSConfig.GetCertificate(hello)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestConnectionPolicy_GetCertificate_HandshakeContext_Error(t *testing.T) {
+	ctx, err := caddy.ProvisionContext(nil)
+	if err != nil {
+		t.Fatalf("ProvisionContext() error = %v", err)
+	}
+
+	tlsAppIface, err := ctx.App("tls")
+	if err != nil {
+		t.Fatalf("ctx.App('tls') error = %v", err)
+	}
+	tlsApp := tlsAppIface.(*TLS)
+	if err := tlsApp.Provision(ctx); err != nil {
+		t.Fatalf("tlsApp.Provision() error = %v", err)
+	}
+
+	expectedErr := fmt.Errorf("context hook error")
+	pol := &ConnectionPolicy{
+		handshakeContext: mockHandshakeContext{err: expectedErr},
+	}
+	policies := ConnectionPolicies{pol}
+
+	err = policies.Provision(ctx)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	hello := &tls.ClientHelloInfo{
+		ServerName: "example.com",
+		Conn:       serverConn,
+	}
+	_, err = pol.TLSConfig.GetCertificate(hello)
+	if err == nil {
+		t.Fatalf("expected error from GetCertificate, got nil")
+	}
+	expectedMsg := fmt.Sprintf("handshake context: %v", expectedErr)
+	if err.Error() != expectedMsg {
+		t.Errorf("got error %q, want %q", err.Error(), expectedMsg)
 	}
 }
