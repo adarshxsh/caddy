@@ -732,15 +732,8 @@ func (app *App) Stop() error {
 			return
 		}
 
-		// closing quic listeners won't affect accepted connections now
-		// so like stdlib, close listeners first, but keep the net.PacketConns open
-		for _, h3ln := range server.quicListeners {
-			if err := h3ln.Close(); err != nil {
-				app.logger.Error("http3 listener close",
-					zap.Error(err))
-			}
-		}
-
+		// Shutdown HTTP/3 server while QUIC listeners and their contexts remain active.
+		// This enables sending GOAWAY frames and draining active connections.
 		if err := server.h3server.Shutdown(ctx); err != nil {
 			if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.DeadlineExceeded) {
 				err = cause
@@ -750,8 +743,16 @@ func (app *App) Stop() error {
 				zap.Strings("addresses", server.Listen))
 		}
 
-		// close the underlying net.PacketConns now
-		// see the comment for ListenQUIC
+		// Close QUIC listeners in two stages after Shutdown finishes.
+		// First close cancels listener context and stops accepting new connections;
+		// second close removes listener pool entries and closes underlying net.PacketConns.
+		for _, h3ln := range server.quicListeners {
+			if err := h3ln.Close(); err != nil {
+				app.logger.Error("http3 listener close",
+					zap.Error(err))
+			}
+		}
+
 		for _, h3ln := range server.quicListeners {
 			if err := h3ln.Close(); err != nil {
 				app.logger.Error("http3 listener close socket",
