@@ -1279,6 +1279,11 @@ func (h *Handler) finalizeResponse(
 		if c := logger.Check(zapcore.WarnLevel, "aborting with incomplete response"); c != nil {
 			c.Write(zap.Error(err))
 		}
+		if code, ok := extractQUICResetCode(err); ok {
+			tryCancelWrite(rw, code)
+		} else if code, ok := extractQUICResetCode(errClose); ok {
+			tryCancelWrite(rw, code)
+		}
 		// no extra logging from stdlib
 		panic(http.ErrAbortHandler)
 	}
