@@ -484,7 +484,36 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	// No-placeholder string: expected 0 allocations because string contains no braces
+	allocsNoPlaceholder := testing.AllocsPerRun(100, func() {
+		benchStringSink = rep.ReplaceAll("simple static string", "")
+	})
+	if allocsNoPlaceholder != 0 {
+		t.Errorf("Expected 0 allocs for no-placeholder string, got %f", allocsNoPlaceholder)
+	}
+
+	// Single placeholder replacement: expected <= 1 allocation
+	allocsSinglePlaceholder := testing.AllocsPerRun(100, func() {
+		benchStringSink = rep.ReplaceAll("str={str}", "")
+	})
+	if allocsSinglePlaceholder > 1 {
+		t.Errorf("Expected <= 1 allocs for single-placeholder string, got %f", allocsSinglePlaceholder)
+	}
+}
+
+var (
+	benchSink       any
+	benchStringSink string
+)
+
 func BenchmarkReplacer(b *testing.B) {
+	b.ReportAllocs()
+
 	type testCase struct {
 		name, input, empty string
 	}
@@ -511,16 +540,77 @@ func BenchmarkReplacer(b *testing.B) {
 			input: `{"json": "object"}`,
 		},
 		{
+			name:  "multi placeholder",
+			input: `str={str} int={int} str={str}`,
+		},
+		{
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
-				rep.ReplaceAll(bm.input, bm.empty)
+				benchStringSink = rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
 	}
+
+	b.Run("NewReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchSink = NewReplacer()
+		}
+	})
+
+	b.Run("NewEmptyReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchSink = NewEmptyReplacer()
+		}
+	})
+
+	b.Run("WithoutFile", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchSink = rep.WithoutFile()
+		}
+	})
+}
+
+func BenchmarkReplacerParallel(b *testing.B) {
+	b.ReportAllocs()
+
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	b.Run("ReplaceAll", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				benchStringSink = rep.ReplaceAll("str={str} int={int}", "")
+			}
+		})
+	})
+
+	b.Run("Set", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				rep.Set("key", "val")
+			}
+		})
+	})
+
+	b.Run("Get", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				benchSink, _ = rep.Get("str")
+			}
+		})
+	})
 }
 
 func testReplacer() Replacer {

@@ -296,3 +296,90 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+var (
+	benchSink       any
+	benchStringSink string
+)
+
+func BenchmarkAddHTTPVarsToReplacer(b *testing.B) {
+	b.ReportAllocs()
+
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+	req.Header.Set("User-Agent", "caddy-bench")
+	localAddr, _ := net.ResolveTCPAddr("tcp", "192.168.159.1:80")
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), VarsCtxKey, vars)
+	ctx = context.WithValue(ctx, http.LocalAddrContextKey, localAddr)
+	req = req.WithContext(ctx)
+	res := httptest.NewRecorder()
+
+	b.ResetTimer()
+	for b.Loop() {
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, res)
+		benchSink = repl
+	}
+}
+
+func BenchmarkHTTPVarReplacement(b *testing.B) {
+	b.ReportAllocs()
+
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+	req.Header.Set("User-Agent", "caddy-bench")
+	localAddr, _ := net.ResolveTCPAddr("tcp", "192.168.159.1:80")
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), VarsCtxKey, vars)
+	ctx = context.WithValue(ctx, http.LocalAddrContextKey, localAddr)
+	req = req.WithContext(ctx)
+	res := httptest.NewRecorder()
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	b.Run("GetString/method", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchStringSink, _ = repl.GetString("http.request.method")
+		}
+	})
+
+	b.Run("GetString/host", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchStringSink, _ = repl.GetString("http.request.host")
+		}
+	})
+
+	b.Run("GetString/uri", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchStringSink, _ = repl.GetString("http.request.uri")
+		}
+	})
+
+	b.Run("GetString/header", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchStringSink, _ = repl.GetString("http.request.header.User-Agent")
+		}
+	})
+
+	b.Run("GetString/query", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchStringSink, _ = repl.GetString("http.request.uri.query.a")
+		}
+	})
+
+	b.Run("ReplaceAll/request_line", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			benchStringSink = repl.ReplaceAll("{http.request.method} {http.request.uri} {http.request.proto}", "")
+		}
+	})
+}
