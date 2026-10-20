@@ -710,3 +710,55 @@ func TestSplitUnixSocketPermissionsBits(t *testing.T) {
 		}
 	}
 }
+
+type mockSessionTicketRegisterer struct {
+	registered   []*tls.Config
+	unregistered []*tls.Config
+}
+
+func (m *mockSessionTicketRegisterer) RegisterSessionTicket(cfg *tls.Config) {
+	m.registered = append(m.registered, cfg)
+}
+
+func (m *mockSessionTicketRegisterer) UnregisterSessionTicket(cfg *tls.Config) {
+	m.unregistered = append(m.unregistered, cfg)
+}
+
+func TestSharedQUICStateSessionTicketRegistration(t *testing.T) {
+	reg1 := &mockSessionTicketRegisterer{}
+	reg2 := &mockSessionTicketRegisterer{}
+
+	tlsConf1 := &tls.Config{MinVersion: tls.VersionTLS13}
+	tlsConf2 := &tls.Config{MinVersion: tls.VersionTLS13}
+
+	sqs := &sharedQUICState{
+		tlsConfs:      make(map[*tls.Config]contextAndCancelFunc),
+		activeTlsConf: tlsConf1,
+		quicTlsConfig: &tls.Config{},
+	}
+
+	// Direct register call test
+	reg1.RegisterSessionTicket(sqs.quicTlsConfig)
+	if len(reg1.registered) != 1 || reg1.registered[0] != sqs.quicTlsConfig {
+		t.Fatalf("expected quicTlsConfig to be registered with reg1")
+	}
+
+	// Simulate reload with reg2
+	reg2.RegisterSessionTicket(sqs.quicTlsConfig)
+	if len(reg2.registered) != 1 || reg2.registered[0] != sqs.quicTlsConfig {
+		t.Fatalf("expected quicTlsConfig to be registered with reg2")
+	}
+
+	// Unregister from reg1 on context cancel
+	reg1.UnregisterSessionTicket(sqs.quicTlsConfig)
+	if len(reg1.unregistered) != 1 || reg1.unregistered[0] != sqs.quicTlsConfig {
+		t.Fatalf("expected quicTlsConfig to be unregistered from reg1")
+	}
+
+	if len(reg2.unregistered) != 0 {
+		t.Fatalf("quicTlsConfig should still be registered with reg2")
+	}
+
+	_ = tlsConf2
+}
+
