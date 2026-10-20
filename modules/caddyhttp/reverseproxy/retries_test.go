@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -783,5 +784,187 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	expectedBody := "hello world"
 	if rec.Body.String() != expectedBody {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
+	}
+}
+
+func TestTryAgainBodyConsumption(t *testing.T) {
+	lb := LoadBalancing{Retries: 1}
+	logger := zap.NewNop()
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// 1. Unbuffered body with read bytes > 0 and non-dial transport error -> should NOT retry
+	unbufferedReadBody := &bodyNopCloserIfNotRead{
+		ReadCloser: io.NopCloser(strings.NewReader("payload")),
+		read:       5,
+	}
+	req1 := httptest.NewRequest(http.MethodGet, "http://example.com", unbufferedReadBody)
+	req1.Body = unbufferedReadBody
+	if lb.tryAgain(ctx, time.Now(), 0, errors.New("transport reset"), req1, logger) {
+		t.Errorf("expected tryAgain to return false when unbuffered body was partially read")
+	}
+
+	// 2. Unbuffered body with read bytes == -1 (EOF read) and non-dial transport error -> should NOT retry
+	unbufferedEOFBody := &bodyNopCloserIfNotRead{
+		ReadCloser: io.NopCloser(strings.NewReader("payload")),
+		read:       -1,
+	}
+	req2 := httptest.NewRequest(http.MethodGet, "http://example.com", unbufferedEOFBody)
+	req2.Body = unbufferedEOFBody
+	if lb.tryAgain(ctx, time.Now(), 0, errors.New("transport reset"), req2, logger) {
+		t.Errorf("expected tryAgain to return false when unbuffered body read returned EOF")
+	}
+
+	// 3. Unbuffered body with read bytes == 0 and dial error -> SHOULD retry
+	unbufferedUnreadBody := &bodyNopCloserIfNotRead{
+		ReadCloser: io.NopCloser(strings.NewReader("payload")),
+		read:       0,
+	}
+	req3 := httptest.NewRequest(http.MethodPost, "http://example.com", unbufferedUnreadBody)
+	req3.Body = unbufferedUnreadBody
+	if !lb.tryAgain(ctx, time.Now(), 0, DialError{errors.New("dial failure")}, req3, logger) {
+		t.Errorf("expected tryAgain to return true for dial error when body was not read")
+	}
+
+	// 4. Fully buffered body (io.NopCloser) with non-dial error -> SHOULD retry for GET
+	bufferedBody := io.NopCloser(strings.NewReader("payload"))
+	req4 := httptest.NewRequest(http.MethodGet, "http://example.com", bufferedBody)
+	if !lb.tryAgain(ctx, time.Now(), 0, errors.New("transport reset"), req4, logger) {
+		t.Errorf("expected tryAgain to return true for GET with buffered body")
+	}
+}
+
+func TestUnbufferedBodyMidStreamFailureNoRetry(t *testing.T) {
+	// Good secondary upstream that returns 200 OK
+	var goodCalled int32
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&goodCalled, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("good"))
+	}))
+	t.Cleanup(goodServer.Close)
+
+	// Upstream that reads request body and abruptly closes TCP connection mid-stream
+	badListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer badListener.Close()
+
+	go func() {
+		for {
+			conn, err := badListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(100 * time.Millisecond))
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)
+				time.Sleep(5 * time.Millisecond)
+			}(conn)
+		}
+	}()
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: badListener.Addr().String()},
+	}
+
+	transportErrorExpr := newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true")
+	retryMatch := caddyhttp.MatcherSets{caddyhttp.MatcherSet{transportErrorExpr}}
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+
+	bodyReader := newCloseOnCloseReader("unbuffered body data")
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+	req.Body = bodyReader
+	req.ContentLength = int64(len("unbuffered body data"))
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err = h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	if err == nil {
+		t.Fatalf("expected error from ServeHTTP, got nil")
+	}
+
+	// Verify that secondary upstream was NOT called because unbuffered body was consumed
+	if atomic.LoadInt32(&goodCalled) != 0 {
+		t.Errorf("expected secondary upstream to not be called, but called %d times", atomic.LoadInt32(&goodCalled))
+	}
+}
+
+func TestBufferedBodyMidStreamFailureRetry(t *testing.T) {
+	// Good secondary upstream that returns 200 OK
+	var goodCalled int32
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&goodCalled, 1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(goodServer.Close)
+
+	// Upstream that reads request body and abruptly closes TCP connection mid-stream
+	badListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer badListener.Close()
+
+	go func() {
+		for {
+			conn, err := badListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(100 * time.Millisecond))
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)
+				time.Sleep(5 * time.Millisecond)
+			}(conn)
+		}
+	}()
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: badListener.Addr().String()},
+	}
+
+	transportErrorExpr := newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true")
+	retryMatch := caddyhttp.MatcherSets{caddyhttp.MatcherSet{transportErrorExpr}}
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+	h.RequestBuffers = 1024 // Enable body buffering
+
+	const payload = "buffered request body"
+	bodyReader := newCloseOnCloseReader(payload)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+	req.Body = bodyReader
+	req.ContentLength = int64(len(payload))
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err = h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	if err != nil {
+		t.Fatalf("expected no error from ServeHTTP for buffered request, got: %v", err)
+	}
+
+	if atomic.LoadInt32(&goodCalled) != 1 {
+		t.Errorf("expected secondary upstream to be called once, got %d", atomic.LoadInt32(&goodCalled))
+	}
+	if rec.Body.String() != payload {
+		t.Errorf("body: got %q, want %q", rec.Body.String(), payload)
 	}
 }
