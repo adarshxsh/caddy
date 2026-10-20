@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -530,3 +531,157 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestTimeReplacerCache(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	mockTime := time.Date(2026, 10, 20, 12, 34, 56, 123456789, time.UTC)
+	nowFunc = func() time.Time { return mockTime }
+
+	rep := NewReplacer()
+
+	expectedHTTP := "Tue, 20 Oct 2026 12:34:56 GMT"
+	expectedCommonLog := mockTime.Format("02/Jan/2006:15:04:05 -0700")
+	expectedYear := "2026"
+	expectedUnix := fmt.Sprintf("%d", mockTime.Unix())
+
+	if val, ok := rep.Get("time.now.http"); !ok || val != expectedHTTP {
+		t.Errorf("expected time.now.http %q, got %v (ok: %v)", expectedHTTP, val, ok)
+	}
+	if val, ok := rep.Get("time.now.common_log"); !ok || val != expectedCommonLog {
+		t.Errorf("expected time.now.common_log %q, got %v (ok: %v)", expectedCommonLog, val, ok)
+	}
+	if val, ok := rep.Get("time.now.year"); !ok || val != expectedYear {
+		t.Errorf("expected time.now.year %q, got %v (ok: %v)", expectedYear, val, ok)
+	}
+	if val, ok := rep.Get("time.now.unix"); !ok || val != expectedUnix {
+		t.Errorf("expected time.now.unix %q, got %v (ok: %v)", expectedUnix, val, ok)
+	}
+
+	// Verify cache hits within same second return identical strings
+	val1, _ := rep.Get("time.now.http")
+	val2, _ := rep.Get("time.now.http")
+	if val1 != val2 {
+		t.Errorf("expected identical cached string within same second, got %v and %v", val1, val2)
+	}
+
+	// Advance time by 5 seconds
+	mockTime = mockTime.Add(5 * time.Second)
+	expectedHTTPAdv := "Tue, 20 Oct 2026 12:35:01 GMT"
+	if val, ok := rep.Get("time.now.http"); !ok || val != expectedHTTPAdv {
+		t.Errorf("after time advancement, expected time.now.http %q, got %v", expectedHTTPAdv, val)
+	}
+
+	// Verify time.now.unix_ms evaluates dynamically
+	ms1, _ := rep.Get("time.now.unix_ms")
+	mockTime = mockTime.Add(10 * time.Millisecond)
+	ms2, _ := rep.Get("time.now.unix_ms")
+	if ms1 == ms2 {
+		t.Errorf("expected time.now.unix_ms to evaluate dynamically, but got identical values: %v", ms1)
+	}
+}
+
+func TestTimeReplacerConcurrency(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	var mu sync.Mutex
+	currentSec := int64(1000)
+	nowFunc = func() time.Time {
+		mu.Lock()
+		sec := currentSec
+		mu.Unlock()
+		return time.Unix(sec, 0).UTC()
+	}
+
+	rep := NewReplacer()
+	var wg sync.WaitGroup
+	const numGoroutines = 10
+	const iterations = 100
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			keys := []string{"time.now.http", "time.now.common_log", "time.now.year", "time.now.unix"}
+			for j := 0; j < iterations; j++ {
+				key := keys[(gid+j)%len(keys)]
+				val, ok := rep.Get(key)
+				if !ok || val == "" {
+					t.Errorf("goroutine %d iteration %d: Get(%s) failed", gid, j, key)
+				}
+				if j%10 == 0 {
+					mu.Lock()
+					currentSec++
+					mu.Unlock()
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestTimeReplacerAllocations(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	fixedTime := time.Date(2026, 10, 20, 12, 34, 56, 0, time.UTC)
+	nowFunc = func() time.Time { return fixedTime }
+
+	rep := NewReplacer()
+
+	// Warm up cache
+	rep.Get("time.now.http")
+	rep.Get("time.now.common_log")
+	rep.Get("time.now.year")
+	rep.Get("time.now.unix")
+
+	keys := []string{"time.now.http", "time.now.common_log", "time.now.year", "time.now.unix"}
+	for _, key := range keys {
+		allocs := testing.AllocsPerRun(1000, func() {
+			rep.Get(key)
+		})
+		if allocs > 0 {
+			t.Errorf("key %s: expected 0 allocs per run on cache hit, got %f", key, allocs)
+		}
+	}
+}
+
+func BenchmarkTimeReplacer(b *testing.B) {
+	rep := NewReplacer()
+	// Warm up cache
+	rep.Get("time.now.http")
+	rep.Get("time.now.common_log")
+	rep.Get("time.now.year")
+	rep.Get("time.now.unix")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.Run("time.now.http", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			rep.Get("time.now.http")
+		}
+	})
+
+	b.Run("time.now.common_log", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			rep.Get("time.now.common_log")
+		}
+	})
+
+	b.Run("time.now.year", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			rep.Get("time.now.year")
+		}
+	})
+
+	b.Run("time.now.unix", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			rep.Get("time.now.unix")
+		}
+	})
+}
+
+
