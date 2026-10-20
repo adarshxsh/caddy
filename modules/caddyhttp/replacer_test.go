@@ -296,3 +296,104 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestZeroAllocScanners(t *testing.T) {
+	t.Run("Cookie Lookup", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Add("Cookie", "session_id=12345; theme=\"dark\"; user=john")
+		req.Header.Add("Cookie", "tracking_id=abcxyz")
+
+		tests := []struct {
+			cookieName string
+			expected   string
+			found      bool
+		}{
+			{"session_id", "12345", true},
+			{"SESSION_ID", "12345", true}, // case insensitive
+			{"theme", "dark", true},        // quoted value
+			{"user", "john", true},
+			{"tracking_id", "abcxyz", true},
+			{"missing", "", false},
+		}
+
+		for _, tc := range tests {
+			val, ok := fastCookieLookup(req, tc.cookieName)
+			if ok != tc.found || val != tc.expected {
+				t.Errorf("cookie %q: expected (%q, %t), got (%q, %t)", tc.cookieName, tc.expected, tc.found, val, ok)
+			}
+		}
+
+		allocs := testing.AllocsPerRun(100, func() {
+			_, _ = fastCookieLookup(req, "session_id")
+		})
+		if allocs > 0 {
+			t.Errorf("fastCookieLookup allocated %f objects/run, expected 0", allocs)
+		}
+	})
+
+	t.Run("Host Label Lookup", func(t *testing.T) {
+		tests := []struct {
+			host     string
+			idx      int
+			expected string
+			found    bool
+		}{
+			{"sub.domain.example.com:8080", 0, "com", true},
+			{"sub.domain.example.com:8080", 1, "example", true},
+			{"sub.domain.example.com:8080", 2, "domain", true},
+			{"sub.domain.example.com:8080", 3, "sub", true},
+			{"sub.domain.example.com:8080", 4, "", true},
+			{"sub.domain.example.com:8080", -1, "", false},
+			{"[::1]:8080", 0, "::1", true},
+			{"localhost", 0, "localhost", true},
+		}
+
+		for _, tc := range tests {
+			val, ok := fastHostLabelLookup(tc.host, tc.idx)
+			if ok != tc.found || val != tc.expected {
+				t.Errorf("host %q idx %d: expected (%q, %t), got (%q, %t)", tc.host, tc.idx, tc.expected, tc.found, val, ok)
+			}
+		}
+
+		allocs := testing.AllocsPerRun(100, func() {
+			_, _ = fastHostLabelLookup("sub.domain.example.com:8080", 1)
+		})
+		if allocs > 0 {
+			t.Errorf("fastHostLabelLookup allocated %f objects/run, expected 0", allocs)
+		}
+	})
+
+	t.Run("Path Part Lookup", func(t *testing.T) {
+		tests := []struct {
+			path     string
+			idx      int
+			expected string
+			found    bool
+		}{
+			{"/api/v1/users/123", 0, "api", true},
+			{"/api/v1/users/123", 1, "v1", true},
+			{"/api/v1/users/123", 2, "users", true},
+			{"/api/v1/users/123", 3, "123", true},
+			{"/api/v1/users/123", 4, "", true},
+			{"/api/v1/users/123", -1, "", false},
+			{"/", 0, "", true},
+			{"", 0, "", true},
+			{"//foo", 0, "", true},
+			{"//foo", 1, "foo", true},
+		}
+
+		for _, tc := range tests {
+			val, ok := fastPathPartLookup(tc.path, tc.idx)
+			if ok != tc.found || val != tc.expected {
+				t.Errorf("path %q idx %d: expected (%q, %t), got (%q, %t)", tc.path, tc.idx, tc.expected, tc.found, val, ok)
+			}
+		}
+
+		allocs := testing.AllocsPerRun(100, func() {
+			_, _ = fastPathPartLookup("/api/v1/users/123", 2)
+		})
+		if allocs > 0 {
+			t.Errorf("fastPathPartLookup allocated %f objects/run, expected 0", allocs)
+		}
+	})
+}
