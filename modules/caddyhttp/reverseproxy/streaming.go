@@ -35,6 +35,9 @@ import (
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http/httpguts"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -373,6 +376,53 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 			return written, fmt.Errorf("reading: %w", rerr)
 		}
 	}
+}
+
+// extractQUICResetCode checks err and its error chain for a QUIC or HTTP/3 stream reset code or application error.
+func extractQUICResetCode(err error) (quic.StreamErrorCode, bool) {
+	if err == nil {
+		return 0, false
+	}
+	var (
+		strErr *quic.StreamError
+		appErr *quic.ApplicationError
+		h3Err  *http3.Error
+	)
+	if errors.As(err, &strErr) {
+		return strErr.ErrorCode, true
+	}
+	if errors.As(err, &appErr) {
+		return quic.StreamErrorCode(appErr.ErrorCode), true
+	}
+	if errors.As(err, &h3Err) {
+		return quic.StreamErrorCode(h3Err.ErrorCode), true
+	}
+	return 0, false
+}
+
+// tryCancelWrite unwraps downstream ResponseWriter decorators to locate a QUIC/HTTP3 stream
+// and invokes CancelWrite with the provided error code.
+func tryCancelWrite(rw http.ResponseWriter, code quic.StreamErrorCode) bool {
+	curr := rw
+	for curr != nil {
+		if streamer, ok := curr.(http3.HTTPStreamer); ok {
+			str := streamer.HTTPStream()
+			if str != nil {
+				str.CancelWrite(code)
+				return true
+			}
+		}
+		if cw, ok := curr.(interface{ CancelWrite(quic.StreamErrorCode) }); ok {
+			cw.CancelWrite(code)
+			return true
+		}
+		unwrapper, ok := curr.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		curr = unwrapper.Unwrap()
+	}
+	return false
 }
 
 // registerConnection holds onto conn so it can be closed in the event
