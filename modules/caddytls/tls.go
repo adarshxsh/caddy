@@ -466,10 +466,16 @@ func (t *TLS) Start() error {
 func (t *TLS) Stop() error {
 	// stop the storage cleaner goroutine and ticker
 	if t.storageCleanStop != nil {
-		close(t.storageCleanStop)
+		select {
+		case <-t.storageCleanStop:
+		default:
+			close(t.storageCleanStop)
+		}
+		t.storageCleanStop = nil
 	}
 	if t.storageCleanTicker != nil {
 		t.storageCleanTicker.Stop()
+		t.storageCleanTicker = nil
 	}
 	return nil
 }
