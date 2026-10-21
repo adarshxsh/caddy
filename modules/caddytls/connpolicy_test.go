@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -360,4 +361,58 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+type testSTEKProvider struct {
+	initialKeys [][32]byte
+	keysChan    chan [][32]byte
+}
+
+func (p *testSTEKProvider) Initialize(config *SessionTicketService) ([][32]byte, error) {
+	return p.initialKeys, nil
+}
+
+func (p *testSTEKProvider) Next(doneChan <-chan struct{}) <-chan [][32]byte {
+	return p.keysChan
+}
+
+func TestSessionTicketServiceRegistration(t *testing.T) {
+	var key1, key2 [32]byte
+	key1[0] = 1
+	key2[0] = 2
+
+	stekChan := make(chan [][32]byte, 1)
+	provider := &testSTEKProvider{
+		initialKeys: [][32]byte{key1},
+		keysChan:    stekChan,
+	}
+
+	stekService := &SessionTicketService{
+		MaxKeys: 4,
+	}
+	stekService.SetKeySource(provider)
+	if err := stekService.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	defer stekService.Stop()
+
+	cfg := &tls.Config{}
+	stekService.Register(cfg)
+
+	stekService.mu.Lock()
+	if len(stekService.configs) != 1 {
+		t.Errorf("expected 1 config registered, got %d", len(stekService.configs))
+	}
+	stekService.mu.Unlock()
+
+	stekChan <- [][32]byte{key2, key1}
+	// Give stayUpdated a moment to process key rotation
+	time.Sleep(50 * time.Millisecond)
+
+	stekService.Unregister(cfg)
+	stekService.mu.Lock()
+	if len(stekService.configs) != 0 {
+		t.Errorf("expected 0 configs registered after unregister, got %d", len(stekService.configs))
+	}
+	stekService.mu.Unlock()
 }

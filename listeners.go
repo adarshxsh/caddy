@@ -460,7 +460,14 @@ func (na NetworkAddress) ListenQUIC(ctx context.Context, portOffset uint, config
 		}
 
 		sqs := newSharedQUICState(tlsConf)
-		// http3.ConfigureTLSConfig only uses this field and tls App sets this field as well
+		// http3.ConfigureTLSConfig only uses this field and tls App sets this field as well.
+		// QUIC listeners delegate ClientHello evaluation to the active TLS config (sqs.activeTlsConf),
+		// which delegates to active connection policies (connpolicy.go).
+		// Connection policy configurations register their underlying tls.Config instances with
+		// SessionTicketService, so session ticket encryption keys (STEKs) are rotated directly on
+		// those configurations. Incoming QUIC handshakes dynamically query these connection policy
+		// configurations per ClientHello, inheriting updated ticket keys for 0-RTT session resumption
+		// without requiring wrapper tls.Config objects to register with SessionTicketService or listener restarts.
 		//nolint:gosec
 		quicTlsConfig := &tls.Config{
 			GetConfigForClient:          sqs.getConfigForClient,
@@ -536,7 +543,12 @@ func newSharedQUICState(tlsConfig *tls.Config) *sharedQUICState {
 	return sqtc
 }
 
-// getConfigForClient is used as tls.Config's GetConfigForClient field
+// getConfigForClient is used as tls.Config's GetConfigForClient field.
+// It delegates ClientHello evaluation to activeTlsConf.GetConfigForClient(ch), which evaluates
+// registered connection policies and returns the matching policy's tls.Config. Because SessionTicketService
+// updates session ticket encryption keys (STEKs) directly on those connection policy configurations during
+// key rotation events, QUIC handshakes dynamically receive updated session ticket keys without requiring
+// QUIC transport listener wrappers to be registered directly with SessionTicketService.
 func (sqs *sharedQUICState) getConfigForClient(ch *tls.ClientHelloInfo) (*tls.Config, error) {
 	sqs.rmu.RLock()
 	defer sqs.rmu.RUnlock()
