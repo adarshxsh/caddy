@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -360,4 +361,119 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetEncryptedClientHelloKeys_ConcurrentRotation(t *testing.T) {
+	cfg := &caddy.Config{
+		AppsRaw: map[string]json.RawMessage{
+			"tls": []byte(`{}`),
+		},
+	}
+	ctx, err := caddy.ProvisionContext(cfg)
+	if err != nil {
+		t.Fatalf("ProvisionContext failed: %v", err)
+	}
+
+	tlsAppIface, err := ctx.AppIfConfigured("tls")
+	if err != nil {
+		t.Fatalf("AppIfConfigured('tls') failed: %v", err)
+	}
+	tlsApp := tlsAppIface.(*TLS)
+
+	ech := &ECH{
+		configsMu: new(sync.RWMutex),
+		configs: map[string][]echConfig{
+			"public.example.com": {
+				{
+					configBin:  []byte("config1"),
+					privKeyBin: []byte("key1"),
+				},
+			},
+		},
+	}
+
+	tlsApp.EncryptedClientHello = ech
+
+	policies := ConnectionPolicies{&ConnectionPolicy{}}
+	tlsCfg := policies.TLSConfig(ctx)
+
+	if tlsCfg.GetEncryptedClientHelloKeys == nil {
+		t.Fatal("expected GetEncryptedClientHelloKeys callback to be set on tls.Config")
+	}
+
+	t.Run("nil_stdlibReady", func(t *testing.T) {
+		ech.configsMu.Lock()
+		ech.stdlibReady = nil
+		ech.configsMu.Unlock()
+
+		keys, kErr := tlsCfg.GetEncryptedClientHelloKeys(&tls.ClientHelloInfo{})
+		if kErr != nil {
+			t.Fatalf("unexpected error: %v", kErr)
+		}
+		if keys != nil {
+			t.Fatalf("expected nil keys for nil stdlibReady, got %v", keys)
+		}
+	})
+
+	t.Run("empty_stdlibReady", func(t *testing.T) {
+		ech.configsMu.Lock()
+		ech.stdlibReady = []tls.EncryptedClientHelloKey{}
+		ech.configsMu.Unlock()
+
+		keys, kErr := tlsCfg.GetEncryptedClientHelloKeys(&tls.ClientHelloInfo{})
+		if kErr != nil {
+			t.Fatalf("unexpected error: %v", kErr)
+		}
+		if keys == nil || len(keys) != 0 {
+			t.Fatalf("expected empty non-nil slice, got %v", keys)
+		}
+	})
+
+	t.Run("concurrent_rotation", func(t *testing.T) {
+		ech.configsMu.Lock()
+		ech.updateKeyList()
+		ech.configsMu.Unlock()
+
+		// Verify initial keys
+		keys, kErr := tlsCfg.GetEncryptedClientHelloKeys(&tls.ClientHelloInfo{})
+		if kErr != nil {
+			t.Fatalf("GetEncryptedClientHelloKeys failed: %v", kErr)
+		}
+		if len(keys) != 1 {
+			t.Fatalf("expected 1 ECH key, got %d", len(keys))
+		}
+
+		// Verify concurrent access does not produce data races
+		var wg sync.WaitGroup
+		const iterations = 500
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				kList, err := tlsCfg.GetEncryptedClientHelloKeys(&tls.ClientHelloInfo{})
+				if err != nil {
+					t.Errorf("GetEncryptedClientHelloKeys error: %v", err)
+					return
+				}
+				for _, k := range kList {
+					_ = len(k.Config)
+					_ = len(k.PrivateKey)
+					_ = k.SendAsRetry
+				}
+			}
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				ech.configsMu.Lock()
+				ech.updateKeyList()
+				ech.configsMu.Unlock()
+			}
+		}()
+
+		wg.Wait()
+	})
 }
