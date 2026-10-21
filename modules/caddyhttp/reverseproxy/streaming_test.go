@@ -74,6 +74,50 @@ func TestSwitchProtocolCopierDefaultBufferSize(t *testing.T) {
 	}
 }
 
+func TestNewMaskKey(t *testing.T) {
+	keys := make(map[[4]byte]bool)
+	const numIterations = 100
+
+	for i := 0; i < numIterations; i++ {
+		key := newMaskKey()
+		if len(key) != 4 {
+			t.Fatalf("expected 4-byte mask key, got %d bytes", len(key))
+		}
+		keys[key] = true
+	}
+
+	// Out of 100 random 4-byte keys, we should have generated multiple unique keys.
+	if len(keys) < numIterations/2 {
+		t.Fatalf("expected high randomness in mask keys, but got only %d unique keys out of %d", len(keys), numIterations)
+	}
+}
+
+func TestWriteCloseControl(t *testing.T) {
+	t.Run("client mode with masking", func(t *testing.T) {
+		var buf bytes.Buffer
+		err := writeCloseControl(&buf, true)
+		if err != nil {
+			t.Fatalf("writeCloseControl failed: %v", err)
+		}
+		// Close frame length when masked: 2 bytes header + 4 bytes mask key + 2 bytes status code = 8 bytes
+		if buf.Len() != 8 {
+			t.Fatalf("expected buffer length 8, got %d", buf.Len())
+		}
+	})
+
+	t.Run("server mode without masking", func(t *testing.T) {
+		var buf bytes.Buffer
+		err := writeCloseControl(&buf, false)
+		if err != nil {
+			t.Fatalf("writeCloseControl failed: %v", err)
+		}
+		// Close frame length unmasked: 2 bytes header + 2 bytes status code = 4 bytes
+		if buf.Len() != 4 {
+			t.Fatalf("expected buffer length 4, got %d", buf.Len())
+		}
+	})
+}
+
 type nopReadWriteCloser struct {
 	io.Reader
 	io.Writer
