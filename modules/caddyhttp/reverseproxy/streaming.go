@@ -171,11 +171,14 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		return
 	}
 
+	syncFront := &syncWriterConn{ReadWriteCloser: conn}
+	syncBack := &syncWriterConn{ReadWriteCloser: backConn}
+
 	// There may be buffered data in the *bufio.Reader
 	// see: https://github.com/caddyserver/caddy/issues/6273
 	if buffered := brw.Reader.Buffered(); buffered > 0 {
 		data, _ := brw.Peek(buffered)
-		_, err := backConn.Write(data)
+		_, err := syncBack.Write(data)
 		if err != nil {
 			if c := logger.Check(zapcore.DebugLevel, "backConn write failed"); c != nil {
 				c.Write(zap.Error(err))
@@ -199,14 +202,14 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 		return nil
 	}
-	deleteFrontConn := h.registerConnection(conn, gracefulClose(conn, false))
-	deleteBackConn := h.registerConnection(backConn, gracefulClose(backConn, true))
+	deleteFrontConn := h.registerConnection(syncFront, gracefulClose(syncFront, false))
+	deleteBackConn := h.registerConnection(syncBack, gracefulClose(syncBack, true))
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
+		user:       syncFront,
+		backend:    syncBack,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
 	}
@@ -679,3 +682,18 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+// syncWriterConn wraps an io.ReadWriteCloser with a mutex to serialize Write operations.
+// This prevents concurrent write races on the socket (e.g. between io.CopyBuffer
+// streaming and writeCloseControl during connection shutdown) while leaving Read
+// operations unblocked.
+type syncWriterConn struct {
+	io.ReadWriteCloser
+	mu sync.Mutex
+}
+
+func (s *syncWriterConn) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ReadWriteCloser.Write(p)
+}

@@ -3,6 +3,7 @@ package reverseproxy
 import (
 	"bytes"
 	"io"
+	"net"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -80,3 +81,134 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestSyncWriterConn(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+
+	conn := &syncWriterConn{ReadWriteCloser: nopReadWriteCloser{Reader: pr, Writer: pw}}
+
+	const goroutines = 10
+	const writesPerGoroutine = 50
+	var wg sync.WaitGroup
+
+	// Drain reader concurrently
+	readDone := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			_, err := conn.Read(buf)
+			if err != nil {
+				break
+			}
+		}
+		close(readDone)
+	}()
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < writesPerGoroutine; j++ {
+				_, err := conn.Write([]byte("test-data"))
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	pw.Close()
+	<-readDone
+}
+
+func TestConcurrentCloseAndStream(t *testing.T) {
+	uProxy, uClient := net.Pipe()
+	bProxy, bBackend := net.Pipe()
+
+	syncUser := &syncWriterConn{ReadWriteCloser: uProxy}
+	syncBack := &syncWriterConn{ReadWriteCloser: bProxy}
+
+	var wg sync.WaitGroup
+	errc := make(chan error, 2)
+
+	spc := switchProtocolCopier{
+		user:       syncUser,
+		backend:    syncBack,
+		wg:         &wg,
+		bufferSize: 64,
+	}
+
+	wg.Add(2)
+	go spc.copyToBackend(errc)
+	go spc.copyFromBackend(errc)
+
+	// Mock client goroutine: sending data and reading data
+	var mockWg sync.WaitGroup
+	mockWg.Add(2)
+	go func() {
+		defer mockWg.Done()
+		for i := 0; i < 20; i++ {
+			_, err := uClient.Write([]byte("hello from client"))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer mockWg.Done()
+		buf := make([]byte, 512)
+		for {
+			_, err := uClient.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Mock backend goroutine: sending data and reading data
+	mockWg.Add(2)
+	go func() {
+		defer mockWg.Done()
+		for i := 0; i < 20; i++ {
+			_, err := bBackend.Write([]byte("hello from backend"))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer mockWg.Done()
+		buf := make([]byte, 512)
+		for {
+			_, err := bBackend.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Concurrently invoke writeCloseControl while streaming
+	var closeWg sync.WaitGroup
+	closeWg.Add(2)
+	go func() {
+		defer closeWg.Done()
+		_ = writeCloseControl(syncUser, false)
+	}()
+	go func() {
+		defer closeWg.Done()
+		_ = writeCloseControl(syncBack, true)
+	}()
+
+	closeWg.Wait()
+
+	_ = uClient.Close()
+	_ = bBackend.Close()
+	_ = uProxy.Close()
+	_ = bProxy.Close()
+
+	mockWg.Wait()
+	wg.Wait()
+}
