@@ -28,6 +28,7 @@ import (
 	"mime"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -204,19 +205,61 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
-	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         wg,
-		bufferSize: h.StreamBufferSize,
-	}
+	userConn := conn
+	backConnConn := backConn
 
 	// setup the timeout if requested
 	var timeoutc <-chan time.Time
+	donec := make(chan struct{})
+	defer close(donec)
+
 	if h.StreamTimeout > 0 {
-		timer := time.NewTimer(time.Duration(h.StreamTimeout))
-		defer timer.Stop()
-		timeoutc = timer.C
+		var lastActivity atomic.Int64
+		lastActivity.Store(time.Now().UnixNano())
+
+		recordActivity := func() {
+			lastActivity.Store(time.Now().UnixNano())
+		}
+		userConn = &activityRWC{ReadWriteCloser: conn, onActivity: recordActivity}
+		backConnConn = &activityRWC{ReadWriteCloser: backConn, onActivity: recordActivity}
+
+		streamTimeout := time.Duration(h.StreamTimeout)
+		toCh := make(chan time.Time, 1)
+		timeoutc = toCh
+
+		go func() {
+			timer := time.NewTimer(streamTimeout)
+			defer timer.Stop()
+
+			for {
+				select {
+				case t := <-timer.C:
+					last := time.Unix(0, lastActivity.Load())
+					elapsed := t.Sub(last)
+					if elapsed >= streamTimeout {
+						select {
+						case toCh <- t:
+						default:
+						}
+						return
+					}
+					remaining := streamTimeout - elapsed
+					if remaining > streamTimeout || remaining <= 0 {
+						remaining = streamTimeout
+					}
+					timer.Reset(remaining)
+				case <-donec:
+					return
+				}
+			}
+		}()
+	}
+
+	spc := switchProtocolCopier{
+		user:       userConn,
+		backend:    backConnConn,
+		wg:         wg,
+		bufferSize: h.StreamBufferSize,
 	}
 
 	// when a stream timeout is encountered, no error will be read from errc
@@ -565,6 +608,27 @@ func newMaskKey() [4]byte {
 func isWebsocket(r *http.Request) bool {
 	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	onActivity func()
+}
+
+func (a *activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
+}
+
+func (a *activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
 }
 
 // openConnection maps an open connection to
