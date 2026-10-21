@@ -2,13 +2,16 @@ package reverseproxy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func TestHandlerCopyResponse(t *testing.T) {
@@ -80,3 +83,122 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+type mockDeadlineReadWriteCloser struct {
+	io.Reader
+	buf          bytes.Buffer
+	mu           sync.Mutex
+	deadlines    []time.Time
+	writeErr     error
+	blockOnWrite bool
+}
+
+func (m *mockDeadlineReadWriteCloser) SetWriteDeadline(t time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deadlines = append(m.deadlines, t)
+	return nil
+}
+
+func (m *mockDeadlineReadWriteCloser) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	if m.writeErr != nil {
+		err := m.writeErr
+		m.mu.Unlock()
+		return 0, err
+	}
+	m.mu.Unlock()
+
+	if m.blockOnWrite {
+		return 0, context.DeadlineExceeded
+	}
+	return m.buf.Write(p)
+}
+
+func (m *mockDeadlineReadWriteCloser) Close() error { return nil }
+
+func TestSwitchProtocolCopierWriteDeadline(t *testing.T) {
+	var wg sync.WaitGroup
+	errc := make(chan error, 1)
+
+	userConn := &mockDeadlineReadWriteCloser{
+		Reader: strings.NewReader(""),
+	}
+	backendConn := &mockDeadlineReadWriteCloser{
+		Reader: strings.NewReader("hello from backend"),
+	}
+
+	copier := switchProtocolCopier{
+		user:         userConn,
+		backend:      backendConn,
+		wg:           &wg,
+		writeTimeout: 5 * time.Second,
+	}
+
+	wg.Add(1)
+	go copier.copyFromBackend(errc)
+	wg.Wait()
+
+	if err := <-errc; err != nil {
+		t.Fatalf("copyFromBackend() unexpected error = %v", err)
+	}
+
+	if got := userConn.buf.String(); got != "hello from backend" {
+		t.Fatalf("user received = %q, want %q", got, "hello from backend")
+	}
+
+	userConn.mu.Lock()
+	defer userConn.mu.Unlock()
+	if len(userConn.deadlines) == 0 {
+		t.Fatalf("expected SetWriteDeadline to be called, got 0 calls")
+	}
+	// Verify deadline set was non-zero
+	if userConn.deadlines[0].IsZero() {
+		t.Fatalf("expected non-zero write deadline, got zero")
+	}
+}
+
+func TestSwitchProtocolCopierStalledWriteTimeout(t *testing.T) {
+	var wg sync.WaitGroup
+	errc := make(chan error, 1)
+
+	userConn := &mockDeadlineReadWriteCloser{
+		Reader:       strings.NewReader(""),
+		blockOnWrite: true,
+	}
+	backendConn := &mockDeadlineReadWriteCloser{
+		Reader: strings.NewReader("data stream payload"),
+	}
+
+	copier := switchProtocolCopier{
+		user:         userConn,
+		backend:      backendConn,
+		wg:           &wg,
+		writeTimeout: 100 * time.Millisecond,
+	}
+
+	wg.Add(1)
+	go copier.copyFromBackend(errc)
+	wg.Wait()
+
+	err := <-errc
+	if err == nil {
+		t.Fatalf("expected error from stalled write, got nil")
+	}
+}
+
+func TestCaddyfileStreamWriteTimeout(t *testing.T) {
+	input := `reverse_proxy localhost:8080 {
+		stream_write_timeout 10s
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	h := new(Handler)
+	err := h.UnmarshalCaddyfile(d)
+	if err != nil {
+		t.Fatalf("UnmarshalCaddyfile failed: %v", err)
+	}
+	if time.Duration(h.StreamWriteTimeout) != 10*time.Second {
+		t.Fatalf("expected StreamWriteTimeout = 10s, got %v", h.StreamWriteTimeout)
+	}
+}
+
