@@ -634,6 +634,11 @@ func (m *maxLatencyWriter) stop() {
 	if m.t != nil {
 		m.t.Stop()
 	}
+	if m.flush != nil {
+		m.logger.Debug("final flush on stop")
+		//nolint:errcheck
+		m.flush()
+	}
 }
 
 // switchProtocolCopier exists so goroutines proxying data back and
