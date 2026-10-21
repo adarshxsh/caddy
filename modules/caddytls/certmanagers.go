@@ -106,8 +106,6 @@ type HTTPCertGetter struct {
 	// (No Content). Error statuses will indicate that the manager is
 	// capable of providing a certificate but was unable to.
 	URL string `json:"url,omitempty"`
-
-	ctx context.Context
 }
 
 // CaddyModule returns the Caddy module information.
@@ -118,8 +116,7 @@ func (hcg HTTPCertGetter) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (hcg *HTTPCertGetter) Provision(ctx caddy.Context) error {
-	hcg.ctx = ctx
+func (hcg *HTTPCertGetter) Provision(_ caddy.Context) error {
 	if hcg.URL == "" {
 		return fmt.Errorf("URL is required")
 	}
@@ -150,7 +147,7 @@ func (hcg HTTPCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientH
 	}
 	parsed.RawQuery = qs.Encode()
 
-	req, err := http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return nil, err
 	}
