@@ -171,6 +171,10 @@ type Handler struct {
 	// forcibly closed at the end of the timeout. Default: no timeout.
 	StreamTimeout caddy.Duration `json:"stream_timeout,omitempty"`
 
+	// If nonzero, sets write deadlines for streaming requests such as
+	// WebSockets before each write operation. Default: no write timeout.
+	StreamWriteTimeout caddy.Duration `json:"stream_write_timeout,omitempty"`
+
 	// The size of the buffer used for each direction of streaming
 	// requests such as WebSockets. If zero, the default size is 32 KiB.
 	// This only affects upgraded bidirectional streams, not normal

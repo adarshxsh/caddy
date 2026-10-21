@@ -205,10 +205,11 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteBackConn()
 
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         wg,
-		bufferSize: h.StreamBufferSize,
+		user:         conn,
+		backend:      backConn,
+		wg:           wg,
+		bufferSize:   h.StreamBufferSize,
+		writeTimeout: time.Duration(h.StreamWriteTimeout),
 	}
 
 	// setup the timeout if requested
@@ -642,18 +643,48 @@ type switchProtocolCopier struct {
 	user, backend io.ReadWriteCloser
 	wg            *sync.WaitGroup
 	bufferSize    int
+	writeTimeout  time.Duration
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	_, err := io.CopyBuffer(c.writer(c.user), c.backend, c.buffer())
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	_, err := io.CopyBuffer(c.writer(c.backend), c.user, c.buffer())
 	errc <- err
 	c.wg.Done()
+}
+
+func (c switchProtocolCopier) writer(w io.Writer) io.Writer {
+	if c.writeTimeout <= 0 {
+		return w
+	}
+	return writeDeadlineWriter{w: w, writeTimeout: c.writeTimeout}
+}
+
+type deadlineWriter interface {
+	SetWriteDeadline(time.Time) error
+}
+
+type writeDeadlineWriter struct {
+	w            io.Writer
+	writeTimeout time.Duration
+}
+
+func (w writeDeadlineWriter) Write(p []byte) (int, error) {
+	if w.writeTimeout > 0 {
+		if dw, ok := w.w.(deadlineWriter); ok {
+			_ = dw.SetWriteDeadline(time.Now().Add(w.writeTimeout))
+		}
+	}
+	n, err := w.w.Write(p)
+	if dw, ok := w.w.(deadlineWriter); ok {
+		_ = dw.SetWriteDeadline(time.Time{})
+	}
+	return n, err
 }
 
 func (c switchProtocolCopier) buffer() []byte {
