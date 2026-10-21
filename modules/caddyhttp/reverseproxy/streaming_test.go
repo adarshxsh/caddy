@@ -7,8 +7,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
 )
 
 func TestHandlerCopyResponse(t *testing.T) {
@@ -80,3 +82,75 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestMaxLatencyWriterStopFlushes(t *testing.T) {
+	var flushCount int
+	dst := &bytes.Buffer{}
+	mlw := &maxLatencyWriter{
+		dst: dst,
+		flush: func() error {
+			flushCount++
+			return nil
+		},
+		latency: 1 * time.Hour,
+		logger:  zap.NewNop(),
+	}
+
+	n, err := mlw.Write([]byte("hello trailing bytes"))
+	if err != nil {
+		t.Fatalf("unexpected Write error: %v", err)
+	}
+	if n != 20 {
+		t.Fatalf("expected 20 bytes written, got %d", n)
+	}
+
+	if flushCount != 0 {
+		t.Fatalf("expected 0 flushes before stop, got %d", flushCount)
+	}
+
+	mlw.stop()
+
+	if flushCount != 1 {
+		t.Fatalf("expected 1 flush after stop, got %d", flushCount)
+	}
+}
+
+func TestHandlerCopyResponseWithFlushInterval(t *testing.T) {
+	h := Handler{}
+	src := strings.NewReader("response body payload")
+
+	flushed := false
+	recorder := httptest.NewRecorder()
+	fw := &flushTrackingResponseWriter{
+		ResponseRecorder: recorder,
+		onFlush: func() {
+			flushed = true
+		},
+	}
+
+	err := h.copyResponse(fw, src, 10*time.Minute, zap.NewNop())
+	if err != nil {
+		t.Fatalf("copyResponse failed: %v", err)
+	}
+
+	if recorder.Body.String() != "response body payload" {
+		t.Fatalf("unexpected body: %q", recorder.Body.String())
+	}
+
+	if !flushed {
+		t.Fatalf("expected flush to be called on stop when response copy finishes")
+	}
+}
+
+type flushTrackingResponseWriter struct {
+	*httptest.ResponseRecorder
+	onFlush func()
+}
+
+func (w *flushTrackingResponseWriter) Flush() {
+	if w.onFlush != nil {
+		w.onFlush()
+	}
+	w.ResponseRecorder.Flush()
+}
+
