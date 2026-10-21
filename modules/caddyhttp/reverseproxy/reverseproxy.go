@@ -186,6 +186,10 @@ type Handler struct {
 	// by the previous config closing. Default: no delay.
 	StreamCloseDelay caddy.Duration `json:"stream_close_delay,omitempty"`
 
+	// The interval between keepalive ping frames sent to quiet upgraded
+	// WebSocket streams. Default: 0 (keepalives disabled).
+	StreamKeepaliveInterval caddy.Duration `json:"stream_keepalive_interval,omitempty"`
+
 	// If configured, rewrites the copy of the upstream request.
 	// Allows changing the request method and URI (path and query).
 	// Since the rewrite is applied to the copy, it does not persist

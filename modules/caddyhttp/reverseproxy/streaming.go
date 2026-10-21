@@ -28,6 +28,7 @@ import (
 	"mime"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -205,10 +206,20 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteBackConn()
 
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         wg,
-		bufferSize: h.StreamBufferSize,
+		user:              conn,
+		backend:           backConn,
+		userWriter:        newSyncWriter(conn),
+		backendWriter:     newSyncWriter(backConn),
+		wg:                wg,
+		bufferSize:        h.StreamBufferSize,
+		keepaliveInterval: time.Duration(h.StreamKeepaliveInterval),
+		isWebsocket:       isWebsocket(req),
+	}
+
+	if spc.isWebsocket && spc.keepaliveInterval > 0 {
+		keepaliveDone := make(chan struct{})
+		defer close(keepaliveDone)
+		go spc.startKeepalive(keepaliveDone)
 	}
 
 	// setup the timeout if requested
@@ -510,6 +521,48 @@ func writeCloseControl(conn io.Writer, isClient bool) error {
 	return err
 }
 
+// writePingControl sends an RFC 6455 Ping control message (opcode 0x9) to the given
+// WebSocket connection. If isClient is true, the payload (if any) and frame header
+// are masked according to RFC 6455 client masking rules.
+func writePingControl(conn io.Writer, isClient bool, payload []byte) error {
+	if len(payload) > 125 {
+		payload = payload[:125]
+	}
+	const pingMessage = 9
+	const finalBit = 1 << 7
+	const maskBit = 1 << 7
+
+	b0 := byte(pingMessage) | finalBit
+	b1 := byte(len(payload))
+
+	if dw, ok := conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = dw.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		defer func() {
+			_ = dw.SetWriteDeadline(time.Time{})
+		}()
+	}
+
+	if isClient {
+		b1 |= maskBit
+		key := newMaskKey()
+		buf := make([]byte, 0, 2+4+len(payload))
+		buf = append(buf, b0, b1, key[0], key[1], key[2], key[3])
+		payloadStart := len(buf)
+		buf = append(buf, payload...)
+		if len(payload) > 0 {
+			maskBytes(key, 0, buf[payloadStart:])
+		}
+		_, err := conn.Write(buf)
+		return err
+	}
+
+	buf := make([]byte, 0, 2+len(payload))
+	buf = append(buf, b0, b1)
+	buf = append(buf, payload...)
+	_, err := conn.Write(buf)
+	return err
+}
+
 // Copied from https://github.com/gorilla/websocket/blob/v1.5.0/mask.go
 func maskBytes(key [4]byte, pos int, b []byte) int {
 	// Mask one byte at a time for small buffers.
@@ -636,24 +689,96 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+type syncWriter struct {
+	w         io.Writer
+	mu        sync.Mutex
+	lastWrite atomic.Int64 // unix nano timestamp
+}
+
+func newSyncWriter(w io.Writer) *syncWriter {
+	sw := &syncWriter{w: w}
+	sw.lastWrite.Store(time.Now().UnixNano())
+	return sw
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, err := s.w.Write(p)
+	if n > 0 {
+		s.lastWrite.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (s *syncWriter) SetWriteDeadline(t time.Time) error {
+	if dw, ok := s.w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return dw.SetWriteDeadline(t)
+	}
+	return nil
+}
+
+func (s *syncWriter) getLastWrite() time.Time {
+	return time.Unix(0, s.lastWrite.Load())
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
-	user, backend io.ReadWriteCloser
-	wg            *sync.WaitGroup
-	bufferSize    int
+	user, backend     io.ReadWriteCloser
+	userWriter        *syncWriter
+	backendWriter     *syncWriter
+	wg                *sync.WaitGroup
+	bufferSize        int
+	keepaliveInterval time.Duration
+	isWebsocket       bool
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	w := io.Writer(c.user)
+	if c.userWriter != nil {
+		w = c.userWriter
+	}
+	_, err := io.CopyBuffer(w, c.backend, c.buffer())
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	w := io.Writer(c.backend)
+	if c.backendWriter != nil {
+		w = c.backendWriter
+	}
+	_, err := io.CopyBuffer(w, c.user, c.buffer())
 	errc <- err
 	c.wg.Done()
+}
+
+func (c switchProtocolCopier) startKeepalive(done <-chan struct{}) {
+	ticker := time.NewTicker(c.keepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			if c.userWriter != nil && now.Sub(c.userWriter.getLastWrite()) >= c.keepaliveInterval {
+				if err := writePingControl(c.userWriter, false, nil); err != nil {
+					_ = c.user.Close()
+					_ = c.backend.Close()
+					return
+				}
+			}
+			if c.backendWriter != nil && now.Sub(c.backendWriter.getLastWrite()) >= c.keepaliveInterval {
+				if err := writePingControl(c.backendWriter, true, nil); err != nil {
+					_ = c.user.Close()
+					_ = c.backend.Close()
+					return
+				}
+			}
+		case <-done:
+			return
+		}
+	}
 }
 
 func (c switchProtocolCopier) buffer() []byte {
