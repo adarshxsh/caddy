@@ -226,14 +226,25 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errc:
+			if err != nil {
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				return
+			}
+		case time := <-timeoutc:
+			if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", time))
+			}
+			return
+		case <-req.Context().Done():
+			if c := logger.Check(zapcore.DebugLevel, "request context canceled"); c != nil {
+				c.Write(zap.Error(req.Context().Err()))
+			}
+			return
 		}
 	}
 }
@@ -644,14 +655,28 @@ type switchProtocolCopier struct {
 	bufferSize    int
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	if err == nil {
+		if cw, ok := c.user.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	if err == nil {
+		if cw, ok := c.backend.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	errc <- err
 	c.wg.Done()
 }
