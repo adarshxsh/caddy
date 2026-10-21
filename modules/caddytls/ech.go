@@ -356,16 +356,16 @@ func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
 		if publication.Configs == nil {
 			// by default, publish all configs
 			for _, configs := range t.EncryptedClientHello.configs {
-				echCfgList = append(echCfgList, configs...)
 				for _, c := range configs {
+					echCfgList = append(echCfgList, c.clone())
 					configIDs = append(configIDs, c.ConfigID)
 				}
 			}
 		} else {
 			for _, cfgOuterName := range publication.Configs {
 				if cfgList, ok := t.EncryptedClientHello.configs[cfgOuterName]; ok {
-					echCfgList = append(echCfgList, cfgList...)
 					for _, c := range cfgList {
+						echCfgList = append(echCfgList, c.clone())
 						configIDs = append(configIDs, c.ConfigID)
 					}
 				}
@@ -488,7 +488,9 @@ func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
 					zap.Strings("domains", successNames),
 					zap.Uint8s("config_ids", configIDs))
 
-				for _, cfg := range echCfgList {
+				t.EncryptedClientHello.configsMu.Lock()
+				for i := range echCfgList {
+					cfg := &echCfgList[i]
 					if cfg.meta.Publications == nil {
 						cfg.meta.Publications = make(publicationHistory)
 					}
@@ -498,14 +500,46 @@ func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
 					for _, name := range successNames {
 						cfg.meta.Publications[publisherKey][name] = pubTime
 					}
-					metaBytes, err := json.Marshal(cfg.meta)
+
+					// find matching target config in t.EncryptedClientHello.configs
+					var target *echConfig
+					for _, cfgs := range t.EncryptedClientHello.configs {
+						for j := range cfgs {
+							if cfgs[j].ConfigID == cfg.ConfigID {
+								target = &cfgs[j]
+								break
+							}
+						}
+						if target != nil {
+							break
+						}
+					}
+					if target == nil {
+						// config was rotated out during background publication; skip
+						continue
+					}
+
+					if target.meta.Publications == nil {
+						target.meta.Publications = make(publicationHistory)
+					}
+					if _, ok := target.meta.Publications[publisherKey]; !ok {
+						target.meta.Publications[publisherKey] = make(map[string]time.Time)
+					}
+					for _, name := range successNames {
+						target.meta.Publications[publisherKey][name] = pubTime
+					}
+
+					metaBytes, err := json.Marshal(target.meta)
 					if err != nil {
+						t.EncryptedClientHello.configsMu.Unlock()
 						return fmt.Errorf("marshaling ECH config metadata: %v", err)
 					}
-					if err := t.ctx.Storage().Store(t.ctx, echMetaKey(cfg.ConfigID), metaBytes); err != nil {
+					if err := t.ctx.Storage().Store(t.ctx, echMetaKey(target.ConfigID), metaBytes); err != nil {
+						t.EncryptedClientHello.configsMu.Unlock()
 						return fmt.Errorf("storing updated ECH config metadata: %v", err)
 					}
 				}
+				t.EncryptedClientHello.configsMu.Unlock()
 			} else {
 				logger.Error("all domains failed to publish ECH configuration list (see earlier errors)",
 					zap.String("publisher", publisherKey),
@@ -953,6 +987,24 @@ type echConfig struct {
 	meta       echConfigMeta
 }
 
+func (c echConfig) clone() echConfig {
+	c2 := c
+	if c.CipherSuites != nil {
+		c2.CipherSuites = append([]hpkeSymmetricCipherSuite(nil), c.CipherSuites...)
+	}
+	if c.RawExtensions != nil {
+		c2.RawExtensions = append([]byte(nil), c.RawExtensions...)
+	}
+	if c.configBin != nil {
+		c2.configBin = append([]byte(nil), c.configBin...)
+	}
+	if c.privKeyBin != nil {
+		c2.privKeyBin = append([]byte(nil), c.privKeyBin...)
+	}
+	c2.meta = c.meta.clone()
+	return c2
+}
+
 func (echCfg echConfig) MarshalBinary() ([]byte, error) {
 	var b cryptobyte.Builder
 	if err := echCfg.marshalBinary(&b); err != nil {
@@ -1187,6 +1239,12 @@ type echConfigMeta struct {
 	Publications publicationHistory `json:"publications"`
 }
 
+func (m echConfigMeta) clone() echConfigMeta {
+	m2 := m
+	m2.Publications = m.Publications.clone()
+	return m2
+}
+
 func echMetaKey(configID uint8) string {
 	return path.Join(echConfigsKey, strconv.Itoa(int(configID)), "meta.json")
 }
@@ -1194,6 +1252,25 @@ func echMetaKey(configID uint8) string {
 // publicationHistory is a map of publisher key to
 // map of inner name to timestamp
 type publicationHistory map[string]map[string]time.Time
+
+func (p publicationHistory) clone() publicationHistory {
+	if p == nil {
+		return nil
+	}
+	p2 := make(publicationHistory, len(p))
+	for k, v := range p {
+		if v == nil {
+			p2[k] = nil
+			continue
+		}
+		v2 := make(map[string]time.Time, len(v))
+		for k2, v2Val := range v {
+			v2[k2] = v2Val
+		}
+		p2[k] = v2
+	}
+	return p2
+}
 
 // echStorageLockName is the name of the storage lock to sync ECH updates.
 const echStorageLockName = "ech_rotation"
