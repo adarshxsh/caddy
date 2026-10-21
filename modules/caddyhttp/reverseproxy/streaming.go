@@ -40,21 +40,44 @@ import (
 
 type h2ReadWriteCloser struct {
 	io.ReadCloser
-	http.ResponseWriter
+	rw      http.ResponseWriter
+	flusher *maxLatencyWriter
 }
 
 func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
-	n, err = rwc.ResponseWriter.Write(p)
-	if err != nil {
-		return 0, err
+	if rwc.flusher != nil {
+		return rwc.flusher.Write(p)
 	}
+	if rwc.rw != nil {
+		return rwc.rw.Write(p)
+	}
+	return 0, io.ErrClosedPipe
+}
 
-	//nolint:bodyclose
-	err = http.NewResponseController(rwc.ResponseWriter).Flush()
-	if err != nil {
-		return 0, err
+func (rwc h2ReadWriteCloser) Flush() error {
+	if rwc.flusher != nil {
+		return rwc.flusher.Flush()
 	}
-	return n, nil
+	if rwc.rw != nil {
+		//nolint:bodyclose
+		return http.NewResponseController(rwc.rw).Flush()
+	}
+	return nil
+}
+
+func (rwc h2ReadWriteCloser) Close() error {
+	if rwc.flusher != nil {
+		_ = rwc.flusher.Flush()
+		rwc.flusher.stop()
+	}
+	if rwc.ReadCloser != nil {
+		return rwc.ReadCloser.Close()
+	}
+	return nil
+}
+
+func (rwc h2ReadWriteCloser) Unwrap() http.ResponseWriter {
+	return rwc.rw
 }
 
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
@@ -115,7 +138,32 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			}
 			return
 		}
-		conn = h2ReadWriteCloser{req.Body, rw}
+
+		flushInterval := time.Duration(h.FlushInterval)
+		if flushInterval == 0 {
+			flushInterval = 250 * time.Microsecond
+		}
+
+		var mlwLogger *zap.Logger
+		if h.VerboseLogs {
+			mlwLogger = logger.Named("max_latency_writer")
+		} else {
+			mlwLogger = zap.NewNop()
+		}
+
+		mlw := &maxLatencyWriter{
+			dst: rw,
+			//nolint:bodyclose
+			flush:   http.NewResponseController(rw).Flush,
+			latency: flushInterval,
+			logger:  mlwLogger,
+		}
+
+		conn = h2ReadWriteCloser{
+			ReadCloser: req.Body,
+			rw:         rw,
+			flusher:    mlw,
+		}
 		// bufio is not needed, use minimal buffer
 		brw = bufio.NewReadWriter(bufio.NewReaderSize(conn, 1), bufio.NewWriterSize(conn, 1))
 	} else {
@@ -634,6 +682,19 @@ func (m *maxLatencyWriter) stop() {
 	if m.t != nil {
 		m.t.Stop()
 	}
+}
+
+func (m *maxLatencyWriter) Flush() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.flushPending = false
+	if m.t != nil {
+		m.t.Stop()
+	}
+	if m.flush != nil {
+		return m.flush()
+	}
+	return nil
 }
 
 // switchProtocolCopier exists so goroutines proxying data back and
