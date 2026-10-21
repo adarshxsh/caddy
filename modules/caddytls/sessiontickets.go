@@ -193,24 +193,24 @@ func (s SessionTicketService) RotateSTEKs(keys [][32]byte) ([][32]byte, error) {
 		return nil, fmt.Errorf("generating STEK: %v", err)
 	}
 
-	// we need to prepend this new key to the list of
-	// keys so that it is preferred, but we need to be
-	// careful that we do not grow the slice larger
-	// than MaxKeys, otherwise we'll be storing one
-	// more key in memory than we expect; so be sure
-	// that the slice does not grow beyond the limit
-	// even for a brief period of time, since there's
-	// no guarantee when that extra allocation will
-	// be overwritten; this is why we first trim the
-	// length to one less the max, THEN prepend the
-	// new key
-	if len(keys) >= s.MaxKeys {
-		keys[len(keys)-1] = [32]byte{} // zero-out memory of oldest key
-		keys = keys[:s.MaxKeys-1]      // trim length of slice
+	maxKeys := s.MaxKeys
+	if maxKeys <= 0 {
+		maxKeys = defaultMaxSTEKs
 	}
-	keys = append([][32]byte{newKey}, keys...) // prepend new key
 
-	return keys, nil
+	trimmedLen := len(keys)
+	if trimmedLen >= maxKeys {
+		trimmedLen = maxKeys - 1
+	}
+	if trimmedLen < 0 {
+		trimmedLen = 0
+	}
+
+	newKeys := make([][32]byte, 1+trimmedLen)
+	newKeys[0] = newKey
+	copy(newKeys[1:], keys[:trimmedLen])
+
+	return newKeys, nil
 }
 
 // generateSTEK generates key material suitable for use as a
