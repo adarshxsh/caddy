@@ -15,9 +15,22 @@
 package caddy
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"io"
+	"math/big"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/quic-go/quic-go"
 
 	"github.com/caddyserver/caddy/v2/internal"
 )
@@ -709,4 +722,267 @@ func TestSplitUnixSocketPermissionsBits(t *testing.T) {
 			t.Errorf("Test %d: Expected perms '%s' but got '%s'", i, tc.expectFileMode, actualFileMode.Perm().String())
 		}
 	}
+}
+
+// mockSessionTicketService simulates SessionTicketService key rotation across registered connection policy tls.Configs.
+type mockSessionTicketService struct {
+	mu      sync.Mutex
+	configs map[*tls.Config]struct{}
+}
+
+func newMockSessionTicketService() *mockSessionTicketService {
+	return &mockSessionTicketService{
+		configs: make(map[*tls.Config]struct{}),
+	}
+}
+
+func (s *mockSessionTicketService) Register(cfg *tls.Config, initialKeys [][32]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg.SetSessionTicketKeys(initialKeys)
+	s.configs[cfg] = struct{}{}
+}
+
+func (s *mockSessionTicketService) RotateKeys(newKeys [][32]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for cfg := range s.configs {
+		cfg.SetSessionTicketKeys(newKeys)
+	}
+}
+
+func generateTestCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating private key: %v", err)
+	}
+
+	notBefore := time.Now().Add(-1 * time.Hour)
+	notAfter := time.Now().Add(24 * time.Hour)
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		t.Fatalf("generating serial number: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"Caddy Test"},
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("creating certificate: %v", err)
+	}
+
+	cert, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		t.Fatalf("parsing certificate: %v", err)
+	}
+
+	certPool := x509.NewCertPool()
+	certPool.AddCert(cert)
+
+	tlsCert := tls.Certificate{
+		Certificate: [][]byte{derBytes},
+		PrivateKey:  priv,
+	}
+
+	return tlsCert, certPool
+}
+
+func TestQUICListenerSessionTicketRotation(t *testing.T) {
+	tlsCert, certPool := generateTestCert(t)
+
+	var key1, key2, key3 [32]byte
+	if _, err := rand.Read(key1[:]); err != nil {
+		t.Fatalf("key1: %v", err)
+	}
+	if _, err := rand.Read(key2[:]); err != nil {
+		t.Fatalf("key2: %v", err)
+	}
+	if _, err := rand.Read(key3[:]); err != nil {
+		t.Fatalf("key3: %v", err)
+	}
+
+	stekService := newMockSessionTicketService()
+
+	policyTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		NextProtos:   []string{"h3"},
+	}
+	stekService.Register(policyTLSConfig, [][32]byte{key1})
+
+	// Delegate GetConfigForClient to policyTLSConfig (simulating connection policy selection)
+	outerTLSConfig := &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			return policyTLSConfig, nil
+		},
+	}
+
+	allow0RTT := true
+	na := NetworkAddress{
+		Network: "udp",
+		Host:    "127.0.0.1",
+	}
+	earlyLn, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, outerTLSConfig, nil, &allow0RTT)
+	if err != nil {
+		t.Fatalf("ListenQUIC failed: %v", err)
+	}
+	defer func() {
+		_ = earlyLn.Close()
+		_ = earlyLn.Close()
+	}()
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
+
+	go func() {
+		for {
+			conn, err := earlyLn.Accept(serverCtx)
+			if err != nil {
+				return
+			}
+			go func(c *quic.Conn) {
+				str, err := c.AcceptStream(serverCtx)
+				if err == nil {
+					b := make([]byte, 4)
+					_, _ = io.ReadFull(str, b)
+					_, _ = str.Write([]byte("pong"))
+				}
+			}(conn)
+		}
+	}()
+
+	serverAddrStr := earlyLn.Addr().String()
+	remoteAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr: %v", err)
+	}
+
+	clientSessionCache := tls.NewLRUClientSessionCache(10)
+	clientTLSConfig := &tls.Config{
+		RootCAs:            certPool,
+		ServerName:         "localhost",
+		NextProtos:         []string{"h3"},
+		ClientSessionCache: clientSessionCache,
+	}
+
+	// 1st Handshake: Obtain session ticket encrypted with key1
+	udpConn1, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP 1: %v", err)
+	}
+	defer udpConn1.Close()
+
+	tr1 := &quic.Transport{Conn: udpConn1}
+	defer tr1.Close()
+
+	dialCtx1, dialCancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel1()
+
+	conn1, err := tr1.DialEarly(dialCtx1, remoteAddr, clientTLSConfig, &quic.Config{Allow0RTT: true})
+	if err != nil {
+		t.Fatalf("DialEarly 1 failed: %v", err)
+	}
+
+	str1, err := conn1.OpenStreamSync(dialCtx1)
+	if err != nil {
+		t.Fatalf("OpenStreamSync 1 failed: %v", err)
+	}
+	if _, err := str1.Write([]byte("ping")); err != nil {
+		t.Fatalf("Write 1 failed: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(str1, buf); err != nil {
+		t.Fatalf("Read 1 failed: %v", err)
+	}
+
+	select {
+	case <-conn1.HandshakeComplete():
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for handshake 1 complete")
+	}
+
+	// Wait briefly for ticket to land in clientSessionCache
+	time.Sleep(150 * time.Millisecond)
+	_ = conn1.CloseWithError(0, "")
+
+	// 2. Rotate keys: key2 is new primary, key1 is secondary
+	stekService.RotateKeys([][32]byte{key2, key1})
+	time.Sleep(50 * time.Millisecond)
+
+	// 2nd Handshake: Resume session using rotated key (key1 is secondary on policyTLSConfig)
+	udpConn2, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP 2: %v", err)
+	}
+	defer udpConn2.Close()
+
+	tr2 := &quic.Transport{Conn: udpConn2}
+	defer tr2.Close()
+
+	dialCtx2, dialCancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel2()
+
+	conn2, err := tr2.DialEarly(dialCtx2, remoteAddr, clientTLSConfig, &quic.Config{Allow0RTT: true})
+	if err != nil {
+		t.Fatalf("DialEarly 2 failed: %v", err)
+	}
+
+	select {
+	case <-conn2.HandshakeComplete():
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for handshake 2 complete")
+	}
+
+	cs2 := conn2.ConnectionState()
+	if !cs2.TLS.DidResume {
+		t.Errorf("Handshake 2 failed to resume session after key rotation (DidResume=false)")
+	}
+	_ = conn2.CloseWithError(0, "")
+
+	// 3. Rotate keys again: evict key1, leaving only key3 and key2
+	stekService.RotateKeys([][32]byte{key3, key2})
+	time.Sleep(50 * time.Millisecond)
+
+	// 3rd Handshake: Verification that ticket encrypted with key1 fails decryption after eviction
+	udpConn3, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP 3: %v", err)
+	}
+	defer udpConn3.Close()
+
+	tr3 := &quic.Transport{Conn: udpConn3}
+	defer tr3.Close()
+
+	dialCtx3, dialCancel3 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel3()
+
+	conn3, err := tr3.DialEarly(dialCtx3, remoteAddr, clientTLSConfig, &quic.Config{Allow0RTT: true})
+	if err != nil {
+		t.Fatalf("DialEarly 3 failed: %v", err)
+	}
+
+	select {
+	case <-conn3.HandshakeComplete():
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for handshake 3 complete")
+	}
+
+	cs3 := conn3.ConnectionState()
+	if cs3.TLS.DidResume {
+		t.Errorf("Handshake 3 unexpectedly resumed session after ticket key eviction")
+	}
+	_ = conn3.CloseWithError(0, "")
 }

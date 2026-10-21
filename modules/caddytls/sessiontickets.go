@@ -147,11 +147,42 @@ func (s *SessionTicketService) stayUpdated() {
 	}
 }
 
+// SetKeySource sets the STEKProvider for key management.
+func (s *SessionTicketService) SetKeySource(provider STEKProvider) {
+	s.keySource = provider
+}
+
+// Start starts key management using keySource.
+func (s *SessionTicketService) Start() error {
+	if s.configs == nil {
+		s.configs = make(map[*tls.Config]struct{})
+	}
+	if s.mu == nil {
+		s.mu = new(sync.Mutex)
+	}
+	return s.start()
+}
+
+// Stop terminates the key rotation service.
+func (s *SessionTicketService) Stop() {
+	s.stop()
+}
+
 // stop terminates the key rotation goroutine.
 func (s *SessionTicketService) stop() {
 	if s.stopChan != nil {
 		close(s.stopChan)
 	}
+}
+
+// Register sets the session ticket keys on cfg and keeps them updated.
+func (s *SessionTicketService) Register(cfg *tls.Config) {
+	s.register(cfg)
+}
+
+// Unregister stops session key management on cfg and removes it.
+func (s *SessionTicketService) Unregister(cfg *tls.Config) {
+	s.unregister(cfg)
 }
 
 // register sets the session ticket keys on cfg
