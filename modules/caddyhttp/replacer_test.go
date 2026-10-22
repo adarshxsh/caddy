@@ -27,6 +27,11 @@ import (
 	"github.com/caddyserver/caddy/v2"
 )
 
+var (
+	benchStringSink string
+	benchAnySink    any
+)
+
 func TestHTTPVarReplacement(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
 	repl := caddy.NewReplacer()
@@ -295,4 +300,107 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
 	}
+}
+
+func createBenchmarkHTTPRequest() *http.Request {
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+	req.Header.Set("User-Agent", "CaddyBench/1.0")
+	req.Header.Set("Accept", "text/html,application/json")
+	req.Header.Set("X-Forwarded-For", "203.0.113.195")
+
+	req.TLS = &tls.ConnectionState{
+		Version:            tls.VersionTLS13,
+		HandshakeComplete:  true,
+		ServerName:         "example.com",
+		CipherSuite:        tls.TLS_AES_256_GCM_SHA384,
+		NegotiatedProtocol: "h2",
+	}
+
+	return req
+}
+
+func TestHTTPReplacerAllocations(t *testing.T) {
+	req := createBenchmarkHTTPRequest()
+	repl := NewTestReplacer(req)
+
+	// Direct variable lookups via closure provider perform at most 1 allocation (for interface boxing)
+	allocsMethod := testing.AllocsPerRun(100, func() {
+		benchStringSink, _ = repl.GetString("http.request.method")
+	})
+	if allocsMethod > 1 {
+		t.Errorf("Expected at most 1 allocation for http.request.method lookup, got %f", allocsMethod)
+	}
+
+	allocsScheme := testing.AllocsPerRun(100, func() {
+		benchStringSink, _ = repl.GetString("http.request.scheme")
+	})
+	if allocsScheme > 1 {
+		t.Errorf("Expected at most 1 allocation for http.request.scheme lookup, got %f", allocsScheme)
+	}
+}
+
+func BenchmarkHTTPReplacerSetup(b *testing.B) {
+	b.ReportAllocs()
+	req := createBenchmarkHTTPRequest()
+
+	b.Run("NewTestReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			reqCopy := *req
+			_ = NewTestReplacer(&reqCopy)
+		}
+	})
+
+	b.Run("addHTTPVarsToReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			repl := caddy.NewReplacer()
+			reqCopy := *req
+			addHTTPVarsToReplacer(repl, &reqCopy, nil)
+		}
+	})
+}
+
+func BenchmarkHTTPVariableResolution(b *testing.B) {
+	b.ReportAllocs()
+	req := createBenchmarkHTTPRequest()
+	repl := NewTestReplacer(req)
+
+	type testCase struct {
+		name    string
+		varName string
+	}
+
+	lookups := []testCase{
+		{name: "method", varName: "http.request.method"},
+		{name: "scheme", varName: "http.request.scheme"},
+		{name: "host", varName: "http.request.host"},
+		{name: "uri", varName: "http.request.uri"},
+		{name: "header_user_agent", varName: "http.request.header.User-Agent"},
+		{name: "header_accept", varName: "http.request.header.Accept"},
+		{name: "query_a", varName: "http.request.uri.query.a"},
+		{name: "query_b", varName: "http.request.uri.query.b"},
+		{name: "tls_cipher_suite", varName: "http.request.tls.cipher_suite"},
+		{name: "tls_version", varName: "http.request.tls.version"},
+		{name: "tls_server_name", varName: "http.request.tls.server_name"},
+	}
+
+	for _, bm := range lookups {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				benchStringSink, _ = repl.GetString(bm.varName)
+			}
+		})
+	}
+
+	b.Run("ReplaceAll_multi_variable", func(b *testing.B) {
+		b.ReportAllocs()
+		input := "{http.request.method} {http.request.host}{http.request.uri} UA={http.request.header.User-Agent}"
+		for b.Loop() {
+			benchStringSink = repl.ReplaceAll(input, "")
+		}
+	})
 }

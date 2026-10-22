@@ -20,7 +20,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
+)
+
+var (
+	benchStringSink string
+	benchAnySink    any
 )
 
 func TestReplacer(t *testing.T) {
@@ -484,7 +490,44 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+
+	// 1. Static text with no placeholders must be 0 allocations
+	allocsNoPlaceholder := testing.AllocsPerRun(100, func() {
+		benchStringSink = rep.ReplaceAll("simple static text with no placeholders", "")
+	})
+	if allocsNoPlaceholder != 0 {
+		t.Errorf("Expected 0 allocations for static text without placeholders, got %f", allocsNoPlaceholder)
+	}
+
+	// 2. Static variable lookup via Get and GetString must be 0 allocations
+	allocsGet := testing.AllocsPerRun(100, func() {
+		benchAnySink, _ = rep.Get("str")
+	})
+	if allocsGet != 0 {
+		t.Errorf("Expected 0 allocations for Get static variable, got %f", allocsGet)
+	}
+
+	allocsGetString := testing.AllocsPerRun(100, func() {
+		benchStringSink, _ = rep.GetString("str")
+	})
+	if allocsGetString != 0 {
+		t.Errorf("Expected 0 allocations for GetString static variable, got %f", allocsGetString)
+	}
+
+	// 3. Single-placeholder replacement producing a new string must perform exactly 1 allocation (for the result string)
+	allocsSingle := testing.AllocsPerRun(100, func() {
+		benchStringSink = rep.ReplaceAll("prefix {str} suffix", "")
+	})
+	if allocsSingle > 1 {
+		t.Errorf("Expected at most 1 allocation for single-placeholder replacement, got %f", allocsSingle)
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
+	b.ReportAllocs()
 	type testCase struct {
 		name, input, empty string
 	}
@@ -492,6 +535,16 @@ func BenchmarkReplacer(b *testing.B) {
 	rep := testReplacer()
 	rep.Set("str", "a string")
 	rep.Set("int", 123.456)
+	rep.Set("v1", "val1")
+	rep.Set("v2", "val2")
+	rep.Set("v3", "val3")
+	rep.Set("v4", "val4")
+	rep.Set("v5", "val5")
+	rep.Set("v6", "val6")
+	rep.Set("v7", "val7")
+	rep.Set("v8", "val8")
+	rep.Set("v9", "val9")
+	rep.Set("v10", "val10")
 
 	for _, bm := range []testCase{
 		{
@@ -514,13 +567,98 @@ func BenchmarkReplacer(b *testing.B) {
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
+		{
+			name:  "3 placeholders",
+			input: `v1={v1} v2={v2} v3={v3}`,
+		},
+		{
+			name:  "5 placeholders",
+			input: `v1={v1} v2={v2} v3={v3} v4={v4} v5={v5}`,
+		},
+		{
+			name:  "10 placeholders",
+			input: `v1={v1} v2={v2} v3={v3} v4={v4} v5={v5} v6={v6} v7={v7} v8={v8} v9={v9} v10={v10}`,
+		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
-				rep.ReplaceAll(bm.input, bm.empty)
+				benchStringSink = rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
 	}
+}
+
+func BenchmarkReplacerMultiPlaceholder(b *testing.B) {
+	b.ReportAllocs()
+	rep := testReplacer()
+	for i := 1; i <= 10; i++ {
+		rep.Set(fmt.Sprintf("k%d", i), fmt.Sprintf("val%d", i))
+	}
+
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "3_placeholders",
+			input: "item1={k1} item2={k2} item3={k3}",
+		},
+		{
+			name:  "5_placeholders",
+			input: "item1={k1} item2={k2} item3={k3} item4={k4} item5={k5}",
+		},
+		{
+			name:  "10_placeholders",
+			input: "1={k1} 2={k2} 3={k3} 4={k4} 5={k5} 6={k6} 7={k7} 8={k8} 9={k9} 10={k10}",
+		},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				benchStringSink = rep.ReplaceAll(tc.input, "")
+			}
+		})
+	}
+}
+
+func BenchmarkReplacerParallel(b *testing.B) {
+	b.ReportAllocs()
+	rep := NewReplacer()
+	rep.Set("a", "alpha")
+	rep.Set("b", "beta")
+	rep.Set("c", "gamma")
+
+	b.Run("concurrent_reads", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			var s string
+			for pb.Next() {
+				s = rep.ReplaceAll("test {a} and {b} and {c}", "")
+			}
+			_ = s
+		})
+	})
+
+	b.Run("concurrent_read_write", func(b *testing.B) {
+		b.ReportAllocs()
+		var counter uint64
+		b.RunParallel(func(pb *testing.PB) {
+			id := atomic.AddUint64(&counter, 1)
+			var s string
+			for pb.Next() {
+				if id%2 == 0 {
+					rep.Set("dyn", "value")
+					s = rep.ReplaceAll("dynamic {dyn} {a}", "")
+				} else {
+					s = rep.ReplaceAll("static {a} {b}", "")
+				}
+			}
+			_ = s
+		})
+	})
 }
 
 func testReplacer() Replacer {
