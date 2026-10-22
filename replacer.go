@@ -33,7 +33,7 @@ import (
 // NewReplacer returns a new Replacer.
 func NewReplacer() *Replacer {
 	rep := &Replacer{
-		static:   make(map[string]any),
+		static:   make(map[string]staticValue),
 		mapMutex: &sync.RWMutex{},
 	}
 	rep.providers = []replacementProvider{
@@ -48,7 +48,7 @@ func NewReplacer() *Replacer {
 // without the global default replacements.
 func NewEmptyReplacer() *Replacer {
 	rep := &Replacer{
-		static:   make(map[string]any),
+		static:   make(map[string]staticValue),
 		mapMutex: &sync.RWMutex{},
 	}
 	rep.providers = []replacementProvider{
@@ -57,12 +57,17 @@ func NewEmptyReplacer() *Replacer {
 	return rep
 }
 
+type staticValue struct {
+	val    any
+	strVal string
+}
+
 // Replacer can replace values in strings.
 // A default/empty Replacer is not valid;
 // use NewReplacer to make one.
 type Replacer struct {
 	providers []replacementProvider
-	static    map[string]any
+	static    map[string]staticValue
 	mapMutex  *sync.RWMutex
 }
 
@@ -72,7 +77,10 @@ type Replacer struct {
 //
 // EXPERIMENTAL: Subject to change or removal.
 func (r *Replacer) WithoutFile() *Replacer {
-	rep := &Replacer{static: r.static}
+	rep := &Replacer{
+		static:   r.static,
+		mapMutex: r.mapMutex,
+	}
 	for _, v := range r.providers {
 		if _, ok := v.(fileReplacementProvider); ok {
 			continue
@@ -91,13 +99,23 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
-	r.static[variable] = value
+	r.static[variable] = staticValue{
+		val:    value,
+		strVal: ToString(value),
+	}
 	r.mapMutex.Unlock()
 }
 
 // Get gets a value from the replacer. It returns
 // the value and whether the variable was known.
 func (r *Replacer) Get(variable string) (any, bool) {
+	r.mapMutex.RLock()
+	if val, ok := r.static[variable]; ok {
+		r.mapMutex.RUnlock()
+		return val.val, true
+	}
+	r.mapMutex.RUnlock()
+
 	for _, mapFunc := range r.providers {
 		if val, ok := mapFunc.replace(variable); ok {
 			return val, true
@@ -109,6 +127,13 @@ func (r *Replacer) Get(variable string) (any, bool) {
 // GetString is the same as Get, but coerces the value to a
 // string representation as efficiently as possible.
 func (r *Replacer) GetString(variable string) (string, bool) {
+	r.mapMutex.RLock()
+	if val, ok := r.static[variable]; ok {
+		r.mapMutex.RUnlock()
+		return val.strVal, true
+	}
+	r.mapMutex.RUnlock()
+
 	s, found := r.Get(variable)
 	return ToString(s), found
 }
@@ -138,7 +163,10 @@ func (r *Replacer) fromStatic(key string) (any, bool) {
 	r.mapMutex.RLock()
 	defer r.mapMutex.RUnlock()
 	val, ok := r.static[key]
-	return val, ok
+	if !ok {
+		return nil, false
+	}
+	return val.strVal, true
 }
 
 // ReplaceOrErr is like ReplaceAll, but any placeholders
@@ -183,8 +211,10 @@ func (r *Replacer) replace(input, empty string,
 	var sb strings.Builder
 
 	// it is reasonable to assume that the output
-	// will be approximately as long as the input
-	sb.Grow(len(input))
+	// will be approximately as long as the input,
+	// plus a default growth buffer margin to prevent
+	// reallocations when replacement values expand.
+	sb.Grow(len(input) + 32)
 
 	// iterate the input to find each placeholder
 	var lastWriteCursor int
@@ -236,7 +266,15 @@ scan:
 		key := input[i+1 : end]
 
 		// try to get a value for this key, handle empty values accordingly
-		val, found := r.Get(key)
+		var val any
+		var valStr string
+		var found bool
+		if f == nil {
+			valStr, found = r.GetString(key)
+		} else {
+			val, found = r.Get(key)
+		}
+
 		if !found {
 			// placeholder is unknown (unrecognized); handle accordingly
 			if errOnUnknown {
@@ -257,10 +295,8 @@ scan:
 			if err != nil {
 				return "", err
 			}
+			valStr = ToString(val)
 		}
-
-		// convert val to a string as efficiently as possible
-		valStr := ToString(val)
 
 		// write the value; if it's empty, either return
 		// an error or write a default value
@@ -286,6 +322,91 @@ scan:
 	return sb.String(), nil
 }
 
+var smallIntStrs = [...]string{
+	"0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+	"10", "11", "12", "13", "14", "15", "16", "17", "18", "19",
+	"20", "21", "22", "23", "24", "25", "26", "27", "28", "29",
+	"30", "31", "32", "33", "34", "35", "36", "37", "38", "39",
+	"40", "41", "42", "43", "44", "45", "46", "47", "48", "49",
+	"50", "51", "52", "53", "54", "55", "56", "57", "58", "59",
+	"60", "61", "62", "63", "64", "65", "66", "67", "68", "69",
+	"70", "71", "72", "73", "74", "75", "76", "77", "78", "79",
+	"80", "81", "82", "83", "84", "85", "86", "87", "88", "89",
+	"90", "91", "92", "93", "94", "95", "96", "97", "98", "99",
+}
+
+func formatInt(v int64) string {
+	if v >= 0 && v < int64(len(smallIntStrs)) {
+		return smallIntStrs[v]
+	}
+	switch v {
+	case -1:
+		return "-1"
+	case 200:
+		return "200"
+	case 201:
+		return "201"
+	case 204:
+		return "204"
+	case 301:
+		return "301"
+	case 302:
+		return "302"
+	case 304:
+		return "304"
+	case 400:
+		return "400"
+	case 401:
+		return "401"
+	case 403:
+		return "403"
+	case 404:
+		return "404"
+	case 500:
+		return "500"
+	case 502:
+		return "502"
+	case 503:
+		return "503"
+	}
+	return strconv.FormatInt(v, 10)
+}
+
+func formatUint(v uint64) string {
+	if v < uint64(len(smallIntStrs)) {
+		return smallIntStrs[v]
+	}
+	switch v {
+	case 200:
+		return "200"
+	case 201:
+		return "201"
+	case 204:
+		return "204"
+	case 301:
+		return "301"
+	case 302:
+		return "302"
+	case 304:
+		return "304"
+	case 400:
+		return "400"
+	case 401:
+		return "401"
+	case 403:
+		return "403"
+	case 404:
+		return "404"
+	case 500:
+		return "500"
+	case 502:
+		return "502"
+	case 503:
+		return "503"
+	}
+	return strconv.FormatUint(v, 10)
+}
+
 // ToString returns val as a string, as efficiently as possible.
 // EXPERIMENTAL: may be changed or removed later.
 func ToString(val any) string {
@@ -305,17 +426,17 @@ func ToString(val any) string {
 	case []rune:
 		return string(v)
 	case int:
-		return strconv.Itoa(v)
+		return formatInt(int64(v))
 	case int32:
-		return strconv.Itoa(int(v))
+		return formatInt(int64(v))
 	case int64:
-		return strconv.Itoa(int(v))
+		return formatInt(v)
 	case uint:
-		return strconv.FormatUint(uint64(v), 10)
+		return formatUint(uint64(v))
 	case uint32:
-		return strconv.FormatUint(uint64(v), 10)
+		return formatUint(uint64(v))
 	case uint64:
-		return strconv.FormatUint(v, 10)
+		return formatUint(v)
 	case float32:
 		return strconv.FormatFloat(float64(v), 'f', -1, 32)
 	case float64:
