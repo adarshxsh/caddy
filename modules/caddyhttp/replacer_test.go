@@ -18,10 +18,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -294,5 +297,108 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+type trackingReader struct {
+	reader     io.Reader
+	readCount  int
+	closeCount int
+}
+
+func (tr *trackingReader) Read(p []byte) (int, error) {
+	tr.readCount++
+	return tr.reader.Read(p)
+}
+
+func (tr *trackingReader) Close() error {
+	tr.closeCount++
+	return nil
+}
+
+func TestHTTPRequestBodyPlaceholder(t *testing.T) {
+	bodyText := "hello request body world!"
+	tr := &trackingReader{reader: strings.NewReader(bodyText)}
+
+	req := httptest.NewRequest(http.MethodPost, "/", tr)
+	repl := NewTestReplacer(req)
+
+	// First evaluation: reads stream into pooled buffer, caches on context, replaces req.Body
+	val1, ok1 := repl.GetString("http.request.body")
+	if !ok1 || val1 != bodyText {
+		t.Fatalf("expected body %q, got %q (ok=%t)", bodyText, val1, ok1)
+	}
+
+	if tr.readCount == 0 {
+		t.Fatalf("expected stream to be read on first evaluation")
+	}
+	if tr.closeCount == 0 {
+		t.Fatalf("expected original body to be closed on first evaluation")
+	}
+	initialReadCount := tr.readCount
+
+	// Verify cached context variable is set
+	cachedBytes, ok := GetVar(req.Context(), RequestBodyVarKey).([]byte)
+	if !ok || string(cachedBytes) != bodyText {
+		t.Fatalf("expected cached body var %q, got %q (ok=%t)", bodyText, string(cachedBytes), ok)
+	}
+
+	// Second evaluation (base64): must reuse cached body context var without re-reading stream
+	expectedBase64 := base64.StdEncoding.EncodeToString([]byte(bodyText))
+	val2, ok2 := repl.GetString("http.request.body_base64")
+	if !ok2 || val2 != expectedBase64 {
+		t.Fatalf("expected body_base64 %q, got %q (ok=%t)", expectedBase64, val2, ok2)
+	}
+
+	// Third evaluation: must reuse cached body
+	val3, ok3 := repl.GetString("http.request.body")
+	if !ok3 || val3 != bodyText {
+		t.Fatalf("expected body %q, got %q (ok=%t)", bodyText, val3, ok3)
+	}
+
+	// Ensure no additional reads occurred on original stream
+	if tr.readCount != initialReadCount {
+		t.Fatalf("expected single stream read, readCount changed from %d to %d", initialReadCount, tr.readCount)
+	}
+
+	// Downstream handler readability check: req.Body must be readable
+	downstreamBody, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read downstream req.Body: %v", err)
+	}
+	if string(downstreamBody) != bodyText {
+		t.Fatalf("expected downstream body %q, got %q", bodyText, string(downstreamBody))
+	}
+
+	// Test nil req.Body
+	nilReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	nilReq.Body = nil
+	nilRepl := NewTestReplacer(nilReq)
+	nilVal, nilOk := nilRepl.GetString("http.request.body")
+	if !nilOk || nilVal != "" {
+		t.Fatalf("expected empty string for nil body, got %q (ok=%t)", nilVal, nilOk)
+	}
+}
+
+func TestHTTPRequestBodyPlaceholderAllocations(t *testing.T) {
+	bodyText := "cached request body content"
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(bodyText))
+	repl := NewTestReplacer(req)
+
+	// First read caches the body
+	_, _ = repl.GetString("http.request.body")
+
+	// Verify subsequent calls to GetString("http.request.body") on cached context incur 0 buffer allocations
+	var sink string
+	allocs := testing.AllocsPerRun(100, func() {
+		sink, _ = repl.GetString("http.request.body")
+	})
+	if sink != bodyText {
+		t.Fatalf("expected %q, got %q", bodyText, sink)
+	}
+	// Note: string(bodyBytes) conversion and interface boxing take 2 allocs/op on hit,
+	// but zero unpooled bytes.Buffer instances are created.
+	if allocs > 2 {
+		t.Fatalf("expected at most 2 allocs/op (for string conversion and interface boxing), got %f", allocs)
 	}
 }

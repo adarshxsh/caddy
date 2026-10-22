@@ -1213,6 +1213,9 @@ const (
 
 	// For tracking the real client IP (affected by trusted_proxy)
 	ClientIPVarKey string = "client_ip"
+
+	// For caching the HTTP request body read by body placeholders
+	RequestBodyVarKey string = "http.request.body"
 )
 
 var networkTypesHTTP3 = map[string]string{
