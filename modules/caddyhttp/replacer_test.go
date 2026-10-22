@@ -296,3 +296,38 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLazyRequestID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	repl := NewTestReplacer(req)
+
+	// Ensure uuid is NOT set in request context prior to evaluation
+	if id := GetVar(req.Context(), "uuid"); id != nil {
+		t.Fatalf("expected GetVar('uuid') to be nil initially, got: %v", id)
+	}
+
+	// First evaluation of {http.request.uuid}
+	uuidVal1, found1 := repl.GetString("http.request.uuid")
+	if !found1 {
+		t.Fatalf("expected http.request.uuid placeholder to be found")
+	}
+	if uuidVal1 == "" {
+		t.Fatalf("expected non-empty uuid string")
+	}
+
+	// Ensure uuid is now stored in request context
+	idInCtx := GetVar(req.Context(), "uuid")
+	if idInCtx == nil {
+		t.Fatalf("expected uuid to be set in request context after evaluation")
+	}
+
+	// Second evaluation of {http.request.uuid} must return the same string
+	uuidVal2, found2 := repl.GetString("http.request.uuid")
+	if !found2 {
+		t.Fatalf("expected http.request.uuid placeholder to be found on second evaluation")
+	}
+	if uuidVal2 != uuidVal1 {
+		t.Errorf("expected subsequent uuid evaluation to return same string %q, got %q", uuidVal1, uuidVal2)
+	}
+}
+
