@@ -296,3 +296,92 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkHTTPReplacer(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar?a=1&b=2", nil)
+	req.Header.Set("User-Agent", "CaddyBench/1.0")
+	req.Header.Set("Accept", "text/html")
+	req.Host = "example.com"
+	req.RemoteAddr = "192.168.1.100:12345"
+
+	b.Run("init", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			repl := caddy.NewReplacer()
+			reqCopy := *req
+			ctx := context.WithValue(reqCopy.Context(), caddy.ReplacerCtxKey, repl)
+			reqCopy = *reqCopy.WithContext(ctx)
+			addHTTPVarsToReplacer(repl, &reqCopy, nil)
+		}
+	})
+
+	repl := NewTestReplacer(req)
+
+	b.Run("header lookup", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.header.user-agent")
+		}
+	})
+
+	b.Run("context lookup", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.method")
+		}
+	})
+
+	b.Run("multi placeholder", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = repl.ReplaceAll("{http.request.method} {http.request.uri} {http.request.header.user-agent}", "")
+		}
+	})
+
+	b.Run("parallel context lookup", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_, _ = repl.GetString("http.request.method")
+			}
+		})
+	})
+
+	b.Run("parallel multi placeholder", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_ = repl.ReplaceAll("{http.request.method} {http.request.uri} {http.request.header.user-agent}", "")
+			}
+		})
+	})
+}
+
+func TestHTTPReplacerAllocations(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar?a=1&b=2", nil)
+	req.Header.Set("User-Agent", "CaddyBench/1.0")
+	req.Host = "example.com"
+	req.RemoteAddr = "192.168.1.100:12345"
+
+	repl := NewTestReplacer(req)
+
+	// Static string without placeholders must yield 0 allocations
+	resStatic := testing.Benchmark(func(b *testing.B) {
+		for b.Loop() {
+			_ = repl.ReplaceAll("static string without placeholders", "")
+		}
+	})
+	if allocs := resStatic.AllocsPerOp(); allocs != 0 {
+		t.Errorf("Expected 0 allocs/op for static string replacement in HTTP replacer, got %d", allocs)
+	}
+
+	// Simple HTTP method variable lookup
+	resMethod := testing.Benchmark(func(b *testing.B) {
+		for b.Loop() {
+			_, _ = repl.GetString("http.request.method")
+		}
+	})
+	if allocs := resMethod.AllocsPerOp(); allocs > 1 {
+		t.Errorf("Expected <= 1 allocs/op for http.request.method lookup, got %d", allocs)
+	}
+}
