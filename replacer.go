@@ -36,11 +36,12 @@ func NewReplacer() *Replacer {
 		static:   make(map[string]any),
 		mapMutex: &sync.RWMutex{},
 	}
-	rep.providers = []replacementProvider{
+	rep.providers = rep.providerBuf[:0:4]
+	rep.providers = append(rep.providers,
 		globalDefaultReplacementProvider{},
 		fileReplacementProvider{},
-		ReplacerFunc(rep.fromStatic),
-	}
+		staticReplacementProvider{rep},
+	)
 	return rep
 }
 
@@ -51,9 +52,10 @@ func NewEmptyReplacer() *Replacer {
 		static:   make(map[string]any),
 		mapMutex: &sync.RWMutex{},
 	}
-	rep.providers = []replacementProvider{
-		ReplacerFunc(rep.fromStatic),
-	}
+	rep.providers = rep.providerBuf[:0:4]
+	rep.providers = append(rep.providers,
+		staticReplacementProvider{rep},
+	)
 	return rep
 }
 
@@ -61,9 +63,10 @@ func NewEmptyReplacer() *Replacer {
 // A default/empty Replacer is not valid;
 // use NewReplacer to make one.
 type Replacer struct {
-	providers []replacementProvider
-	static    map[string]any
-	mapMutex  *sync.RWMutex
+	providers   []ReplacementProvider
+	static      map[string]any
+	mapMutex    *sync.RWMutex
+	providerBuf [4]ReplacementProvider
 }
 
 // WithoutFile returns a copy of the current Replacer
@@ -72,7 +75,10 @@ type Replacer struct {
 //
 // EXPERIMENTAL: Subject to change or removal.
 func (r *Replacer) WithoutFile() *Replacer {
-	rep := &Replacer{static: r.static}
+	rep := &Replacer{
+		static: r.static,
+	}
+	rep.providers = rep.providerBuf[:0:4]
 	for _, v := range r.providers {
 		if _, ok := v.(fileReplacementProvider); ok {
 			continue
@@ -88,9 +94,23 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 	r.providers = append(r.providers, mapFunc)
 }
 
+// ReplacementProvider is a type that can provide replacements
+// for placeholders.
+type ReplacementProvider interface {
+	Replace(key string) (any, bool)
+}
+
+// MapProvider adds provider to the list of value providers.
+func (r *Replacer) MapProvider(provider ReplacementProvider) {
+	r.providers = append(r.providers, provider)
+}
+
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
+	if r.static == nil {
+		r.static = make(map[string]any)
+	}
 	r.static[variable] = value
 	r.mapMutex.Unlock()
 }
@@ -98,8 +118,8 @@ func (r *Replacer) Set(variable string, value any) {
 // Get gets a value from the replacer. It returns
 // the value and whether the variable was known.
 func (r *Replacer) Get(variable string) (any, bool) {
-	for _, mapFunc := range r.providers {
-		if val, ok := mapFunc.replace(variable); ok {
+	for _, provider := range r.providers {
+		if val, ok := provider.Replace(variable); ok {
 			return val, true
 		}
 	}
@@ -117,7 +137,9 @@ func (r *Replacer) GetString(variable string) (string, bool) {
 // that was created using Set.
 func (r *Replacer) Delete(variable string) {
 	r.mapMutex.Lock()
-	delete(r.static, variable)
+	if r.static != nil {
+		delete(r.static, variable)
+	}
 	r.mapMutex.Unlock()
 }
 
@@ -125,19 +147,27 @@ func (r *Replacer) Delete(variable string) {
 // keys starting with the given prefix
 func (r *Replacer) DeleteByPrefix(prefix string) {
 	r.mapMutex.Lock()
-	for key := range r.static {
-		if strings.HasPrefix(key, prefix) {
-			delete(r.static, key)
+	if r.static != nil {
+		for key := range r.static {
+			if strings.HasPrefix(key, prefix) {
+				delete(r.static, key)
+			}
 		}
 	}
 	r.mapMutex.Unlock()
 }
 
-// fromStatic provides values from r.static.
-func (r *Replacer) fromStatic(key string) (any, bool) {
-	r.mapMutex.RLock()
-	defer r.mapMutex.RUnlock()
-	val, ok := r.static[key]
+type staticReplacementProvider struct {
+	r *Replacer
+}
+
+func (s staticReplacementProvider) Replace(key string) (any, bool) {
+	s.r.mapMutex.RLock()
+	defer s.r.mapMutex.RUnlock()
+	if s.r.static == nil {
+		return nil, false
+	}
+	val, ok := s.r.static[key]
 	return val, ok
 }
 
@@ -336,22 +366,19 @@ func ToString(val any) string {
 // not recognize the key, false should be returned.
 type ReplacerFunc func(key string) (any, bool)
 
-func (f ReplacerFunc) replace(key string) (any, bool) {
+func (f ReplacerFunc) Replace(key string) (any, bool) {
 	return f(key)
 }
 
-// replacementProvider is a type that can provide replacements
-// for placeholders. Allows for type assertion to determine
-// which type of provider it is.
-type replacementProvider interface {
-	replace(key string) (any, bool)
+func (f ReplacerFunc) replace(key string) (any, bool) {
+	return f(key)
 }
 
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
 type fileReplacementProvider struct{}
 
-func (f fileReplacementProvider) replace(key string) (any, bool) {
+func (f fileReplacementProvider) Replace(key string) (any, bool) {
 	if !strings.HasPrefix(key, filePrefix) {
 		return nil, false
 	}
@@ -377,7 +404,7 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 // time, or environment variables.
 type globalDefaultReplacementProvider struct{}
 
-func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
+func (f globalDefaultReplacementProvider) Replace(key string) (any, bool) {
 	// check environment variable
 	const envPrefix = "env."
 	if strings.HasPrefix(key, envPrefix) {

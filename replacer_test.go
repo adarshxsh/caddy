@@ -240,7 +240,7 @@ func TestReplacerSet(t *testing.T) {
 func TestReplacerReplaceKnown(t *testing.T) {
 	rep := Replacer{
 		mapMutex: &sync.RWMutex{},
-		providers: []replacementProvider{
+		providers: []ReplacementProvider{
 			// split our possible vars to two functions (to test if both functions are called)
 			ReplacerFunc(func(key string) (val any, ok bool) {
 				switch key {
@@ -413,7 +413,7 @@ func TestReplacerNew(t *testing.T) {
 			value:    "envtest",
 		},
 	} {
-		if val, ok := repl.providers[0].replace(tc.variable); ok {
+		if val, ok := repl.providers[0].Replace(tc.variable); ok {
 			if val != tc.value {
 				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
 			}
@@ -440,7 +440,7 @@ func TestReplacerNew(t *testing.T) {
 			value:    "foo" + getEOL(),
 		},
 	} {
-		if val, ok := repl.providers[1].replace(tc.variable); ok {
+		if val, ok := repl.providers[1].Replace(tc.variable); ok {
 			if val != tc.value {
 				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
 			}
@@ -525,7 +525,7 @@ func BenchmarkReplacer(b *testing.B) {
 
 func testReplacer() Replacer {
 	return Replacer{
-		providers: make([]replacementProvider, 0),
+		providers: make([]ReplacementProvider, 0),
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
 	}

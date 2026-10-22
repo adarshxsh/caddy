@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -294,5 +295,81 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestLazyRequestID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+	req = req.WithContext(ctx)
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	if id := GetVar(req.Context(), "uuid"); id != nil {
+		t.Fatalf("expected uuid to be nil before query, got %v", id)
+	}
+
+	val1, ok1 := repl.GetString("http.request.uuid")
+	if !ok1 || val1 == "" {
+		t.Fatalf("expected uuid string on query, got ok=%t val=%q", ok1, val1)
+	}
+
+	id := GetVar(req.Context(), "uuid")
+	if id == nil {
+		t.Fatalf("expected uuid to be populated after query, got nil")
+	}
+
+	val2, ok2 := repl.GetString("http.request.uuid")
+	if !ok2 || val2 != val1 {
+		t.Fatalf("expected cached uuid on second query, got %q vs %q", val2, val1)
+	}
+}
+
+func TestAddHTTPVarsToReplacerAllocs(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	vars := make(map[string]any)
+	vars["start_time"] = nil
+	ctx := context.WithValue(req.Context(), VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	allocsSetVar := testing.AllocsPerRun(100, func() {
+		SetVar(req.Context(), "start_time", time.Now())
+	})
+
+	repl := caddy.NewReplacer()
+	allocsMapProvider := testing.AllocsPerRun(100, func() {
+		repl.MapProvider(&httpVarsProvider{req: req, w: nil})
+	})
+
+	t.Logf("SetVar allocs: %f, MapProvider allocs: %f", allocsSetVar, allocsMapProvider)
+
+	if allocsSetVar > 1 || allocsMapProvider > 1 {
+		t.Fatalf("expected <= 1 allocation for SetVar and MapProvider each, got SetVar=%f MapProvider=%f", allocsSetVar, allocsMapProvider)
+	}
+
+	allocsAddHTTPVars := testing.AllocsPerRun(100, func() {
+		addHTTPVarsToReplacer(repl, req, nil)
+	})
+	t.Logf("addHTTPVarsToReplacer allocs on existing replacer: %f", allocsAddHTTPVars)
+
+	if allocsAddHTTPVars > 2 {
+		t.Fatalf("expected <= 2 allocations for addHTTPVarsToReplacer on existing replacer, got %f", allocsAddHTTPVars)
+	}
+}
+
+func BenchmarkAddHTTPVarsToReplacer(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	vars := make(map[string]any)
+	vars["start_time"] = nil
+	ctx := context.WithValue(req.Context(), VarsCtxKey, vars)
+	req = req.WithContext(ctx)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
 	}
 }
