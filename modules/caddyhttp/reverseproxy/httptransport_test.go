@@ -8,6 +8,9 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +280,66 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestTCPRWTimeoutConn_UnwrapAndDeadlines(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			defer c.Close()
+			buf := make([]byte, 100)
+			_, _ = c.Read(buf)
+		}
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	tcpConn, ok := clientConn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("expected *net.TCPConn, got %T", clientConn)
+	}
+
+	wrapper := &tcpRWTimeoutConn{
+		TCPConn: tcpConn,
+		logger:  zap.NewNop(),
+	}
+	wrapper.readTimeout.Store(int64(50 * time.Millisecond))
+	wrapper.writeTimeout.Store(int64(50 * time.Millisecond))
+
+	// Requirement 1: Unwrap returns underlying *net.TCPConn
+	unwrapped := wrapper.Unwrap()
+	if unwrapped != tcpConn {
+		t.Fatalf("Unwrap() = %v, want %v", unwrapped, tcpConn)
+	}
+
+	// Requirement 2: SetReadDeadline(time.Time{}) and SetWriteDeadline(time.Time{}) disable timeout setting
+	if err := wrapper.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetReadDeadline error: %v", err)
+	}
+	if got := time.Duration(wrapper.readTimeout.Load()); got != 0 {
+		t.Fatalf("readTimeout = %v, want 0", got)
+	}
+
+	if err := wrapper.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetWriteDeadline error: %v", err)
+	}
+	if got := time.Duration(wrapper.writeTimeout.Load()); got != 0 {
+		t.Fatalf("writeTimeout = %v, want 0", got)
+	}
+
+	// Verify that Read/Write calls work without re-arming deadlines
+	if _, err := wrapper.Write([]byte("test")); err != nil {
+		t.Fatalf("Write error: %v", err)
 	}
 }
