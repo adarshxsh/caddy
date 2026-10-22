@@ -26,7 +26,11 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
+	"os"
+	"reflect"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -83,6 +87,12 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	if !ok {
 		logger.Error("internal error: 101 switching protocols response with non-writable body")
 		return
+	}
+
+	if err := clearDeadlines(backConn); err != nil {
+		if c := logger.Check(zapcore.DebugLevel, "failed to clear transport deadlines on upgraded connection"); c != nil {
+			c.Write(zap.Error(err))
+		}
 	}
 
 	// write header first, response headers should not be counted in size
@@ -679,3 +689,100 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+type deadlineClearer interface {
+	ClearDeadlines() error
+}
+
+func clearDeadlines(conn any) error {
+	return clearDeadlinesRecursive(conn, 0)
+}
+
+func clearDeadlinesRecursive(conn any, depth int) error {
+	if conn == nil || depth > 10 {
+		return nil
+	}
+
+	var firstErr error
+
+	if dc, ok := conn.(deadlineClearer); ok {
+		if err := dc.ClearDeadlines(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if nc, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		if err := clearDeadlinesRecursive(nc.NetConn(), depth+1); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if uw, ok := conn.(interface{ Unwrap() net.Conn }); ok {
+		if err := clearDeadlinesRecursive(uw.Unwrap(), depth+1); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	} else if uw, ok := conn.(interface{ Unwrap() io.ReadWriteCloser }); ok {
+		if err := clearDeadlinesRecursive(uw.Unwrap(), depth+1); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	} else if uw, ok := conn.(interface{ Unwrap() any }); ok {
+		if err := clearDeadlinesRecursive(uw.Unwrap(), depth+1); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if sd, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+		if err := sd.SetDeadline(time.Time{}); err != nil && !isNoDeadlineErr(err) && firstErr == nil {
+			firstErr = err
+		}
+	} else {
+		if srd, ok := conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+			if err := srd.SetReadDeadline(time.Time{}); err != nil && !isNoDeadlineErr(err) && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if swd, ok := conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			if err := swd.SetWriteDeadline(time.Time{}); err != nil && !isNoDeadlineErr(err) && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	val := reflect.ValueOf(conn)
+	for val.Kind() == reflect.Pointer || val.Kind() == reflect.Interface {
+		if val.IsNil() {
+			break
+		}
+		val = val.Elem()
+	}
+	if val.IsValid() && val.Kind() == reflect.Struct {
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if !field.IsValid() {
+				continue
+			}
+			var fieldValue any
+			if field.CanInterface() {
+				fieldValue = field.Interface()
+			} else if field.CanAddr() {
+				fieldValue = reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Interface()
+			}
+			if fieldValue != nil {
+				if err := clearDeadlinesRecursive(fieldValue, depth+1); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+	}
+
+	return firstErr
+}
+
+func isNoDeadlineErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrNoDeadline) {
+		return true
+	}
+	return strings.Contains(err.Error(), "does not support deadline")
+}
