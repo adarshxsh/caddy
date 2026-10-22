@@ -26,7 +26,9 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
 	"unsafe"
@@ -83,6 +85,53 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	if !ok {
 		logger.Error("internal error: 101 switching protocols response with non-writable body")
 		return
+	}
+
+	// Protocol upgrade: clear deadlines and unwrap backend connection layers
+	for i := 0; i < 10; i++ {
+		if c, ok := backConn.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = c.SetReadDeadline(time.Time{})
+		}
+		if c, ok := backConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = c.SetWriteDeadline(time.Time{})
+		}
+
+		var unwrapped io.ReadWriteCloser
+		if u, ok := backConn.(interface{ Unwrap() net.Conn }); ok {
+			unwrapped = u.Unwrap()
+		} else if u, ok := backConn.(interface{ Unwrap() io.ReadWriteCloser }); ok {
+			unwrapped = u.Unwrap()
+		} else if u, ok := backConn.(interface{ Unwrap() any }); ok {
+			if rwc, ok := u.Unwrap().(io.ReadWriteCloser); ok {
+				unwrapped = rwc
+			}
+		}
+
+		if unwrapped == nil {
+			v := reflect.ValueOf(backConn)
+			if v.Kind() == reflect.Ptr {
+				v = v.Elem()
+			}
+			if v.Kind() == reflect.Struct {
+				for j := 0; j < v.NumField(); j++ {
+					f := v.Field(j)
+					if f.CanAddr() {
+						f = reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
+					}
+					if f.IsValid() && f.CanInterface() {
+						if rwc, ok := f.Interface().(io.ReadWriteCloser); ok && rwc != nil && rwc != backConn {
+							unwrapped = rwc
+							break
+						}
+					}
+				}
+			}
+		}
+
+		if unwrapped == nil || unwrapped == backConn {
+			break
+		}
+		backConn = unwrapped
 	}
 
 	// write header first, response headers should not be counted in size
