@@ -50,7 +50,7 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 	}
 
 	buf := copier.buffer()
-	if got := len(buf); got != 7 {
+	if got := len(*buf); got != 7 {
 		t.Fatalf("buffer len = %d, want 7", got)
 	}
 
@@ -69,9 +69,40 @@ func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 func TestSwitchProtocolCopierDefaultBufferSize(t *testing.T) {
 	copier := switchProtocolCopier{}
 	buf := copier.buffer()
-	if got := len(buf); got != defaultBufferSize {
+	if got := len(*buf); got != defaultBufferSize {
 		t.Fatalf("buffer len = %d, want %d", got, defaultBufferSize)
 	}
+	copier.putBuffer(buf)
+}
+
+func TestSwitchProtocolCopierPoolRecycling(t *testing.T) {
+	copier := switchProtocolCopier{}
+	buf1 := copier.buffer()
+	if len(*buf1) != defaultBufferSize {
+		t.Fatalf("buf1 len = %d, want %d", len(*buf1), defaultBufferSize)
+	}
+	copier.putBuffer(buf1)
+
+	buf2 := copier.buffer()
+	if buf1 != buf2 {
+		t.Errorf("expected pooled buffer pointer to be reused: got %p, want %p", buf2, buf1)
+	}
+	copier.putBuffer(buf2)
+
+	// Test custom buffer size does not go to pool
+	customCopier := switchProtocolCopier{bufferSize: 1024}
+	customBuf := customCopier.buffer()
+	if len(*customBuf) != 1024 {
+		t.Fatalf("customBuf len = %d, want 1024", len(*customBuf))
+	}
+	customCopier.putBuffer(customBuf)
+
+	// Verify pool still yields standard buffers
+	buf3 := copier.buffer()
+	if len(*buf3) != defaultBufferSize {
+		t.Fatalf("buf3 len = %d, want %d", len(*buf3), defaultBufferSize)
+	}
+	copier.putBuffer(buf3)
 }
 
 type nopReadWriteCloser struct {
