@@ -2,13 +2,16 @@ package reverseproxy
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
 )
 
 func TestHandlerCopyResponse(t *testing.T) {
@@ -80,3 +83,78 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestMaxLatencyWriterStopFlushesWhenPending(t *testing.T) {
+	flushed := false
+	mlw := &maxLatencyWriter{
+		flush: func() error {
+			flushed = true
+			return nil
+		},
+		flushPending: true,
+		logger:       zap.NewNop(),
+	}
+
+	mlw.stop()
+
+	if !flushed {
+		t.Errorf("expected flush() to be called on stop() when flushPending is true")
+	}
+	if mlw.flushPending {
+		t.Errorf("expected flushPending to be false after stop()")
+	}
+}
+
+func TestMaxLatencyWriterStopNoFlushWhenNotPending(t *testing.T) {
+	flushed := false
+	mlw := &maxLatencyWriter{
+		flush: func() error {
+			flushed = true
+			return nil
+		},
+		flushPending: false,
+		logger:       zap.NewNop(),
+	}
+
+	mlw.stop()
+
+	if flushed {
+		t.Errorf("expected flush() NOT to be called on stop() when flushPending is false")
+	}
+}
+
+func TestMaxLatencyWriterStopHandlesFlushError(t *testing.T) {
+	mlw := &maxLatencyWriter{
+		flush: func() error {
+			return errors.New("flush failed")
+		},
+		flushPending: true,
+		logger:       zap.NewNop(),
+	}
+
+	// Must not panic or fail cleanup
+	mlw.stop()
+
+	if mlw.flushPending {
+		t.Errorf("expected flushPending to be false after stop() even if flush returns an error")
+	}
+}
+
+func TestHandlerCopyResponseWithFlushIntervalFlushesTrailingBytes(t *testing.T) {
+	h := Handler{}
+	recorder := httptest.NewRecorder()
+	src := strings.NewReader("hello world streaming")
+
+	err := h.copyResponse(recorder, src, 100*time.Millisecond, zap.NewNop())
+	if err != nil {
+		t.Fatalf("copyResponse failed: %v", err)
+	}
+
+	if !recorder.Flushed {
+		t.Errorf("expected recorder to be flushed upon stream completion")
+	}
+	if recorder.Body.String() != "hello world streaming" {
+		t.Errorf("got %q, want %q", recorder.Body.String(), "hello world streaming")
+	}
+}
+
