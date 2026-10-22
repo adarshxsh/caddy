@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -528,5 +529,137 @@ func testReplacer() Replacer {
 		providers: make([]replacementProvider, 0),
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
+	}
+}
+
+func TestFileReplacementStatCache(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "caddy_file_cache_test_*.txt")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	content1 := "initial content\n"
+	if _, err := tmpFile.WriteString(content1); err != nil {
+		t.Fatalf("failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	defaultFileCache.clear()
+	rep := NewReplacer()
+
+	fileKey := "file." + tmpFile.Name()
+
+	val1, ok1 := rep.Get(fileKey)
+	if !ok1 || val1 != "initial content" {
+		t.Fatalf("expected 'initial content', got val: %v, ok: %v", val1, ok1)
+	}
+
+	// Repeated fetch should return cached content
+	val2, ok2 := rep.Get(fileKey)
+	if !ok2 || val2 != "initial content" {
+		t.Fatalf("expected cached 'initial content', got val: %v, ok: %v", val2, ok2)
+	}
+
+	// Overwrite file on disk and modify mtime
+	newContent := "modified content\n"
+	if err := os.WriteFile(tmpFile.Name(), []byte(newContent), 0644); err != nil {
+		t.Fatalf("failed to overwrite temp file: %v", err)
+	}
+
+	// In case filesystem mtime resolution is coarse (e.g. 1s), adjust mtime into future
+	futureTime := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(tmpFile.Name(), futureTime, futureTime)
+
+	val3, ok3 := rep.Get(fileKey)
+	if !ok3 || val3 != "modified content" {
+		t.Fatalf("expected updated 'modified content', got val: %v, ok: %v", val3, ok3)
+	}
+}
+
+func TestFileCacheBoundedCapacity(t *testing.T) {
+	fc := newFileCache(2)
+	now := time.Now()
+
+	fc.set("file1.txt", "content1", now, 10)
+	fc.set("file2.txt", "content2", now, 10)
+
+	if v, ok := fc.get("file1.txt", now, 10); !ok || v != "content1" {
+		t.Errorf("expected file1.txt content1, got %v, %v", v, ok)
+	}
+
+	// Adding file3.txt when capacity is 2 triggers eviction
+	fc.set("file3.txt", "content3", now, 10)
+
+	fc.mu.RLock()
+	count := len(fc.items)
+	fc.mu.RUnlock()
+
+	if count > 2 {
+		t.Errorf("expected max entries 2, got %d", count)
+	}
+
+	if v, ok := fc.get("file3.txt", now, 10); !ok || v != "content3" {
+		t.Errorf("expected file3.txt content3, got %v, %v", v, ok)
+	}
+}
+
+func TestWorkingDirOnce(t *testing.T) {
+	wd1 := getWorkingDir()
+	if wd1 == "" {
+		t.Errorf("expected non-empty working directory")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wd := getWorkingDir()
+			if wd != wd1 {
+				t.Errorf("expected working directory %s, got %s", wd1, wd)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestReadFileIntoBufferPool(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "caddy_buf_pool_test_*.txt")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	expectedContent := "pooled buffer test content\r\n"
+	if _, err := tmpFile.WriteString(expectedContent); err != nil {
+		t.Fatalf("failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	bytesRead, err := readFileIntoBuffer(tmpFile.Name(), 1024)
+	if err != nil {
+		t.Fatalf("readFileIntoBuffer failed: %v", err)
+	}
+
+	if string(bytesRead) != expectedContent {
+		t.Fatalf("expected '%s', got '%s'", expectedContent, string(bytesRead))
+	}
+}
+
+func BenchmarkFileReplacer(b *testing.B) {
+	tmpDir := b.TempDir()
+	tmpFile := filepath.Join(tmpDir, "bench.txt")
+	if err := os.WriteFile(tmpFile, []byte("bench content\n"), 0644); err != nil {
+		b.Fatalf("failed to write tmp file: %v", err)
+	}
+
+	rep := NewReplacer()
+	ph := "{file." + tmpFile + "}"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rep.ReplaceAll(ph, "")
 	}
 }
