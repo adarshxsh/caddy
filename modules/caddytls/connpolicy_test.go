@@ -20,9 +20,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
@@ -360,4 +362,100 @@ func TestClientAuthenticationProvision(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEncryptedClientHelloKeysRace(t *testing.T) {
+	tlsApp := TLS{
+		EncryptedClientHello: &ECH{
+			Configs: []ECHConfiguration{
+				{PublicName: "example.com"},
+			},
+		},
+	}
+	cfg := &caddy.Config{
+		AppsRaw: caddy.ModuleMap{
+			"tls": caddyconfig.JSON(tlsApp, nil),
+		},
+	}
+	ctx, err := caddy.ProvisionContext(cfg)
+	if err != nil {
+		t.Fatalf("ProvisionContext failed: %v", err)
+	}
+
+	appIface, err := ctx.AppIfConfigured("tls")
+	if err != nil {
+		t.Fatalf("AppIfConfigured failed: %v", err)
+	}
+	app := appIface.(*TLS)
+
+	// Populate initial configs and stdlibReady
+	app.EncryptedClientHello.configsMu.Lock()
+	app.EncryptedClientHello.configs = map[string][]echConfig{
+		"example.com": {
+			{
+				configBin:  []byte("config1"),
+				privKeyBin: []byte("key1"),
+			},
+		},
+	}
+	app.EncryptedClientHello.updateKeyList()
+	app.EncryptedClientHello.configsMu.Unlock()
+
+	policies := ConnectionPolicies{
+		{
+			matchers: []ConnectionMatcher{MatchServerName{"example.com"}},
+		},
+	}
+
+	tlsCfg := policies.TLSConfig(ctx)
+	if tlsCfg.GetEncryptedClientHelloKeys == nil {
+		t.Fatal("GetEncryptedClientHelloKeys is nil")
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	// Goroutine 1: Rapidly invoke GetEncryptedClientHelloKeys and inspect/read returned keys
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 500; j++ {
+				keys, err := tlsCfg.GetEncryptedClientHelloKeys(nil)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				for _, k := range keys {
+					_ = len(k.Config)
+					_ = len(k.PrivateKey)
+					_ = k.SendAsRetry
+				}
+			}
+		}()
+	}
+
+	// Goroutine 2: Rapidly update key list (rotation)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 500; j++ {
+				app.EncryptedClientHello.configsMu.Lock()
+				app.EncryptedClientHello.configs["example.com"] = []echConfig{
+					{
+						configBin:  []byte(fmt.Sprintf("config-%d-%d", id, j)),
+						privKeyBin: []byte(fmt.Sprintf("key-%d-%d", id, j)),
+					},
+				}
+				app.EncryptedClientHello.updateKeyList()
+				app.EncryptedClientHello.configsMu.Unlock()
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
 }
