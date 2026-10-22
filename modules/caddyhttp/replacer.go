@@ -59,6 +59,106 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 	SetVar(req.Context(), "start_time", time.Now())
 	SetVar(req.Context(), "uuid", new(requestID))
 
+	// Request-scoped memoization cache for replacer placeholders
+	var (
+		reqHostVal    any
+		reqPortVal    any
+		reqHostLabels []any
+		reqHostSplit  bool
+
+		localHostVal   any
+		localPortVal   any
+		localAddrSplit bool
+
+		remoteHostVal   any
+		remoteHostStr   string
+		remotePortVal   any
+		remoteAddrSplit bool
+
+		remotePrefixCache map[string]any
+
+		prefixedQueryVal     any
+		prefixedQuerySet     bool
+		origPrefixedQueryVal any
+		origPrefixedQuerySet bool
+	)
+
+	splitReqHost := func() {
+		reqHostSplit = true
+		host, port, err := net.SplitHostPort(req.Host)
+		if err != nil {
+			reqHostVal = req.Host
+			reqPortVal = ""
+			rawLabels := strings.Split(req.Host, ".")
+			reqHostLabels = make([]any, len(rawLabels))
+			for i, l := range rawLabels {
+				reqHostLabels[i] = strings.ToLower(l)
+			}
+		} else {
+			reqHostVal = host
+			if portNum, err := strconv.Atoi(port); err == nil {
+				reqPortVal = portNum
+			} else {
+				reqPortVal = port
+			}
+			rawLabels := strings.Split(host, ".")
+			reqHostLabels = make([]any, len(rawLabels))
+			for i, l := range rawLabels {
+				reqHostLabels[i] = strings.ToLower(l)
+			}
+		}
+	}
+
+	splitLocalAddr := func() {
+		localAddrSplit = true
+		localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+		if localAddr == nil {
+			localHostVal = nil
+			localPortVal = nil
+			return
+		}
+		host, port, err := net.SplitHostPort(localAddr.String())
+		if err != nil {
+			// localAddr is host:port for tcp and udp sockets and /unix/socket.path
+			// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
+			// not unix sockets and will fail with the latter.
+			// We assume when net.SplitHostPort fails, localAddr is a unix socket and thus
+			// already "split" and save to return.
+			localHostVal = localAddr
+			localPortVal = ""
+		} else {
+			localHostVal = host
+			if portNum, err := strconv.Atoi(port); err == nil {
+				localPortVal = portNum
+			} else {
+				localPortVal = port
+			}
+		}
+	}
+
+	splitRemoteAddr := func() {
+		remoteAddrSplit = true
+		host, port, err := net.SplitHostPort(req.RemoteAddr)
+		if err != nil {
+			// req.RemoteAddr is host:port for tcp and udp sockets and /unix/socket.path
+			// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
+			// not unix sockets and will fail with the latter.
+			// We assume when net.SplitHostPort fails, req.RemoteAddr is a unix socket
+			// and thus already "split" and save to return.
+			remoteHostVal = req.RemoteAddr
+			remoteHostStr = req.RemoteAddr
+			remotePortVal = ""
+		} else {
+			remoteHostVal = host
+			remoteHostStr = host
+			if portNum, err := strconv.Atoi(port); err == nil {
+				remotePortVal = portNum
+			} else {
+				remotePortVal = port
+			}
+		}
+	}
+
 	httpVars := func(key string) (any, bool) {
 		if req != nil {
 			// query string parameters
@@ -114,41 +214,33 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				}
 				return req.Proto, true
 			case "http.request.host":
-				host, _, err := net.SplitHostPort(req.Host)
-				if err != nil {
-					return req.Host, true // OK; there probably was no port
+				if !reqHostSplit {
+					splitReqHost()
 				}
-				return host, true
+				return reqHostVal, true
 			case "http.request.port":
-				_, port, _ := net.SplitHostPort(req.Host)
-				if portNum, err := strconv.Atoi(port); err == nil {
-					return portNum, true
+				if !reqHostSplit {
+					splitReqHost()
 				}
-				return port, true
+				return reqPortVal, true
 			case "http.request.hostport":
 				return req.Host, true
 			case "http.request.local":
 				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				if localAddr == nil {
+					return nil, true
+				}
 				return localAddr.String(), true
 			case "http.request.local.host":
-				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-				host, _, err := net.SplitHostPort(localAddr.String())
-				if err != nil {
-					// localAddr is host:port for tcp and udp sockets and /unix/socket.path
-					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
-					// not unix sockets and will fail with the latter.
-					// We assume when net.SplitHostPort fails, localAddr is a unix socket and thus
-					// already "split" and save to return.
-					return localAddr, true
+				if !localAddrSplit {
+					splitLocalAddr()
 				}
-				return host, true
+				return localHostVal, true
 			case "http.request.local.port":
-				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-				_, port, _ := net.SplitHostPort(localAddr.String())
-				if portNum, err := strconv.Atoi(port); err == nil {
-					return portNum, true
+				if !localAddrSplit {
+					splitLocalAddr()
 				}
-				return port, true
+				return localPortVal, true
 			case "http.request.remote":
 				if req.TLS != nil && !req.TLS.HandshakeComplete {
 					// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
@@ -160,22 +252,15 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 					// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
 					return nil, true
 				}
-				host, _, err := net.SplitHostPort(req.RemoteAddr)
-				if err != nil {
-					// req.RemoteAddr is host:port for tcp and udp sockets and /unix/socket.path
-					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
-					// not unix sockets and will fail with the latter.
-					// We assume when net.SplitHostPort fails, req.RemoteAddr is a unix socket
-					// and thus already "split" and save to return.
-					return req.RemoteAddr, true
+				if !remoteAddrSplit {
+					splitRemoteAddr()
 				}
-				return host, true
+				return remoteHostVal, true
 			case "http.request.remote.port":
-				_, port, _ := net.SplitHostPort(req.RemoteAddr)
-				if portNum, err := strconv.Atoi(port); err == nil {
-					return portNum, true
+				if !remoteAddrSplit {
+					splitRemoteAddr()
 				}
-				return port, true
+				return remotePortVal, true
 
 			// current URI, including any internal rewrites
 			case "http.request.uri":
@@ -201,10 +286,13 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			case "http.request.uri.query_escaped":
 				return url.QueryEscape(req.URL.RawQuery), true
 			case "http.request.uri.prefixed_query":
-				if req.URL.RawQuery == "" {
-					return "", true
+				if !prefixedQuerySet {
+					if req.URL.RawQuery != "" {
+						prefixedQueryVal = "?" + req.URL.RawQuery
+					}
+					prefixedQuerySet = true
 				}
-				return "?" + req.URL.RawQuery, true
+				return prefixedQueryVal, true
 			case "http.request.duration":
 				start := GetVar(req.Context(), "start_time").(time.Time)
 				return time.Since(start), true
@@ -274,24 +362,33 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
 				return or.URL.RawQuery, true
 			case "http.request.orig_uri.prefixed_query":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				if or.URL.RawQuery == "" {
-					return "", true
+				if !origPrefixedQuerySet {
+					or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+					if or.URL.RawQuery != "" {
+						origPrefixedQueryVal = "?" + or.URL.RawQuery
+					}
+					origPrefixedQuerySet = true
 				}
-				return "?" + or.URL.RawQuery, true
+				return origPrefixedQueryVal, true
 			}
 
 			// remote IP range/prefix (e.g. keep top 24 bits of 1.2.3.4  => "1.2.3.0/24")
 			// syntax: "/V4,V6" where V4 = IPv4 bits, and V6 = IPv6 bits; if no comma, then same bit length used for both
 			// (EXPERIMENTAL)
 			if strings.HasPrefix(key, "http.request.remote.host/") {
-				host, _, err := net.SplitHostPort(req.RemoteAddr)
-				if err != nil {
-					host = req.RemoteAddr // assume no port, I guess?
+				if val, ok := remotePrefixCache[key]; ok {
+					return val, true
 				}
-				addr, err := netip.ParseAddr(host)
+				if !remoteAddrSplit {
+					splitRemoteAddr()
+				}
+				if remotePrefixCache == nil {
+					remotePrefixCache = make(map[string]any)
+				}
+				addr, err := netip.ParseAddr(remoteHostStr)
 				if err != nil {
-					return host, true // not an IP address
+					remotePrefixCache[key] = remoteHostStr
+					return remoteHostStr, true // not an IP address
 				}
 				// extract the bits from the end of the placeholder (start after "/") then split on ","
 				bitsBoth := key[strings.Index(key, "/")+1:]
@@ -303,13 +400,17 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				// convert to integer then compute prefix
 				bits, err := strconv.Atoi(bitsStr)
 				if err != nil {
+					remotePrefixCache[key] = ""
 					return "", true
 				}
 				prefix, err := addr.Prefix(bits)
 				if err != nil {
+					remotePrefixCache[key] = ""
 					return "", true
 				}
-				return prefix.String(), true
+				prefixStr := prefix.String()
+				remotePrefixCache[key] = prefixStr
+				return prefixStr, true
 			}
 
 			// hostname labels (case insensitive, so normalize to lowercase)
@@ -319,15 +420,13 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil || idx < 0 {
 					return "", false
 				}
-				reqHost, _, err := net.SplitHostPort(req.Host)
-				if err != nil {
-					reqHost = req.Host // OK; assume there was no port
+				if !reqHostSplit {
+					splitReqHost()
 				}
-				hostLabels := strings.Split(reqHost, ".")
-				if idx >= len(hostLabels) {
+				if idx >= len(reqHostLabels) {
 					return "", true
 				}
-				return strings.ToLower(hostLabels[len(hostLabels)-idx-1]), true
+				return reqHostLabels[len(reqHostLabels)-idx-1], true
 			}
 
 			// path parts
