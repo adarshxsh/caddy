@@ -156,9 +156,20 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	}()
 	defer close(backConnCloseCh)
 
+	userConn := &syncWriterConn{ReadWriteCloser: conn}
+	backConnWrapper := &syncWriterConn{ReadWriteCloser: backConn}
+
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			userConn.Close()
+			backConnWrapper.Close()
+		})
+	}
+
 	start := time.Now()
 	defer func() {
-		conn.Close()
+		closeBoth()
 		if c := logger.Check(zapcore.DebugLevel, "connection closed"); c != nil {
 			c.Write(zap.Duration("duration", time.Since(start)))
 		}
@@ -175,7 +186,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	// see: https://github.com/caddyserver/caddy/issues/6273
 	if buffered := brw.Reader.Buffered(); buffered > 0 {
 		data, _ := brw.Peek(buffered)
-		_, err := backConn.Write(data)
+		_, err := backConnWrapper.Write(data)
 		if err != nil {
 			if c := logger.Check(zapcore.DebugLevel, "backConn write failed"); c != nil {
 				c.Write(zap.Error(err))
@@ -199,16 +210,49 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 		return nil
 	}
-	deleteFrontConn := h.registerConnection(conn, gracefulClose(conn, false))
-	deleteBackConn := h.registerConnection(backConn, gracefulClose(backConn, true))
+	deleteFrontConn := h.registerConnection(userConn, gracefulClose(userConn, false))
+	deleteBackConn := h.registerConnection(backConnWrapper, gracefulClose(backConnWrapper, true))
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
+		user:       userConn,
+		backend:    backConnWrapper,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
+	}
+
+	keepaliveStop := make(chan struct{})
+	defer close(keepaliveStop)
+
+	if isWebsocket(req) && h.StreamKeepAlive > 0 {
+		interval := time.Duration(h.StreamKeepAlive)
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-keepaliveStop:
+					return
+				case <-ticker.C:
+					if err := writePingControl(userConn, false); err != nil {
+						if c := logger.Check(zapcore.DebugLevel, "keepalive ping to user failed"); c != nil {
+							c.Write(zap.Error(err))
+						}
+						closeBoth()
+						return
+					}
+					if err := writePingControl(backConnWrapper, true); err != nil {
+						if c := logger.Check(zapcore.DebugLevel, "keepalive ping to backend failed"); c != nil {
+							c.Write(zap.Error(err))
+						}
+						closeBoth()
+						return
+					}
+				}
+			}
+		}()
 	}
 
 	// setup the timeout if requested
@@ -508,6 +552,40 @@ func writeCloseControl(conn io.Writer, isClient bool) error {
 	// TODO: we might need to ensure we are the exclusive writer by this point (io.Copy is stopped)?
 	_, err := conn.Write(buf[:msgLength])
 	return err
+}
+
+// writePingControl sends an RFC 6455 Ping control message (opcode 0x9) to the connection.
+// If isClient is true, the frame header sets the mask bit and includes a 4-byte mask key per Section 5.3.
+func writePingControl(conn io.Writer, isClient bool) error {
+	const pingMessage = 9
+	const finalBit = 1 << 7
+	const maskBit = 1 << 7
+
+	b0 := byte(pingMessage) | finalBit
+	var buf []byte
+	if isClient {
+		b1 := byte(maskBit)
+		key := newMaskKey()
+		buf = []byte{b0, b1, key[0], key[1], key[2], key[3]}
+	} else {
+		b1 := byte(0)
+		buf = []byte{b0, b1}
+	}
+	_, err := conn.Write(buf)
+	return err
+}
+
+// syncWriterConn wraps a ReadWriteCloser with a Mutex to ensure
+// thread-safe concurrent writes (e.g. data frames and control frames).
+type syncWriterConn struct {
+	io.ReadWriteCloser
+	mu sync.Mutex
+}
+
+func (s *syncWriterConn) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ReadWriteCloser.Write(p)
 }
 
 // Copied from https://github.com/gorilla/websocket/blob/v1.5.0/mask.go
