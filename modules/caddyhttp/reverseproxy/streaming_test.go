@@ -80,3 +80,34 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestNewMaskKey(t *testing.T) {
+	keys := make([][4]byte, 10)
+	for i := range keys {
+		keys[i] = newMaskKey()
+		if len(keys[i]) != 4 {
+			t.Fatalf("key[%d] length = %d, want 4", i, len(keys[i]))
+		}
+	}
+
+	// Verify non-zero keys
+	allZero := true
+	for _, k := range keys {
+		if k != [4]byte{0, 0, 0, 0} {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		t.Error("all generated mask keys were zero")
+	}
+
+	// Verify sequential keys show distinct randomness
+	distinct := make(map[[4]byte]bool)
+	for _, k := range keys {
+		distinct[k] = true
+	}
+	if len(distinct) < len(keys) {
+		t.Errorf("got duplicate mask keys out of %d generated keys: %v", len(keys), keys)
+	}
+}
