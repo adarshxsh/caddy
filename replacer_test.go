@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -530,3 +531,118 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestFileReplacementCache(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "caddy_file_cache_test_*.txt")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	content1 := "initial content\n"
+	if _, err := tmpFile.WriteString(content1); err != nil {
+		t.Fatalf("failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	defaultFileCache.clear()
+	rep := NewReplacer()
+
+	fileKey := "file." + tmpFile.Name()
+
+	val1, ok1 := rep.Get(fileKey)
+	if !ok1 || val1 != "initial content" {
+		t.Fatalf("expected 'initial content', got val: %v, ok: %v", val1, ok1)
+	}
+
+	// Overwrite file on disk
+	if err := os.WriteFile(tmpFile.Name(), []byte("modified content\n"), 0644); err != nil {
+		t.Fatalf("failed to overwrite temp file: %v", err)
+	}
+
+	// Should still return cached value
+	val2, ok2 := rep.Get(fileKey)
+	if !ok2 || val2 != "initial content" {
+		t.Fatalf("expected cached 'initial content', got val: %v, ok: %v", val2, ok2)
+	}
+
+	// Clear cache and verify fresh read
+	defaultFileCache.clear()
+	val3, ok3 := rep.Get(fileKey)
+	if !ok3 || val3 != "modified content" {
+		t.Fatalf("expected fresh 'modified content', got val: %v, ok: %v", val3, ok3)
+	}
+}
+
+func TestFileCacheEvictionAndTTL(t *testing.T) {
+	fc := newFileCache(2, 50*time.Millisecond)
+
+	fc.set("key1", "val1")
+	fc.set("key2", "val2")
+
+	if v, ok := fc.get("key1"); !ok || v != "val1" {
+		t.Errorf("expected key1 val1, got %v, %v", v, ok)
+	}
+
+	// Adding key3 when max size is 2 should evict oldest
+	time.Sleep(10 * time.Millisecond)
+	fc.set("key3", "val3")
+
+	if _, ok := fc.get("key1"); ok {
+		t.Errorf("expected key1 to be evicted when capacity reached")
+	}
+
+	if v, ok := fc.get("key3"); !ok || v != "val3" {
+		t.Errorf("expected key3 val3, got %v, %v", v, ok)
+	}
+
+	// Wait for TTL expiration
+	time.Sleep(60 * time.Millisecond)
+	if _, ok := fc.get("key3"); ok {
+		t.Errorf("expected key3 to be expired after TTL")
+	}
+}
+
+func TestWorkingDirOnce(t *testing.T) {
+	wd1 := getWorkingDir()
+	if wd1 == "" {
+		t.Errorf("expected non-empty working directory")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wd := getWorkingDir()
+			if wd != wd1 {
+				t.Errorf("expected working directory %s, got %s", wd1, wd)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestReadFileIntoBufferPool(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "caddy_buf_pool_test_*.txt")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	expectedContent := "pooled buffer test content\r\n"
+	if _, err := tmpFile.WriteString(expectedContent); err != nil {
+		t.Fatalf("failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	bytesRead, err := readFileIntoBuffer(tmpFile.Name(), 1024)
+	if err != nil {
+		t.Fatalf("readFileIntoBuffer failed: %v", err)
+	}
+
+	if string(bytesRead) != expectedContent {
+		t.Fatalf("expected '%s', got '%s'", expectedContent, string(bytesRead))
+	}
+}
+

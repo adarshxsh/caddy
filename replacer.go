@@ -356,20 +356,25 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 		return nil, false
 	}
 
+	if val, ok := defaultFileCache.get(key); ok {
+		return val, true
+	}
+
 	filename := key[len(filePrefix):]
 	maxSize := 1024 * 1024
 	body, err := readFileIntoBuffer(filename, maxSize)
 	if err != nil {
-		wd, _ := os.Getwd()
 		Log().Error("placeholder: failed to read file",
 			zap.String("file", filename),
-			zap.String("working_dir", wd),
+			zap.String("working_dir", getWorkingDir()),
 			zap.Error(err))
 		return nil, true
 	}
 	body = bytes.TrimSuffix(body, []byte("\n"))
 	body = bytes.TrimSuffix(body, []byte("\r"))
-	return string(body), true
+	content := string(body)
+	defaultFileCache.set(key, content)
+	return content, true
 }
 
 // globalDefaultReplacementProvider handles replacements
@@ -394,9 +399,7 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	case "system.os":
 		return runtime.GOOS, true
 	case "system.wd":
-		// OK if there is an error; just return empty string
-		wd, _ := os.Getwd()
-		return wd, true
+		return getWorkingDir(), true
 	case "system.arch":
 		return runtime.GOARCH, true
 	case "time.now":
@@ -427,11 +430,113 @@ func readFileIntoBuffer(filename string, size int) ([]byte, error) {
 	}
 	defer file.Close()
 
-	// io.LimitReader ensures we never read more than 'size' bytes.
-	// io.ReadAll starts with a small buffer and grows it as needed,
-	// preventing a massive 1MB allocation for small files.
-	return io.ReadAll(io.LimitReader(file, int64(size)))
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	_, err = buf.ReadFrom(io.LimitReader(file, int64(size)))
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]byte, buf.Len())
+	copy(res, buf.Bytes())
+	return res, nil
 }
+
+var (
+	workingDir     string
+	workingDirOnce sync.Once
+)
+
+func getWorkingDir() string {
+	workingDirOnce.Do(func() {
+		workingDir, _ = os.Getwd()
+	})
+	return workingDir
+}
+
+type fileCacheEntry struct {
+	content   string
+	createdAt time.Time
+}
+
+type fileCache struct {
+	mu      sync.RWMutex
+	entries map[string]fileCacheEntry
+	maxSize int
+	ttl     time.Duration
+}
+
+func newFileCache(maxSize int, ttl time.Duration) *fileCache {
+	return &fileCache{
+		entries: make(map[string]fileCacheEntry),
+		maxSize: maxSize,
+		ttl:     ttl,
+	}
+}
+
+func (c *fileCache) get(key string) (string, bool) {
+	c.mu.RLock()
+	entry, found := c.entries[key]
+	c.mu.RUnlock()
+
+	if !found {
+		return "", false
+	}
+
+	if c.ttl > 0 && time.Since(entry.createdAt) > c.ttl {
+		c.mu.Lock()
+		delete(c.entries, key)
+		c.mu.Unlock()
+		return "", false
+	}
+
+	return entry.content, true
+}
+
+func (c *fileCache) set(key string, content string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	if len(c.entries) >= c.maxSize {
+		for k, e := range c.entries {
+			if c.ttl > 0 && now.Sub(e.createdAt) > c.ttl {
+				delete(c.entries, k)
+			}
+		}
+	}
+
+	if len(c.entries) >= c.maxSize {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, e := range c.entries {
+			if first || e.createdAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = e.createdAt
+				first = false
+			}
+		}
+		if !first {
+			delete(c.entries, oldestKey)
+		}
+	}
+
+	c.entries[key] = fileCacheEntry{
+		content:   content,
+		createdAt: now,
+	}
+}
+
+func (c *fileCache) clear() {
+	c.mu.Lock()
+	c.entries = make(map[string]fileCacheEntry)
+	c.mu.Unlock()
+}
+
+var defaultFileCache = newFileCache(100, 2*time.Second)
 
 // ReplacementFunc is a function that is called when a
 // replacement is being performed. It receives the
