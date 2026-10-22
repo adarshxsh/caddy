@@ -59,23 +59,45 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 	SetVar(req.Context(), "start_time", time.Now())
 	SetVar(req.Context(), "uuid", new(requestID))
 
+	var (
+		parsedQuery  url.Values
+		lastRawQuery string
+		queryParsed  bool
+	)
+
 	httpVars := func(key string) (any, bool) {
 		if req != nil {
 			// query string parameters
 			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
-				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
+				param := key[len(reqURIQueryReplPrefix):]
+				if req.URL == nil || req.URL.RawQuery == "" {
+					// always return true, since the query param might
+					// be present only in some requests
+					return "", true
+				}
+				if !queryParsed || req.URL.RawQuery != lastRawQuery {
+					parsedQuery = req.URL.Query()
+					lastRawQuery = req.URL.RawQuery
+					queryParsed = true
+				}
 				// always return true, since the query param might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return formatHeaderOrQueryValues(parsedQuery[param]), true
 			}
 
 			// request header fields
 			if strings.HasPrefix(key, reqHeaderReplPrefix) {
 				field := key[len(reqHeaderReplPrefix):]
-				vals := req.Header[textproto.CanonicalMIMEHeaderKey(field)]
+				vals, ok := req.Header[field]
+				if !ok {
+					canonicalKey := textproto.CanonicalMIMEHeaderKey(field)
+					if canonicalKey != field {
+						vals = req.Header[canonicalKey]
+					}
+				}
 				// always return true, since the header field might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return formatHeaderOrQueryValues(vals), true
 			}
 
 			// cookies
@@ -385,10 +407,17 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// response header fields
 			if strings.HasPrefix(key, respHeaderReplPrefix) {
 				field := key[len(respHeaderReplPrefix):]
-				vals := w.Header()[textproto.CanonicalMIMEHeaderKey(field)]
+				h := w.Header()
+				vals, ok := h[field]
+				if !ok {
+					canonicalKey := textproto.CanonicalMIMEHeaderKey(field)
+					if canonicalKey != field {
+						vals = h[canonicalKey]
+					}
+				}
 				// always return true, since the header field might
 				// be present only in some responses
-				return strings.Join(vals, ","), true
+				return formatHeaderOrQueryValues(vals), true
 			}
 		}
 
@@ -597,3 +626,14 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+func formatHeaderOrQueryValues(vals []string) string {
+	switch len(vals) {
+	case 0:
+		return ""
+	case 1:
+		return vals[0]
+	default:
+		return strings.Join(vals, ",")
+	}
+}
