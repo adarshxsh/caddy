@@ -357,19 +357,37 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 	}
 
 	filename := key[len(filePrefix):]
+
+	info, err := os.Stat(filename)
+	if err != nil {
+		defaultFileCache.delete(filename)
+		Log().Error("placeholder: failed to read file",
+			zap.String("file", filename),
+			zap.String("working_dir", getWorkingDir()),
+			zap.Error(err))
+		return nil, true
+	}
+
+	if content, ok := defaultFileCache.get(filename, info.ModTime(), info.Size()); ok {
+		return content, true
+	}
+
 	maxSize := 1024 * 1024
 	body, err := readFileIntoBuffer(filename, maxSize)
 	if err != nil {
-		wd, _ := os.Getwd()
+		defaultFileCache.delete(filename)
 		Log().Error("placeholder: failed to read file",
 			zap.String("file", filename),
-			zap.String("working_dir", wd),
+			zap.String("working_dir", getWorkingDir()),
 			zap.Error(err))
 		return nil, true
 	}
 	body = bytes.TrimSuffix(body, []byte("\n"))
 	body = bytes.TrimSuffix(body, []byte("\r"))
-	return string(body), true
+	content := string(body)
+
+	defaultFileCache.set(filename, content, info.ModTime(), info.Size())
+	return content, true
 }
 
 // globalDefaultReplacementProvider handles replacements
@@ -394,9 +412,7 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	case "system.os":
 		return runtime.GOOS, true
 	case "system.wd":
-		// OK if there is an error; just return empty string
-		wd, _ := os.Getwd()
-		return wd, true
+		return getWorkingDir(), true
 	case "system.arch":
 		return runtime.GOARCH, true
 	case "time.now":
@@ -419,7 +435,7 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	return nil, false
 }
 
-// readFileIntoBuffer reads the file at filePath into a size limited buffer.
+// readFileIntoBuffer reads the file at filePath into a size limited buffer using pooled buffers.
 func readFileIntoBuffer(filename string, size int) ([]byte, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -427,11 +443,94 @@ func readFileIntoBuffer(filename string, size int) ([]byte, error) {
 	}
 	defer file.Close()
 
-	// io.LimitReader ensures we never read more than 'size' bytes.
-	// io.ReadAll starts with a small buffer and grows it as needed,
-	// preventing a massive 1MB allocation for small files.
-	return io.ReadAll(io.LimitReader(file, int64(size)))
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	_, err = buf.ReadFrom(io.LimitReader(file, int64(size)))
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]byte, buf.Len())
+	copy(res, buf.Bytes())
+	return res, nil
 }
+
+var getWorkingDir = sync.OnceValue(func() string {
+	wd, _ := os.Getwd()
+	return wd
+})
+
+type fileCacheEntry struct {
+	content string
+	modTime time.Time
+	size    int64
+}
+
+type fileCache struct {
+	mu         sync.RWMutex
+	items      map[string]fileCacheEntry
+	maxEntries int
+}
+
+func newFileCache(maxEntries int) *fileCache {
+	if maxEntries <= 0 {
+		maxEntries = 100
+	}
+	return &fileCache{
+		items:      make(map[string]fileCacheEntry),
+		maxEntries: maxEntries,
+	}
+}
+
+func (c *fileCache) get(key string, modTime time.Time, size int64) (string, bool) {
+	c.mu.RLock()
+	entry, ok := c.items[key]
+	c.mu.RUnlock()
+
+	if !ok {
+		return "", false
+	}
+	if !entry.modTime.Equal(modTime) || entry.size != size {
+		return "", false
+	}
+	return entry.content, true
+}
+
+func (c *fileCache) set(key, content string, modTime time.Time, size int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.items) >= c.maxEntries {
+		if _, ok := c.items[key]; !ok {
+			for k := range c.items {
+				delete(c.items, k)
+				break
+			}
+		}
+	}
+
+	c.items[key] = fileCacheEntry{
+		content: content,
+		modTime: modTime,
+		size:    size,
+	}
+}
+
+func (c *fileCache) delete(key string) {
+	c.mu.Lock()
+	delete(c.items, key)
+	c.mu.Unlock()
+}
+
+func (c *fileCache) clear() {
+	c.mu.Lock()
+	c.items = make(map[string]fileCacheEntry)
+	c.mu.Unlock()
+}
+
+var defaultFileCache = newFileCache(100)
 
 // ReplacementFunc is a function that is called when a
 // replacement is being performed. It receives the
