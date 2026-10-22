@@ -186,6 +186,10 @@ type Handler struct {
 	// by the previous config closing. Default: no delay.
 	StreamCloseDelay caddy.Duration `json:"stream_close_delay,omitempty"`
 
+	// If nonzero, write operations on upgraded streaming connections (such as WebSockets)
+	// will enforce this write timeout per write buffer. Default: 30s.
+	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
+
 	// If configured, rewrites the copy of the upstream request.
 	// Allows changing the request method and URI (path and query).
 	// Since the rewrite is applied to the copy, it does not persist
