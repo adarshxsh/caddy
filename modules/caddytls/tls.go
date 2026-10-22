@@ -697,6 +697,21 @@ func (t *TLS) RegisterServerNames(dnsNames, alpnValues []string) {
 	}
 }
 
+// ServerNames returns a thread-safe snapshot of registered server names.
+func (t *TLS) ServerNames() []string {
+	if t == nil || t.serverNamesMu == nil {
+		return nil
+	}
+	t.serverNamesMu.Lock()
+	defer t.serverNamesMu.Unlock()
+
+	names := make([]string, 0, len(t.serverNames))
+	for name := range t.serverNames {
+		names = append(names, name)
+	}
+	return names
+}
+
 func (t *TLS) alpnValuesForServerNames(dnsNames []string) map[string][]string {
 	t.serverNamesMu.Lock()
 	defer t.serverNamesMu.Unlock()
