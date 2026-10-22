@@ -36,6 +36,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -223,34 +224,18 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return id.String(), true
 
 			case "http.request.body":
-				if req.Body == nil {
+				bodyBytes, ok := getOrReadRequestBody(req)
+				if !ok {
 					return "", true
 				}
-				// normally net/http will close the body for us, but since we
-				// are replacing it with a fake one, we have to ensure we close
-				// the real body ourselves when we're done
-				defer req.Body.Close()
-				// read the request body into a buffer (can't pool because we
-				// don't know its lifetime and would have to make a copy anyway)
-				buf := new(bytes.Buffer)
-				_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-				req.Body = io.NopCloser(buf)  // replace real body with buffered data
-				return buf.String(), true
+				return string(bodyBytes), true
 
 			case "http.request.body_base64":
-				if req.Body == nil {
+				bodyBytes, ok := getOrReadRequestBody(req)
+				if !ok {
 					return "", true
 				}
-				// normally net/http will close the body for us, but since we
-				// are replacing it with a fake one, we have to ensure we close
-				// the real body ourselves when we're done
-				defer req.Body.Close()
-				// read the request body into a buffer (can't pool because we
-				// don't know its lifetime and would have to make a copy anyway)
-				buf := new(bytes.Buffer)
-				_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-				req.Body = io.NopCloser(buf)  // replace real body with buffered data
-				return base64.StdEncoding.EncodeToString(buf.Bytes()), true
+				return base64.StdEncoding.EncodeToString(bodyBytes), true
 
 			// original request, before any internal changes
 			case "http.request.orig_method":
@@ -584,6 +569,48 @@ func (rid *requestID) String() string {
 		}
 	}
 	return rid.value
+}
+
+var bufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+func getOrReadRequestBody(req *http.Request) ([]byte, bool) {
+	if req == nil {
+		return nil, false
+	}
+	ctx := req.Context()
+	if ctx.Value(VarsCtxKey) == nil {
+		ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]any))
+		*req = *req.WithContext(ctx)
+	}
+	if v := GetVar(req.Context(), RequestBodyVarKey); v != nil {
+		switch body := v.(type) {
+		case []byte:
+			return body, true
+		case string:
+			return []byte(body), true
+		}
+	}
+	if req.Body == nil {
+		return nil, false
+	}
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	_, _ = io.Copy(buf, req.Body)
+	_ = req.Body.Close()
+
+	bodyBytes := bytes.Clone(buf.Bytes())
+	bufPool.Put(buf)
+
+	SetVar(req.Context(), RequestBodyVarKey, bodyBytes)
+	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	return bodyBytes, true
 }
 
 const (
