@@ -18,10 +18,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -294,5 +297,70 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestRequestBodyReplacerPoolingAndCaching(t *testing.T) {
+	payload := "hello caddy request body payload"
+	req, err := http.NewRequest(http.MethodPost, "/", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	repl := NewTestReplacer(req)
+
+	// First evaluation: {http.request.body}
+	bodyVal, ok := repl.GetString("http.request.body")
+	if !ok || bodyVal != payload {
+		t.Errorf("expected http.request.body to be %q, got %q (ok=%t)", payload, bodyVal, ok)
+	}
+
+	// Verify req.Body is now wrapped in bodyReadCloser
+	brc, isBRC := req.Body.(*bodyReadCloser)
+	if !isBRC {
+		t.Fatalf("expected req.Body to be wrapped in *bodyReadCloser, got %T", req.Body)
+	}
+
+	// Second evaluation: {http.request.body_base64} - should hit context cache
+	expectedBase64 := base64.StdEncoding.EncodeToString([]byte(payload))
+	base64Val, ok := repl.GetString("http.request.body_base64")
+	if !ok || base64Val != expectedBase64 {
+		t.Errorf("expected http.request.body_base64 to be %q, got %q (ok=%t)", expectedBase64, base64Val, ok)
+	}
+
+	// Third evaluation: {http.request.body} - should also hit context cache
+	bodyVal2, ok := repl.GetString("http.request.body")
+	if !ok || bodyVal2 != payload {
+		t.Errorf("expected cached http.request.body to be %q, got %q (ok=%t)", payload, bodyVal2, ok)
+	}
+
+	// Verify downstream handler can still read req.Body from bodyReadCloser
+	readPayload, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read req.Body downstream: %v", err)
+	}
+	if string(readPayload) != payload {
+		t.Errorf("expected downstream read to return %q, got %q", payload, string(readPayload))
+	}
+
+	// Close req.Body (returns buffer to pool)
+	if err := req.Body.Close(); err != nil {
+		t.Fatalf("failed to close req.Body: %v", err)
+	}
+
+	// Verify brc.buf was returned and cleared
+	if brc.buf != nil {
+		t.Errorf("expected brc.buf to be nil after Close()")
+	}
+
+	// Idempotent close check
+	if err := req.Body.Close(); err != nil {
+		t.Errorf("subsequent Close() returned error: %v", err)
+	}
+
+	// Evaluation after req.Body is closed - should still succeed via context cache
+	bodyVal3, ok := repl.GetString("http.request.body")
+	if !ok || bodyVal3 != payload {
+		t.Errorf("expected http.request.body after close to be %q, got %q (ok=%t)", payload, bodyVal3, ok)
 	}
 }
