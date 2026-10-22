@@ -16,11 +16,15 @@ package caddy
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
+	"unsafe"
 )
 
 func TestReplacer(t *testing.T) {
@@ -530,3 +534,126 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestTimePlaceholderCache(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	t1 := time.Date(2025, 5, 10, 12, 30, 45, 500000000, time.UTC)
+	nowFunc = func() time.Time { return t1 }
+
+	repl := NewReplacer()
+
+	// Look up second-granularity placeholders for t1
+	http1, ok := repl.GetString("time.now.http")
+	if !ok || http1 != t1.UTC().Format(http.TimeFormat) {
+		t.Errorf("time.now.http: expected %s, got %s", t1.UTC().Format(http.TimeFormat), http1)
+	}
+
+	commonLog1, ok := repl.GetString("time.now.common_log")
+	if !ok || commonLog1 != t1.Format("02/Jan/2006:15:04:05 -0700") {
+		t.Errorf("time.now.common_log: expected %s, got %s", t1.Format("02/Jan/2006:15:04:05 -0700"), commonLog1)
+	}
+
+	year1, ok := repl.GetString("time.now.year")
+	if !ok || year1 != strconv.Itoa(t1.Year()) {
+		t.Errorf("time.now.year: expected %s, got %s", strconv.Itoa(t1.Year()), year1)
+	}
+
+	unix1, ok := repl.GetString("time.now.unix")
+	if !ok || unix1 != strconv.FormatInt(t1.Unix(), 10) {
+		t.Errorf("time.now.unix: expected %s, got %s", strconv.FormatInt(t1.Unix(), 10), unix1)
+	}
+
+	// Uncached placeholders
+	nowVal, ok := repl.Get("time.now")
+	if !ok || nowVal != t1 {
+		t.Errorf("time.now: expected %v, got %v", t1, nowVal)
+	}
+
+	unixMs1, ok := repl.GetString("time.now.unix_ms")
+	expectedUnixMs := strconv.FormatInt(t1.UnixNano()/int64(time.Millisecond), 10)
+	if !ok || unixMs1 != expectedUnixMs {
+		t.Errorf("time.now.unix_ms: expected %s, got %s", expectedUnixMs, unixMs1)
+	}
+
+	// Second lookup in same second (t1 with different sub-second precision)
+	t1Sub := t1.Add(200 * time.Millisecond)
+	nowFunc = func() time.Time { return t1Sub }
+
+	http2, _ := repl.GetString("time.now.http")
+	commonLog2, _ := repl.GetString("time.now.common_log")
+	year2, _ := repl.GetString("time.now.year")
+	unix2, _ := repl.GetString("time.now.unix")
+
+	// Check string pointer identity to confirm cache reuse
+	if unsafe.StringData(http1) != unsafe.StringData(http2) {
+		t.Error("time.now.http was not re-used from cache within same second")
+	}
+	if unsafe.StringData(commonLog1) != unsafe.StringData(commonLog2) {
+		t.Error("time.now.common_log was not re-used from cache within same second")
+	}
+	if unsafe.StringData(year1) != unsafe.StringData(year2) {
+		t.Error("time.now.year was not re-used from cache within same second")
+	}
+	if unsafe.StringData(unix1) != unsafe.StringData(unix2) {
+		t.Error("time.now.unix was not re-used from cache within same second")
+	}
+
+	// Advance time across second boundary
+	t2 := t1.Add(time.Second)
+	nowFunc = func() time.Time { return t2 }
+
+	http3, _ := repl.GetString("time.now.http")
+	if http3 != t2.UTC().Format(http.TimeFormat) {
+		t.Errorf("time.now.http after 1s: expected %s, got %s", t2.UTC().Format(http.TimeFormat), http3)
+	}
+	if unsafe.StringData(http1) == unsafe.StringData(http3) {
+		t.Error("time.now.http was unexpectedly re-used across second boundary")
+	}
+}
+
+func TestTimePlaceholderCacheConcurrency(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	baseTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	nowFunc = func() time.Time {
+		return baseTime
+	}
+
+	repl := NewReplacer()
+	var wg sync.WaitGroup
+	numGoroutines := 20
+	iterations := 1000
+
+	keys := []string{"time.now.http", "time.now.common_log", "time.now.year", "time.now.unix"}
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				key := keys[(id+j)%len(keys)]
+				val, ok := repl.GetString(key)
+				if !ok || val == "" {
+					t.Errorf("goroutine %d failed to get key %s", id, key)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func BenchmarkTimePlaceholderCache(b *testing.B) {
+	repl := NewReplacer()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		repl.GetString("time.now.http")
+		repl.GetString("time.now.common_log")
+		repl.GetString("time.now.year")
+		repl.GetString("time.now.unix")
+	}
+}
+
