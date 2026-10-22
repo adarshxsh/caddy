@@ -499,6 +499,10 @@ func BenchmarkReplacer(b *testing.B) {
 			input: `simple string`,
 		},
 		{
+			name:  "single placeholder",
+			input: `str={str}`,
+		},
+		{
 			name:  "string replacement",
 			input: `str={str}`,
 		},
@@ -507,19 +511,84 @@ func BenchmarkReplacer(b *testing.B) {
 			input: `int={int}`,
 		},
 		{
+			name:  "multi placeholder",
+			input: `str={str} int={int}`,
+		},
+		{
+			name:  "missing key",
+			input: `missing={missing}`,
+		},
+		{
 			name:  "placeholder",
 			input: `{"json": "object"}`,
 		},
 		{
 			name:  "escaped placeholder",
-			input: `\{"json": \{"nested": "{bar}"\}\}`,
+			input: `\{"json": \{"nested": "{str}"\}\}`,
 		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
+	}
+
+	b.Run("parallel single placeholder", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				rep.ReplaceAll("str={str}", "")
+			}
+		})
+	})
+
+	b.Run("parallel multi placeholder", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				rep.ReplaceAll("str={str} int={int}", "")
+			}
+		})
+	})
+}
+
+func BenchmarkReplacerParallel(b *testing.B) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			rep.ReplaceAll("str={str} int={int}", "")
+		}
+	})
+}
+
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+
+	// Static string without placeholders must yield zero heap allocations
+	resNoPlaceholder := testing.Benchmark(func(b *testing.B) {
+		for b.Loop() {
+			_ = rep.ReplaceAll("simple string without placeholders", "")
+		}
+	})
+	if allocs := resNoPlaceholder.AllocsPerOp(); allocs != 0 {
+		t.Errorf("Expected 0 allocs/op for static string replacement, got %d", allocs)
+	}
+
+	// Simple variable lookup from static map
+	resStaticGet := testing.Benchmark(func(b *testing.B) {
+		for b.Loop() {
+			_, _ = rep.fromStatic("str")
+		}
+	})
+	if allocs := resStaticGet.AllocsPerOp(); allocs != 0 {
+		t.Errorf("Expected 0 allocs/op for fromStatic lookup, got %d", allocs)
 	}
 }
 
