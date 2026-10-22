@@ -138,6 +138,7 @@ type TLS struct {
 	ctx                caddy.Context
 	storageCleanTicker *time.Ticker
 	storageCleanStop   chan struct{}
+	stopOnce           sync.Once
 	logger             *zap.Logger
 	events             *caddyevents.App
 
@@ -465,12 +466,16 @@ func (t *TLS) Start() error {
 // Stop stops the TLS module and cleans up any allocations.
 func (t *TLS) Stop() error {
 	// stop the storage cleaner goroutine and ticker
-	if t.storageCleanStop != nil {
-		close(t.storageCleanStop)
-	}
-	if t.storageCleanTicker != nil {
-		t.storageCleanTicker.Stop()
-	}
+	t.stopOnce.Do(func() {
+		if t.storageCleanStop != nil {
+			close(t.storageCleanStop)
+			t.storageCleanStop = nil
+		}
+		if t.storageCleanTicker != nil {
+			t.storageCleanTicker.Stop()
+			t.storageCleanTicker = nil
+		}
+	})
 	return nil
 }
 
