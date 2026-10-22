@@ -19,7 +19,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"testing"
 )
 
@@ -239,7 +238,6 @@ func TestReplacerSet(t *testing.T) {
 
 func TestReplacerReplaceKnown(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		providers: []replacementProvider{
 			// split our possible vars to two functions (to test if both functions are called)
 			ReplacerFunc(func(key string) (val any, ok bool) {
@@ -312,7 +310,6 @@ func TestReplacerReplaceKnown(t *testing.T) {
 
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		static: map[string]any{
 			"key1": "val1",
 			"key2": "val2",
@@ -527,6 +524,37 @@ func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
 		static:    make(map[string]any),
-		mapMutex:  &sync.RWMutex{},
+	}
+}
+
+var benchReplacerSink *Replacer
+
+func TestReplacerAllocations(t *testing.T) {
+	allocsNew := testing.AllocsPerRun(100, func() {
+		benchReplacerSink = NewReplacer()
+	})
+	if allocsNew > 1 {
+		t.Errorf("Expected NewReplacer to perform at most 1 allocation, got %f", allocsNew)
+	}
+
+	allocsNewEmpty := testing.AllocsPerRun(100, func() {
+		benchReplacerSink = NewEmptyReplacer()
+	})
+	if allocsNewEmpty > 1 {
+		t.Errorf("Expected NewEmptyReplacer to perform at most 1 allocation, got %f", allocsNewEmpty)
+	}
+}
+
+func BenchmarkNewReplacer(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		benchReplacerSink = NewReplacer()
+	}
+}
+
+func BenchmarkNewEmptyReplacer(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		benchReplacerSink = NewEmptyReplacer()
 	}
 }
