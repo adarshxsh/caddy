@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -295,4 +296,217 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
 	}
+}
+
+var sinkStr string
+var sinkOk bool
+
+func TestZeroAllocCookieHostPathLookups(t *testing.T) {
+	// 1. Cookie Lookups
+	t.Run("Cookies", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.Header.Add("Cookie", "flavor=chocolate; size=large; user=\"john doe\"")
+		req.Header.Add("Cookie", "session=abc123xyz")
+
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		tests := []struct {
+			name     string
+			key      string
+			expected string
+			found    bool
+		}{
+			{"cookie flavor", "http.request.cookie.flavor", "chocolate", true},
+			{"cookie Flavor case insensitive", "http.request.cookie.FLAVOR", "chocolate", true},
+			{"cookie size", "http.request.cookie.size", "large", true},
+			{"cookie quoted user", "http.request.cookie.user", "john doe", true},
+			{"cookie second header line", "http.request.cookie.session", "abc123xyz", true},
+			{"cookie nonexistent", "http.request.cookie.nonexistent", "", false},
+		}
+
+		for _, tc := range tests {
+			val, ok := repl.GetString(tc.key)
+			if ok != tc.found {
+				t.Errorf("%s: expected found=%v, got %v", tc.name, tc.found, ok)
+			}
+			if val != tc.expected {
+				t.Errorf("%s: expected value=%q, got %q", tc.name, tc.expected, val)
+			}
+		}
+
+		// Allocation check for fastCookieLookup
+		allocs := testing.AllocsPerRun(100, func() {
+			sinkStr, sinkOk = fastCookieLookup(req, "session")
+		})
+		if allocs > 0 {
+			t.Errorf("fastCookieLookup allocated %f objects, expected 0", allocs)
+		}
+	})
+
+	// 2. Host Label Lookups
+	t.Run("HostLabels", func(t *testing.T) {
+		tests := []struct {
+			host     string
+			idx      int
+			expected string
+			found    bool
+		}{
+			{"sub.example.com:8080", 0, "com", true},
+			{"sub.example.com:8080", 1, "example", true},
+			{"sub.example.com:8080", 2, "sub", true},
+			{"sub.example.com:8080", 3, "", true},
+			{"sub.example.com", 0, "com", true},
+			{"sub.example.com", 1, "example", true},
+			{"sub.example.com", 2, "sub", true},
+			{"localhost", 0, "localhost", true},
+			{"localhost", 1, "", true},
+			{"SUB.EXAMPLE.COM", 1, "example", true},
+			{"[::1]:8080", 0, "::1", true},
+			{"[::1]", 0, "[::1]", true},
+			{"example.com", -1, "", false},
+		}
+
+		for _, tc := range tests {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Host = tc.host
+			repl := caddy.NewReplacer()
+			addHTTPVarsToReplacer(repl, req, nil)
+
+			key := "http.request.host.labels." + strconv.Itoa(tc.idx)
+			if tc.idx < 0 {
+				key = "http.request.host.labels.-1"
+			}
+			val, ok := repl.GetString(key)
+			if ok != tc.found {
+				t.Errorf("host=%q idx=%d: expected found=%v, got %v", tc.host, tc.idx, tc.found, ok)
+			}
+			if val != tc.expected {
+				t.Errorf("host=%q idx=%d: expected value=%q, got %q", tc.host, tc.idx, tc.expected, val)
+			}
+		}
+
+		// Allocation check for fastHostLabelLookup
+		allocs := testing.AllocsPerRun(100, func() {
+			sinkStr, sinkOk = fastHostLabelLookup("sub.example.com:8080", 1)
+		})
+		if allocs > 0 {
+			t.Errorf("fastHostLabelLookup allocated %f objects, expected 0", allocs)
+		}
+	})
+
+	// 3. URI Path & Original URI Path Lookups
+	t.Run("URIPathParts", func(t *testing.T) {
+		tests := []struct {
+			path     string
+			idx      int
+			expected string
+			found    bool
+		}{
+			{"/a/b/c", 0, "a", true},
+			{"/a/b/c", 1, "b", true},
+			{"/a/b/c", 2, "c", true},
+			{"/a/b/c", 3, "", true},
+			{"a/b/c", 0, "a", true},
+			{"/a/b/", 2, "", true},
+			{"/", 0, "", true},
+			{"/", 1, "", true},
+			{"", 0, "", true},
+			{"/a//b", 1, "", true},
+			{"/a//b", 2, "b", true},
+		}
+
+		for _, tc := range tests {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.URL.Path = tc.path
+			repl := caddy.NewReplacer()
+			addHTTPVarsToReplacer(repl, req, nil)
+
+			key := "http.request.uri.path." + strconv.Itoa(tc.idx)
+			val, ok := repl.GetString(key)
+			if ok != tc.found {
+				t.Errorf("path=%q idx=%d: expected found=%v, got %v", tc.path, tc.idx, tc.found, ok)
+			}
+			if val != tc.expected {
+				t.Errorf("path=%q idx=%d: expected value=%q, got %q", tc.path, tc.idx, tc.expected, val)
+			}
+		}
+
+		// Test Original Request URI Path
+		req := httptest.NewRequest(http.MethodGet, "/new/path", nil)
+		origReq := httptest.NewRequest(http.MethodGet, "/orig/first/second", nil)
+		ctx := context.WithValue(req.Context(), OriginalRequestCtxKey, *origReq)
+		req = req.WithContext(ctx)
+
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		val, ok := repl.GetString("http.request.orig_uri.path.0")
+		if !ok || val != "orig" {
+			t.Errorf("orig_uri.path.0: expected 'orig', got %q (ok=%v)", val, ok)
+		}
+		val, ok = repl.GetString("http.request.orig_uri.path.1")
+		if !ok || val != "first" {
+			t.Errorf("orig_uri.path.1: expected 'first', got %q (ok=%v)", val, ok)
+		}
+
+		// Allocation check for fastPathPartLookup
+		allocs := testing.AllocsPerRun(100, func() {
+			sinkStr, sinkOk = fastPathPartLookup("/a/b/c/d/e", 2)
+		})
+		if allocs > 0 {
+			t.Errorf("fastPathPartLookup allocated %f objects, expected 0", allocs)
+		}
+	})
+}
+
+func BenchmarkReplacerZeroAllocLookups(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/123/profile", nil)
+	req.Host = "api.v1.sub.example.com:8080"
+	req.Header.Set("Cookie", "session_id=xyz123; theme=dark; lang=en-US")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.Run("Cookie", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sinkStr, sinkOk = repl.GetString("http.request.cookie.theme")
+		}
+	})
+
+	b.Run("HostLabel", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sinkStr, sinkOk = repl.GetString("http.request.host.labels.2")
+		}
+	})
+
+	b.Run("URIPath", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sinkStr, sinkOk = repl.GetString("http.request.uri.path.2")
+		}
+	})
+
+	b.Run("DirectCookieLookup", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sinkStr, sinkOk = fastCookieLookup(req, "theme")
+		}
+	})
+
+	b.Run("DirectHostLabelLookup", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sinkStr, sinkOk = fastHostLabelLookup(req.Host, 2)
+		}
+	})
+
+	b.Run("DirectPathPartLookup", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			sinkStr, sinkOk = fastPathPartLookup(req.URL.Path, 2)
+		}
+	})
 }
