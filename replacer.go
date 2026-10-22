@@ -95,6 +95,34 @@ func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Unlock()
 }
 
+// SetString sets a custom variable to a static string value.
+func (r *Replacer) SetString(variable string, value string) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetInt sets a custom variable to a static integer value.
+func (r *Replacer) SetInt(variable string, value int) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetBool sets a custom variable to a static boolean value.
+func (r *Replacer) SetBool(variable string, value bool) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetFloat sets a custom variable to a static float value.
+func (r *Replacer) SetFloat(variable string, value float64) {
+	r.mapMutex.Lock()
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
 // Get gets a value from the replacer. It returns
 // the value and whether the variable was known.
 func (r *Replacer) Get(variable string) (any, bool) {
@@ -286,6 +314,16 @@ scan:
 	return sb.String(), nil
 }
 
+const maxSmallInt = 1024
+
+var smallIntStrs = func() [maxSmallInt + 1]string {
+	var strs [maxSmallInt + 1]string
+	for i := 0; i <= maxSmallInt; i++ {
+		strs[i] = strconv.Itoa(i)
+	}
+	return strs
+}()
+
 // ToString returns val as a string, as efficiently as possible.
 // EXPERIMENTAL: may be changed or removed later.
 func ToString(val any) string {
@@ -299,22 +337,43 @@ func ToString(val any) string {
 	case error:
 		return v.Error()
 	case byte:
+		if int(v) <= maxSmallInt {
+			return smallIntStrs[v]
+		}
 		return string(v)
 	case []byte:
 		return string(v)
 	case []rune:
 		return string(v)
 	case int:
+		if v >= 0 && v <= maxSmallInt {
+			return smallIntStrs[v]
+		}
 		return strconv.Itoa(v)
 	case int32:
+		if v >= 0 && int(v) <= maxSmallInt {
+			return smallIntStrs[v]
+		}
 		return strconv.Itoa(int(v))
 	case int64:
-		return strconv.Itoa(int(v))
+		if v >= 0 && v <= maxSmallInt {
+			return smallIntStrs[v]
+		}
+		return strconv.FormatInt(v, 10)
 	case uint:
+		if v <= maxSmallInt {
+			return smallIntStrs[v]
+		}
 		return strconv.FormatUint(uint64(v), 10)
 	case uint32:
+		if v <= maxSmallInt {
+			return smallIntStrs[v]
+		}
 		return strconv.FormatUint(uint64(v), 10)
 	case uint64:
+		if v <= maxSmallInt {
+			return smallIntStrs[v]
+		}
 		return strconv.FormatUint(v, 10)
 	case float32:
 		return strconv.FormatFloat(float64(v), 'f', -1, 32)
