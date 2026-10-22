@@ -484,14 +484,106 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestSpecializedSetters(t *testing.T) {
+	rep := NewReplacer()
+
+	// Test SetString
+	rep.SetString("str_key", "hello")
+	if val, ok := rep.Get("str_key"); !ok || val != "hello" {
+		t.Errorf("Expected 'hello', got %v (ok: %v)", val, ok)
+	}
+
+	// Test SetInt
+	testInts := []struct {
+		val      int
+		expected string
+	}{
+		{0, "0"},
+		{42, "42"},
+		{1024, "1024"},
+		{-5, "-5"},
+		{2000, "2000"},
+	}
+	for _, ti := range testInts {
+		rep.SetInt("int_key", ti.val)
+		if val, ok := rep.Get("int_key"); !ok || val != ti.val {
+			t.Errorf("Expected int %d for Get, got %v (ok: %v)", ti.val, val, ok)
+		}
+		if val, ok := rep.GetString("int_key"); !ok || val != ti.expected {
+			t.Errorf("Expected '%s' for GetString int %d, got '%s' (ok: %v)", ti.expected, ti.val, val, ok)
+		}
+	}
+
+	// Test SetBool
+	rep.SetBool("bool_true", true)
+	if val, ok := rep.Get("bool_true"); !ok || val != true {
+		t.Errorf("Expected bool true for Get, got %v (ok: %v)", val, ok)
+	}
+	if val, ok := rep.GetString("bool_true"); !ok || val != "true" {
+		t.Errorf("Expected 'true', got %v (ok: %v)", val, ok)
+	}
+	rep.SetBool("bool_false", false)
+	if val, ok := rep.Get("bool_false"); !ok || val != false {
+		t.Errorf("Expected bool false for Get, got %v (ok: %v)", val, ok)
+	}
+	if val, ok := rep.GetString("bool_false"); !ok || val != "false" {
+		t.Errorf("Expected 'false', got %v (ok: %v)", val, ok)
+	}
+
+	// Test SetFloat
+	rep.SetFloat("float_key", 123.456)
+	if val, ok := rep.Get("float_key"); !ok || val != 123.456 {
+		t.Errorf("Expected float64 123.456 for Get, got %v (ok: %v)", val, ok)
+	}
+	if val, ok := rep.GetString("float_key"); !ok || val != "123.456" {
+		t.Errorf("Expected '123.456', got %v (ok: %v)", val, ok)
+	}
+
+	// Verify zero allocations for setter operations on existing map keys
+	rep.SetInt("test_int", 200)
+	rep.SetString("test_str", "hello")
+	rep.SetBool("test_bool", true)
+	rep.SetFloat("test_float", 99.9)
+
+	allocsStr := testing.AllocsPerRun(100, func() {
+		rep.SetString("test_str", "hello")
+	})
+	allocsInt := testing.AllocsPerRun(100, func() {
+		rep.SetInt("test_int", 200)
+	})
+	allocsBool := testing.AllocsPerRun(100, func() {
+		rep.SetBool("test_bool", true)
+	})
+	allocsFloat := testing.AllocsPerRun(100, func() {
+		rep.SetFloat("test_float", 99.9)
+	})
+	t.Logf("SetString allocs: %f, SetInt allocs: %f, SetBool allocs: %f, SetFloat allocs: %f",
+		allocsStr, allocsInt, allocsBool, allocsFloat)
+
+	// Verify zero allocations for ToString on small integers and booleans
+	var benchSink string
+	allocsToString := testing.AllocsPerRun(100, func() {
+		benchSink = ToString(200)
+		benchSink = ToString(0)
+		benchSink = ToString(1024)
+		benchSink = ToString(true)
+		benchSink = ToString(false)
+	})
+	_ = benchSink
+	if allocsToString > 0 {
+		t.Errorf("Expected 0 allocations for ToString on small ints and bools, got %f", allocsToString)
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
 	}
 
 	rep := testReplacer()
-	rep.Set("str", "a string")
-	rep.Set("int", 123.456)
+	rep.SetString("str", "a string")
+	rep.SetFloat("int", 123.456)
+	rep.SetInt("small_int", 200)
 
 	for _, bm := range []testCase{
 		{
@@ -505,6 +597,10 @@ func BenchmarkReplacer(b *testing.B) {
 		{
 			name:  "int replacement",
 			input: `int={int}`,
+		},
+		{
+			name:  "small int replacement",
+			input: `small_int={small_int}`,
 		},
 		{
 			name:  "placeholder",

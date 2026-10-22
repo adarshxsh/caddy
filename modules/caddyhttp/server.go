@@ -854,10 +854,10 @@ func (s *Server) logRequest(
 	status := wrec.Status()
 	size := wrec.Size()
 
-	repl.Set("http.response.status", status) // will be 0 if no response is written by us (Go will write 200 to client)
-	repl.Set("http.response.size", size)
+	repl.SetInt("http.response.status", status) // will be 0 if no response is written by us (Go will write 200 to client)
+	repl.SetInt("http.response.size", size)
 	repl.Set("http.response.duration", duration)
-	repl.Set("http.response.duration_ms", duration.Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
+	repl.SetFloat("http.response.duration_ms", duration.Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
 
 	loggers := []*zap.Logger{accLog}
 	if s.Logs != nil {
