@@ -81,12 +81,8 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// cookies
 			if strings.HasPrefix(key, reqCookieReplPrefix) {
 				name := key[len(reqCookieReplPrefix):]
-				for _, cookie := range req.Cookies() {
-					if strings.EqualFold(name, cookie.Name) {
-						// always return true, since the cookie might
-						// be present only in some requests
-						return cookie.Value, true
-					}
+				if val, ok := getCookieValue(req.Header, name); ok {
+					return val, true
 				}
 			}
 
@@ -319,15 +315,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil || idx < 0 {
 					return "", false
 				}
-				reqHost, _, err := net.SplitHostPort(req.Host)
-				if err != nil {
-					reqHost = req.Host // OK; assume there was no port
-				}
-				hostLabels := strings.Split(reqHost, ".")
-				if idx >= len(hostLabels) {
-					return "", true
-				}
-				return strings.ToLower(hostLabels[len(hostLabels)-idx-1]), true
+				return getHostLabel(req.Host, idx)
 			}
 
 			// path parts
@@ -337,17 +325,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil {
 					return "", false
 				}
-				pathParts := strings.Split(req.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
-				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
-					return "", true
-				}
-				return pathParts[idx], true
+				return getPathSegment(req.URL.Path, idx)
 			}
 
 			// orig uri path parts
@@ -358,17 +336,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 					return "", false
 				}
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				pathParts := strings.Split(or.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
-				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
-					return "", true
-				}
-				return pathParts[idx], true
+				return getPathSegment(or.URL.Path, idx)
 			}
 
 			// middleware variables
@@ -597,3 +565,122 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+func getCookieValue(header http.Header, name string) (string, bool) {
+	if header == nil {
+		return "", false
+	}
+	cookies := header["Cookie"]
+	for _, line := range cookies {
+		for len(line) > 0 {
+			line = strings.TrimLeft(line, " \t")
+			if len(line) == 0 {
+				break
+			}
+			var part string
+			if idx := strings.IndexByte(line, ';'); idx >= 0 {
+				part = line[:idx]
+				line = line[idx+1:]
+			} else {
+				part = line
+				line = ""
+			}
+			part = strings.TrimRight(part, " \t")
+			if len(part) == 0 {
+				continue
+			}
+			eq := strings.IndexByte(part, '=')
+			if eq < 0 {
+				continue
+			}
+			cookieName := strings.TrimRight(part[:eq], " \t")
+			if !isCookieNameValid(cookieName) {
+				continue
+			}
+			if strings.EqualFold(cookieName, name) {
+				val := strings.TrimLeft(part[eq+1:], " \t")
+				val, ok := parseCookieValue(val)
+				if ok {
+					return val, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func isCookieNameValid(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b <= 32 || b >= 127 || strings.IndexByte("()<>@,;:\\\"/[]?={} \t", b) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func parseCookieValue(val string) (string, bool) {
+	if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+		val = val[1 : len(val)-1]
+	}
+	for i := 0; i < len(val); i++ {
+		b := val[i]
+		if b < 0x20 || b >= 0x7f || b == '"' || b == ';' || b == '\\' {
+			return "", false
+		}
+	}
+	return val, true
+}
+
+func getHostLabel(reqHost string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	host, _, err := net.SplitHostPort(reqHost)
+	if err != nil {
+		host = reqHost // OK; assume there was no port
+	}
+
+	end := len(host)
+	count := 0
+	for i := len(host) - 1; i >= 0; i-- {
+		if host[i] == '.' {
+			if count == idx {
+				return strings.ToLower(host[i+1 : end]), true
+			}
+			count++
+			end = i
+		}
+	}
+	if count == idx {
+		return strings.ToLower(host[0:end]), true
+	}
+	return "", true
+}
+
+func getPathSegment(path string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	if strings.HasPrefix(path, "/") {
+		path = path[1:]
+	} else if path == "" {
+		return "", true
+	}
+
+	start := 0
+	currentIdx := 0
+	for i := 0; i <= len(path); i++ {
+		if i == len(path) || path[i] == '/' {
+			if currentIdx == idx {
+				return path[start:i], true
+			}
+			currentIdx++
+			start = i + 1
+		}
+	}
+	return "", true
+}
