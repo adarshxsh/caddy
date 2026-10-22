@@ -630,7 +630,16 @@ func (m *maxLatencyWriter) delayedFlush() {
 func (m *maxLatencyWriter) stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.flushPending = false
+	if m.flushPending {
+		if m.logger != nil {
+			m.logger.Debug("flushing trailing response bytes on stop")
+		}
+		if m.flush != nil {
+			//nolint:errcheck
+			_ = m.flush()
+		}
+		m.flushPending = false
+	}
 	if m.t != nil {
 		m.t.Stop()
 	}
