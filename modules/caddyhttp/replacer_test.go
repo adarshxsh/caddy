@@ -296,3 +296,114 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPVarsQueryAndHeaderOptimizations(t *testing.T) {
+	// Query parameter and header tests
+	req, _ := http.NewRequest(http.MethodGet, "/test?single=foo&multi=bar&multi=baz", nil)
+	req.Header.Set("User-Agent", "CaddyAgent")
+	req.Header.Add("X-Multi", "val1")
+	req.Header.Add("X-Multi", "val2")
+	req.Header["x-custom-lowercase"] = []string{"custom"}
+
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "text/plain")
+	rec.Header().Add("Set-Cookie", "c1=v1")
+	rec.Header().Add("Set-Cookie", "c2=v2")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, rec)
+
+	// Single value query param
+	val, ok := repl.GetString("http.request.uri.query.single")
+	if !ok || val != "foo" {
+		t.Errorf("expected 'foo', got %q (ok=%t)", val, ok)
+	}
+
+	// Multi value query param
+	val, ok = repl.GetString("http.request.uri.query.multi")
+	if !ok || val != "bar,baz" {
+		t.Errorf("expected 'bar,baz', got %q (ok=%t)", val, ok)
+	}
+
+	// Missing query param
+	val, ok = repl.GetString("http.request.uri.query.missing")
+	if !ok || val != "" {
+		t.Errorf("expected '', got %q (ok=%t)", val, ok)
+	}
+
+	// Canonical header direct access
+	val, ok = repl.GetString("http.request.header.User-Agent")
+	if !ok || val != "CaddyAgent" {
+		t.Errorf("expected 'CaddyAgent', got %q (ok=%t)", val, ok)
+	}
+
+	// Non-canonical header fallback
+	val, ok = repl.GetString("http.request.header.user-agent")
+	if !ok || val != "CaddyAgent" {
+		t.Errorf("expected 'CaddyAgent', got %q (ok=%t)", val, ok)
+	}
+
+	// Non-canonical lower-cased custom header stored non-canonically
+	val, ok = repl.GetString("http.request.header.x-custom-lowercase")
+	if !ok || val != "custom" {
+		t.Errorf("expected 'custom', got %q (ok=%t)", val, ok)
+	}
+
+	// Multi-value header
+	val, ok = repl.GetString("http.request.header.X-Multi")
+	if !ok || val != "val1,val2" {
+		t.Errorf("expected 'val1,val2', got %q (ok=%t)", val, ok)
+	}
+
+	// Response header canonical
+	val, ok = repl.GetString("http.response.header.Content-Type")
+	if !ok || val != "text/plain" {
+		t.Errorf("expected 'text/plain', got %q (ok=%t)", val, ok)
+	}
+
+	// Response header non-canonical fallback
+	val, ok = repl.GetString("http.response.header.content-type")
+	if !ok || val != "text/plain" {
+		t.Errorf("expected 'text/plain', got %q (ok=%t)", val, ok)
+	}
+
+	// Response multi-value header
+	val, ok = repl.GetString("http.response.header.Set-Cookie")
+	if !ok || val != "c1=v1,c2=v2" {
+		t.Errorf("expected 'c1=v1,c2=v2', got %q (ok=%t)", val, ok)
+	}
+
+	// Empty query string test
+	emptyReq, _ := http.NewRequest(http.MethodGet, "/test", nil)
+	emptyRepl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(emptyRepl, emptyReq, nil)
+	val, ok = emptyRepl.GetString("http.request.uri.query.foo")
+	if !ok || val != "" {
+		t.Errorf("expected '', got %q (ok=%t)", val, ok)
+	}
+}
+
+func BenchmarkReplacerHeaderDirectLookup(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("User-Agent", "CaddyTest/1.0")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.header.User-Agent")
+	}
+}
+
+func BenchmarkReplacerQueryParamLookup(b *testing.B) {
+	req, _ := http.NewRequest(http.MethodGet, "/?foo=bar&baz=qux", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.uri.query.foo")
+	}
+}
