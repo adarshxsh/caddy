@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -401,17 +402,34 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 		return runtime.GOARCH, true
 	case "time.now":
 		return nowFunc(), true
-	case "time.now.http":
-		// According to the comment for http.TimeFormat, the timezone must be in UTC
-		// to generate the correct format.
-		// https://github.com/caddyserver/caddy/issues/5773
-		return nowFunc().UTC().Format(http.TimeFormat), true
-	case "time.now.common_log":
-		return nowFunc().Format("02/Jan/2006:15:04:05 -0700"), true
-	case "time.now.year":
-		return strconv.Itoa(nowFunc().Year()), true
-	case "time.now.unix":
-		return strconv.FormatInt(nowFunc().Unix(), 10), true
+	case "time.now.http", "time.now.common_log", "time.now.year", "time.now.unix":
+		now := nowFunc()
+		sec := now.Unix()
+		_, zoneOffset := now.Zone()
+
+		tc := timeCachePtr.Load()
+		if tc == nil || tc.sec != sec || tc.zoneOffset != zoneOffset {
+			tc = &timeCache{
+				sec:        sec,
+				zoneOffset: zoneOffset,
+				http:       now.UTC().Format(http.TimeFormat),
+				commonLog:  now.Format("02/Jan/2006:15:04:05 -0700"),
+				year:       strconv.Itoa(now.Year()),
+				unix:       strconv.FormatInt(sec, 10),
+			}
+			timeCachePtr.Store(tc)
+		}
+
+		switch key {
+		case "time.now.http":
+			return tc.http, true
+		case "time.now.common_log":
+			return tc.commonLog, true
+		case "time.now.year":
+			return tc.year, true
+		case "time.now.unix":
+			return tc.unix, true
+		}
 	case "time.now.unix_ms":
 		return strconv.FormatInt(nowFunc().UnixNano()/int64(time.Millisecond), 10), true
 	}
@@ -444,6 +462,17 @@ type ReplacementFunc func(variable string, val any) (any, error)
 // nowFunc is a variable so tests can change it
 // in order to obtain a deterministic time.
 var nowFunc = time.Now
+
+type timeCache struct {
+	sec        int64
+	zoneOffset int
+	http       any
+	commonLog  any
+	year       any
+	unix       any
+}
+
+var timeCachePtr atomic.Pointer[timeCache]
 
 // ReplacerCtxKey is the context key for a replacer.
 const ReplacerCtxKey CtxKey = "replacer"
