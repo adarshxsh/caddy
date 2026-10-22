@@ -22,7 +22,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -295,4 +297,146 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
 	}
+}
+
+func TestMemoization(t *testing.T) {
+	t.Run("IP prefix memoization and zero secondary allocations", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "192.168.1.50:12345"
+		repl := NewTestReplacer(req)
+
+		// First lookup computes and memoizes
+		val1, ok1 := repl.GetString("http.request.remote.host/24")
+		if !ok1 || val1 != "192.168.1.0/24" {
+			t.Fatalf("expected 192.168.1.0/24, got %q (ok=%t)", val1, ok1)
+		}
+
+		val2, ok2 := repl.GetString("http.request.remote.host/24")
+		if !ok2 || val2 != "192.168.1.0/24" {
+			t.Fatalf("expected 192.168.1.0/24, got %q (ok=%t)", val2, ok2)
+		}
+
+		// String data pointers must be identical
+		if unsafe.StringData(val1) != unsafe.StringData(val2) {
+			t.Errorf("expected identical string pointer reference for memoized prefix, got %p vs %p",
+				unsafe.StringData(val1), unsafe.StringData(val2))
+		}
+
+		// Re-evaluation via GetVar must yield zero secondary heap allocations
+		allocs := testing.AllocsPerRun(10, func() {
+			val, ok := GetVar(req.Context(), "http.request.remote.host/24").(string)
+			if !ok || val != "192.168.1.0/24" {
+				t.Fatalf("expected 192.168.1.0/24, got %q", val)
+			}
+		})
+		if allocs != 0 {
+			t.Errorf("expected 0 secondary allocations for remote.host/24, got %f", allocs)
+		}
+	})
+
+	t.Run("Prefixed query memoization and zero secondary allocations", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/test?foo=bar&baz=qux", nil)
+		repl := caddy.NewReplacer()
+		req = PrepareRequest(req, repl, nil, nil)
+
+		val1, ok1 := repl.GetString("http.request.uri.prefixed_query")
+		val2, ok2 := repl.GetString("http.request.orig_uri.prefixed_query")
+
+		if !ok1 || val1 != "?foo=bar&baz=qux" {
+			t.Fatalf("expected ?foo=bar&baz=qux, got %q", val1)
+		}
+		if !ok2 || val2 != "?foo=bar&baz=qux" {
+			t.Fatalf("expected ?foo=bar&baz=qux, got %q", val2)
+		}
+
+		val1Again, _ := repl.GetString("http.request.uri.prefixed_query")
+		val2Again, _ := repl.GetString("http.request.orig_uri.prefixed_query")
+
+		if unsafe.StringData(val1) != unsafe.StringData(val1Again) {
+			t.Errorf("expected identical string pointer for uri.prefixed_query")
+		}
+		if unsafe.StringData(val2) != unsafe.StringData(val2Again) {
+			t.Errorf("expected identical string pointer for orig_uri.prefixed_query")
+		}
+
+		// Verify zero secondary allocations on GetVar re-evaluations
+		allocsURI := testing.AllocsPerRun(10, func() {
+			val, _ := GetVar(req.Context(), "http.request.uri.prefixed_query").(string)
+			if val != "?foo=bar&baz=qux" {
+				t.Fatalf("unexpected val: %q", val)
+			}
+		})
+		if allocsURI != 0 {
+			t.Errorf("expected 0 secondary allocations for uri.prefixed_query, got %f", allocsURI)
+		}
+
+		allocsOrigURI := testing.AllocsPerRun(10, func() {
+			val, _ := GetVar(req.Context(), "http.request.orig_uri.prefixed_query").(string)
+			if val != "?foo=bar&baz=qux" {
+				t.Fatalf("unexpected val: %q", val)
+			}
+		})
+		if allocsOrigURI != 0 {
+			t.Errorf("expected 0 secondary allocations for orig_uri.prefixed_query, got %f", allocsOrigURI)
+		}
+	})
+
+	t.Run("Host and port lookups split address at most once", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "10.0.0.1:8080"
+		repl := NewTestReplacer(req)
+
+		host1, okHost := repl.GetString("http.request.remote.host")
+		if !okHost || host1 != "10.0.0.1" {
+			t.Fatalf("expected 10.0.0.1, got %q", host1)
+		}
+
+		// Subsequent host and port lookups must use cached host/port
+		port1, okPort := repl.GetString("http.request.remote.port")
+		if !okPort || port1 != "8080" {
+			t.Fatalf("expected 8080, got %q", port1)
+		}
+
+		host2, _ := repl.GetString("http.request.remote.host")
+		if unsafe.StringData(host1) != unsafe.StringData(host2) {
+			t.Errorf("expected identical string pointer for remote.host")
+		}
+
+		// Verify cached variables exist in context
+		if GetVar(req.Context(), "http.request.remote.host") != "10.0.0.1" {
+			t.Errorf("expected remote.host cached in context")
+		}
+		if GetVar(req.Context(), "http.request.remote.port") != 8080 {
+			t.Errorf("expected remote.port cached in context")
+		}
+
+		allocsHost := testing.AllocsPerRun(10, func() {
+			_ = GetVar(req.Context(), "http.request.remote.host")
+			_ = GetVar(req.Context(), "http.request.remote.port")
+		})
+		if allocsHost != 0 {
+			t.Errorf("expected 0 secondary allocations for remote.host / remote.port, got %f", allocsHost)
+		}
+	})
+
+	t.Run("Concurrent placeholder evaluation safety", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api?key=value", nil)
+		req.RemoteAddr = "172.16.0.1:443"
+		repl := caddy.NewReplacer()
+		req = PrepareRequest(req, repl, nil, nil)
+
+		var wg sync.WaitGroup
+		for i := 0; i < 20; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = repl.GetString("http.request.remote.host/16")
+				_, _ = repl.GetString("http.request.remote.host")
+				_, _ = repl.GetString("http.request.remote.port")
+				_, _ = repl.GetString("http.request.uri.prefixed_query")
+				_, _ = repl.GetString("http.request.orig_uri.prefixed_query")
+			}()
+		}
+		wg.Wait()
+	})
 }
