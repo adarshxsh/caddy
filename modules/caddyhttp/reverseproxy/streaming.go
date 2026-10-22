@@ -204,19 +204,26 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
+	// setup the timeout if requested
+	var timeoutc <-chan time.Time
+	if h.StreamTimeout > 0 {
+		streamTimeout := time.Duration(h.StreamTimeout)
+		timer := time.NewTimer(streamTimeout)
+		defer timer.Stop()
+		timeoutc = timer.C
+
+		resetTimer := func() {
+			timer.Reset(streamTimeout)
+		}
+		conn = activityRWC{ReadWriteCloser: conn, onActivity: resetTimer}
+		backConn = activityRWC{ReadWriteCloser: backConn, onActivity: resetTimer}
+	}
+
 	spc := switchProtocolCopier{
 		user:       conn,
 		backend:    backConn,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
-	}
-
-	// setup the timeout if requested
-	var timeoutc <-chan time.Time
-	if h.StreamTimeout > 0 {
-		timer := time.NewTimer(time.Duration(h.StreamTimeout))
-		defer timer.Stop()
-		timeoutc = timer.C
 	}
 
 	// when a stream timeout is encountered, no error will be read from errc
@@ -634,6 +641,27 @@ func (m *maxLatencyWriter) stop() {
 	if m.t != nil {
 		m.t.Stop()
 	}
+}
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	onActivity func()
+}
+
+func (a activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
+}
+
+func (a activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
 }
 
 // switchProtocolCopier exists so goroutines proxying data back and
