@@ -57,6 +57,10 @@ func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+func (rwc h2ReadWriteCloser) SetWriteDeadline(t time.Time) error {
+	return http.NewResponseController(rwc.ResponseWriter).SetWriteDeadline(t)
+}
+
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
@@ -150,15 +154,18 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		// See issue https://golang.org/issue/35559.
 		select {
 		case <-req.Context().Done():
+			_ = conn.Close()
+			_ = backConn.Close()
 		case <-backConnCloseCh:
+			_ = backConn.Close()
 		}
-		backConn.Close()
 	}()
 	defer close(backConnCloseCh)
 
 	start := time.Now()
 	defer func() {
-		conn.Close()
+		_ = conn.Close()
+		_ = backConn.Close()
 		if c := logger.Check(zapcore.DebugLevel, "connection closed"); c != nil {
 			c.Write(zap.Duration("duration", time.Since(start)))
 		}
@@ -204,11 +211,17 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
+	writeTimeout := time.Duration(h.WriteTimeout)
+	if writeTimeout == 0 {
+		writeTimeout = 30 * time.Second
+	}
+
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         wg,
-		bufferSize: h.StreamBufferSize,
+		user:         conn,
+		backend:      backConn,
+		wg:           wg,
+		bufferSize:   h.StreamBufferSize,
+		writeTimeout: writeTimeout,
 	}
 
 	// setup the timeout if requested
@@ -235,7 +248,14 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
 			c.Write(zap.Time("timeout", time))
 		}
+	case <-req.Context().Done():
+		if c := logger.Check(zapcore.DebugLevel, "context canceled"); c != nil {
+			c.Write(zap.Error(req.Context().Err()))
+		}
 	}
+
+	_ = conn.Close()
+	_ = backConn.Close()
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
@@ -636,22 +656,39 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+type deadlinedWriter struct {
+	w       io.Writer
+	timeout time.Duration
+}
+
+func (dw deadlinedWriter) Write(p []byte) (int, error) {
+	if dw.timeout > 0 {
+		if conn, ok := dw.w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = conn.SetWriteDeadline(time.Now().Add(dw.timeout))
+		}
+	}
+	return dw.w.Write(p)
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
 	user, backend io.ReadWriteCloser
 	wg            *sync.WaitGroup
 	bufferSize    int
+	writeTimeout  time.Duration
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	w := deadlinedWriter{w: c.user, timeout: c.writeTimeout}
+	_, err := io.CopyBuffer(w, c.backend, c.buffer())
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	w := deadlinedWriter{w: c.backend, timeout: c.writeTimeout}
+	_, err := io.CopyBuffer(w, c.user, c.buffer())
 	errc <- err
 	c.wg.Done()
 }
