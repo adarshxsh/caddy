@@ -57,6 +57,21 @@ func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+type lockedReadWriteCloser struct {
+	io.ReadWriteCloser
+	mu sync.Mutex
+}
+
+func (l *lockedReadWriteCloser) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ReadWriteCloser.Write(p)
+}
+
+func (l *lockedReadWriteCloser) Unwrap() io.ReadWriteCloser {
+	return l.ReadWriteCloser
+}
+
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
@@ -183,6 +198,11 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			return
 		}
 	}
+
+	// Wrap connections in lockedReadWriteCloser to serialize all socket writes
+	// across background copying goroutines and shutdown control frame calls.
+	conn = &lockedReadWriteCloser{ReadWriteCloser: conn}
+	backConn = &lockedReadWriteCloser{ReadWriteCloser: backConn}
 
 	// Ensure the hijacked client connection, and the new connection established
 	// with the backend, are both closed in the event of a server shutdown. This
