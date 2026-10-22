@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -296,3 +297,193 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestReplacerMemoizationCache(t *testing.T) {
+	t.Run("IPv4 and standard TCP", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "/path?a=1&b=2", nil)
+		repl := caddy.NewReplacer()
+		localAddr, _ := net.ResolveTCPAddr("tcp", "192.168.1.1:8080")
+		ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+		ctx = context.WithValue(ctx, http.LocalAddrContextKey, localAddr)
+		req = req.WithContext(ctx)
+		req.Host = "sub.example.com:80"
+		req.RemoteAddr = "10.0.0.1:12345"
+
+		var url2 url.URL
+		ctx = context.WithValue(req.Context(), OriginalRequestCtxKey, originalRequest(req, &url2))
+		req = req.WithContext(ctx)
+
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		keys := []string{
+			"http.request.host",
+			"http.request.port",
+			"http.request.host.labels.0",
+			"http.request.host.labels.1",
+			"http.request.local.host",
+			"http.request.local.port",
+			"http.request.remote.host",
+			"http.request.remote.port",
+			"http.request.remote.host/24",
+			"http.request.remote.host/16",
+			"http.request.uri.prefixed_query",
+			"http.request.orig_uri.prefixed_query",
+		}
+
+		// First pass
+		firstPass := make(map[string]string)
+		for _, key := range keys {
+			val, ok := repl.GetString(key)
+			if !ok {
+				t.Fatalf("key %s not found on first access", key)
+			}
+			firstPass[key] = val
+		}
+
+		// Second pass (cached)
+		for _, key := range keys {
+			val, ok := repl.GetString(key)
+			if !ok {
+				t.Fatalf("key %s not found on second access", key)
+			}
+			if val != firstPass[key] {
+				t.Fatalf("key %s mismatch on second access: got %q, expected %q", key, val, firstPass[key])
+			}
+		}
+
+		// Verify 0 allocations on subsequent accesses
+		allocs := testing.AllocsPerRun(10, func() {
+			for _, key := range keys {
+				repl.Get(key)
+			}
+		})
+		if allocs > 0 {
+			t.Errorf("Expected 0 allocations on cached replacer lookups, got %f", allocs)
+		}
+	})
+
+	t.Run("IPv6 and empty query string", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "/path", nil)
+		repl := caddy.NewReplacer()
+		localAddr, _ := net.ResolveTCPAddr("tcp", "[2001:db8::1]:8080")
+		ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+		ctx = context.WithValue(ctx, http.LocalAddrContextKey, localAddr)
+		req = req.WithContext(ctx)
+		req.Host = "[2001:db8::2]:443"
+		req.RemoteAddr = "[2001:db8::3]:54321"
+
+		var url2 url.URL
+		ctx = context.WithValue(req.Context(), OriginalRequestCtxKey, originalRequest(req, &url2))
+		req = req.WithContext(ctx)
+
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		keys := []string{
+			"http.request.host",
+			"http.request.port",
+			"http.request.local.host",
+			"http.request.local.port",
+			"http.request.remote.host",
+			"http.request.remote.port",
+			"http.request.remote.host/32,64",
+			"http.request.uri.prefixed_query",
+			"http.request.orig_uri.prefixed_query",
+		}
+
+		firstPass := make(map[string]string)
+		for _, key := range keys {
+			val, ok := repl.GetString(key)
+			if !ok {
+				t.Fatalf("key %s not found on first access", key)
+			}
+			firstPass[key] = val
+		}
+
+		if got := firstPass["http.request.remote.host/32,64"]; got != "2001:db8::/64" {
+			t.Errorf("Expected IPv6 prefix 2001:db8::/64, got %q", got)
+		}
+		if got := firstPass["http.request.uri.prefixed_query"]; got != "" {
+			t.Errorf("Expected empty prefixed query, got %q", got)
+		}
+
+		// Second pass (cached)
+		for _, key := range keys {
+			val, ok := repl.GetString(key)
+			if !ok {
+				t.Fatalf("key %s not found on second access", key)
+			}
+			if val != firstPass[key] {
+				t.Fatalf("key %s mismatch on second access: got %q, expected %q", key, val, firstPass[key])
+			}
+		}
+
+		allocs := testing.AllocsPerRun(10, func() {
+			for _, key := range keys {
+				repl.Get(key)
+			}
+		})
+		if allocs > 0 {
+			t.Errorf("Expected 0 allocations on cached IPv6 replacer lookups, got %f", allocs)
+		}
+	})
+
+	t.Run("Unix socket fallback", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, "/path", nil)
+		repl := caddy.NewReplacer()
+		unixAddr := &net.UnixAddr{Name: "/var/run/caddy.sock", Net: "unix"}
+		ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+		ctx = context.WithValue(ctx, http.LocalAddrContextKey, unixAddr)
+		req = req.WithContext(ctx)
+		req.Host = "unix-host"
+		req.RemoteAddr = "/var/run/client.sock"
+
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		host, ok := repl.GetString("http.request.remote.host")
+		if !ok || host != "/var/run/client.sock" {
+			t.Errorf("Expected remote.host unix socket '/var/run/client.sock', got %q (ok=%t)", host, ok)
+		}
+
+		port, ok := repl.GetString("http.request.remote.port")
+		if !ok || port != "" {
+			t.Errorf("Expected empty remote.port for unix socket, got %q (ok=%t)", port, ok)
+		}
+
+		// Second access cached
+		hostCached, _ := repl.GetString("http.request.remote.host")
+		if hostCached != host {
+			t.Errorf("Mismatch cached unix socket host: got %q, expected %q", hostCached, host)
+		}
+	})
+
+	t.Run("PrepareRequest cache re-initialization", func(t *testing.T) {
+		repl1 := caddy.NewReplacer()
+		req1, _ := http.NewRequest(http.MethodGet, "/?q=1", nil)
+		req1.Host = "first.com:80"
+		req1.RemoteAddr = "1.1.1.1:1111"
+		req1 = PrepareRequest(req1, repl1, nil, nil)
+
+		host1, _ := repl1.GetString("http.request.host")
+		prefix1, _ := repl1.GetString("http.request.remote.host/24")
+		query1, _ := repl1.GetString("http.request.uri.prefixed_query")
+
+		if host1 != "first.com" || prefix1 != "1.1.1.0/24" || query1 != "?q=1" {
+			t.Fatalf("Unexpected req1 values: host=%s prefix=%s query=%s", host1, prefix1, query1)
+		}
+
+		repl2 := caddy.NewReplacer()
+		req2, _ := http.NewRequest(http.MethodGet, "/?q=2", nil)
+		req2.Host = "second.com:80"
+		req2.RemoteAddr = "2.2.2.2:2222"
+		req2 = PrepareRequest(req2, repl2, nil, nil)
+
+		host2, _ := repl2.GetString("http.request.host")
+		prefix2, _ := repl2.GetString("http.request.remote.host/24")
+		query2, _ := repl2.GetString("http.request.uri.prefixed_query")
+
+		if host2 != "second.com" || prefix2 != "2.2.2.0/24" || query2 != "?q=2" {
+			t.Fatalf("Unexpected req2 values: host=%s prefix=%s query=%s", host2, prefix2, query2)
+		}
+	})
+}
+
