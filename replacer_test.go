@@ -222,8 +222,8 @@ func TestReplacerSet(t *testing.T) {
 
 		// test if key is added
 		if val, ok := rep.static[tc.variable]; ok {
-			if val != tc.value {
-				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
+			if val.val != tc.value {
+				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val.val)
 			}
 		} else {
 			t.Errorf("Expected existing key '%s' found nothing", tc.variable)
@@ -313,11 +313,11 @@ func TestReplacerReplaceKnown(t *testing.T) {
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
 		mapMutex: &sync.RWMutex{},
-		static: map[string]any{
-			"key1": "val1",
-			"key2": "val2",
-			"key3": "val3",
-			"key4": "val4",
+		static: map[string]staticValue{
+			"key1": {val: "val1", strVal: "val1"},
+			"key2": {val: "val2", strVal: "val2"},
+			"key3": {val: "val3", strVal: "val3"},
+			"key4": {val: "val4", strVal: "val4"},
 		},
 	}
 
@@ -526,7 +526,71 @@ func BenchmarkReplacer(b *testing.B) {
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
-		static:    make(map[string]any),
+		static:    make(map[string]staticValue),
 		mapMutex:  &sync.RWMutex{},
+	}
+}
+
+func TestReplacerStaticDualCaching(t *testing.T) {
+	rep := NewReplacer()
+
+	// Set primitive integer
+	rep.Set("intVal", 42)
+	rawInt, ok := rep.Get("intVal")
+	if !ok || rawInt != 42 {
+		t.Errorf("Get('intVal') = %v (%T), expected 42 (int)", rawInt, rawInt)
+	}
+	strInt, ok := rep.GetString("intVal")
+	if !ok || strInt != "42" {
+		t.Errorf("GetString('intVal') = %q, expected '42'", strInt)
+	}
+
+	// Set primitive boolean
+	rep.Set("boolVal", true)
+	rawBool, ok := rep.Get("boolVal")
+	if !ok || rawBool != true {
+		t.Errorf("Get('boolVal') = %v (%T), expected true (bool)", rawBool, rawBool)
+	}
+	strBool, ok := rep.GetString("boolVal")
+	if !ok || strBool != "true" {
+		t.Errorf("GetString('boolVal') = %q, expected 'true'", strBool)
+	}
+
+	// ReplaceAll verification
+	res := rep.ReplaceAll("int={intVal} bool={boolVal}", "")
+	expected := "int=42 bool=true"
+	if res != expected {
+		t.Errorf("ReplaceAll output = %q, expected %q", res, expected)
+	}
+}
+
+func TestReplacerAllocations(t *testing.T) {
+	rep := NewReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+	rep.Set("bool", true)
+
+	// Verify ReplaceAll without placeholders has 0 allocs
+	allocsNoPH := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("simple string", "")
+	})
+	if allocsNoPH != 0 {
+		t.Errorf("ReplaceAll without placeholders allocs = %v, expected 0", allocsNoPH)
+	}
+
+	// Verify string replacement allocs <= 1 (only the returned string allocation)
+	allocsStr := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("str={str}", "")
+	})
+	if allocsStr > 1 {
+		t.Errorf("ReplaceAll string replacement allocs = %v, expected <= 1", allocsStr)
+	}
+
+	// Verify int replacement allocs <= 1
+	allocsInt := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("int={int}", "")
+	})
+	if allocsInt > 1 {
+		t.Errorf("ReplaceAll int replacement allocs = %v, expected <= 1", allocsInt)
 	}
 }
