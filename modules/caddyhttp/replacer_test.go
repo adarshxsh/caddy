@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"unsafe"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -294,5 +295,152 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestHeaderAndQueryOptimization(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test?user=alice&token=xyz123&tags=a&tags=b", nil)
+	req.Header.Set("User-Agent", "TestAgent/1.0")
+	req.Header.Add("Accept", "text/html")
+	req.Header.Add("Accept", "application/json")
+	req.Header.Set("x-custom-lower", "custom-value")
+
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "application/json")
+	rec.Header().Add("X-Multi", "v1")
+	rec.Header().Add("X-Multi", "v2")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, rec)
+
+	// Query lookups
+	val, ok := repl.GetString("http.request.uri.query.user")
+	if !ok || val != "alice" {
+		t.Errorf("expected user=alice, got %q (ok=%t)", val, ok)
+	}
+	val, ok = repl.GetString("http.request.uri.query.token")
+	if !ok || val != "xyz123" {
+		t.Errorf("expected token=xyz123, got %q (ok=%t)", val, ok)
+	}
+	val, ok = repl.GetString("http.request.uri.query.tags")
+	if !ok || val != "a,b" {
+		t.Errorf("expected tags=a,b, got %q (ok=%t)", val, ok)
+	}
+	val, ok = repl.GetString("http.request.uri.query.missing")
+	if !ok || val != "" {
+		t.Errorf("expected missing query param to return empty string, got %q (ok=%t)", val, ok)
+	}
+
+	// Request header lookups (canonical direct map check)
+	val, ok = repl.GetString("http.request.header.User-Agent")
+	if !ok || val != "TestAgent/1.0" {
+		t.Errorf("expected User-Agent=TestAgent/1.0, got %q (ok=%t)", val, ok)
+	}
+	// Request header lookup (non-canonical key lookup)
+	val, ok = repl.GetString("http.request.header.user-agent")
+	if !ok || val != "TestAgent/1.0" {
+		t.Errorf("expected user-agent=TestAgent/1.0, got %q (ok=%t)", val, ok)
+	}
+	val, ok = repl.GetString("http.request.header.X-Custom-Lower")
+	if !ok || val != "custom-value" {
+		t.Errorf("expected X-Custom-Lower=custom-value, got %q (ok=%t)", val, ok)
+	}
+	// Request header lookup (multi-value)
+	val, ok = repl.GetString("http.request.header.Accept")
+	if !ok || val != "text/html,application/json" {
+		t.Errorf("expected Accept=text/html,application/json, got %q (ok=%t)", val, ok)
+	}
+	// Request header lookup (missing)
+	val, ok = repl.GetString("http.request.header.X-Missing")
+	if !ok || val != "" {
+		t.Errorf("expected X-Missing to return empty string, got %q (ok=%t)", val, ok)
+	}
+
+	// Response header lookups
+	val, ok = repl.GetString("http.response.header.Content-Type")
+	if !ok || val != "application/json" {
+		t.Errorf("expected Content-Type=application/json, got %q (ok=%t)", val, ok)
+	}
+	val, ok = repl.GetString("http.response.header.X-Multi")
+	if !ok || val != "v1,v2" {
+		t.Errorf("expected X-Multi=v1,v2, got %q (ok=%t)", val, ok)
+	}
+	val, ok = repl.GetString("http.response.header.X-Missing")
+	if !ok || val != "" {
+		t.Errorf("expected response X-Missing to return empty string, got %q (ok=%t)", val, ok)
+	}
+}
+
+func BenchmarkSingleValueHeaderAndQueryLookups(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/test?user=alice&token=xyz123", nil)
+	req.Header.Set("User-Agent", "TestAgent/1.0")
+	req.Header.Set("Authorization", "Bearer my-secret-token")
+
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "application/json")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, rec)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.header.User-Agent")
+		_, _ = repl.GetString("http.request.header.Authorization")
+		_, _ = repl.GetString("http.request.uri.query.user")
+		_, _ = repl.GetString("http.request.uri.query.token")
+		_, _ = repl.GetString("http.response.header.Content-Type")
+	}
+}
+
+func TestQueryCachingAndHeaderStringIdentity(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test?user=alice&token=xyz123", nil)
+	headerVal := "TestAgent/1.0"
+	req.Header.Set("User-Agent", headerVal)
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// 1. Verify single-value header lookup returns exact string reference (no strings.Join allocation)
+	gotHeader, ok := repl.Get("http.request.header.User-Agent")
+	if !ok {
+		t.Fatalf("expected header lookup to succeed")
+	}
+	headerStr, isStr := gotHeader.(string)
+	if !isStr {
+		t.Fatalf("expected string result")
+	}
+	if unsafe.StringData(headerStr) != unsafe.StringData(req.Header["User-Agent"][0]) {
+		t.Errorf("expected string pointer identity for single-value header lookup, but strings differed in memory location")
+	}
+
+	// 2. Verify query parameter is parsed at most once and cached
+	val1, _ := repl.GetString("http.request.uri.query.user")
+	if val1 != "alice" {
+		t.Errorf("expected user=alice, got %q", val1)
+	}
+
+	// Mutate RawQuery to verify cached result is returned instead of re-parsing
+	req.URL.RawQuery = "user=bob&token=modified"
+
+	val2, _ := repl.GetString("http.request.uri.query.token")
+	if val2 != "xyz123" {
+		t.Errorf("expected cached token=xyz123 after RawQuery mutation, got %q", val2)
+	}
+
+	val3, _ := repl.GetString("http.request.uri.query.user")
+	if val3 != "alice" {
+		t.Errorf("expected cached user=alice, got %q", val3)
+	}
+
+	// 3. Verify single-value query parameter lookup returns exact string reference
+	queryVal, ok := repl.Get("http.request.uri.query.token")
+	if !ok {
+		t.Fatalf("expected query lookup to succeed")
+	}
+	queryStr := queryVal.(string)
+	if queryStr != "xyz123" {
+		t.Errorf("expected queryStr=xyz123, got %q", queryStr)
 	}
 }
