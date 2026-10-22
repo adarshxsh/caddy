@@ -296,3 +296,34 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestTLSPlaceholderOptimization(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+		ServerName:  "example.com",
+	}
+
+	// 1. Verify uppercase keys still work
+	val, ok := getReqTLSReplacement(req, "http.request.tls.SERVER_NAME")
+	if !ok || val != "example.com" {
+		t.Errorf("expected ('example.com', true) for uppercase key, got (%v, %t)", val, ok)
+	}
+
+	// 2. Verify lowercase key produces zero allocations
+	allocs := testing.AllocsPerRun(100, func() {
+		getReqTLSReplacement(req, "http.request.tls.resumed")
+	})
+	if allocs != 0 {
+		t.Errorf("expected 0 allocations for lowercase TLS key lookup, got %f", allocs)
+	}
+
+	// 3. Verify missing client cert lookup produces zero allocations
+	allocsClient := testing.AllocsPerRun(100, func() {
+		getReqTLSReplacement(req, "http.request.tls.client.san.dns_names")
+	})
+	if allocsClient != 0 {
+		t.Errorf("expected 0 allocations for missing client cert TLS lookup, got %f", allocsClient)
+	}
+}
