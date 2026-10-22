@@ -299,9 +299,9 @@ func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInter
 		}
 		defer mlw.stop()
 
-		// set up initial timer so headers get flushed even if body writes are delayed
-		mlw.flushPending = true
-		mlw.t = time.AfterFunc(flushInterval, mlw.delayedFlush)
+		// flush response headers immediately without pre-arming the flush timer
+		//nolint:errcheck
+		mlw.flush()
 
 		w = mlw
 	}
