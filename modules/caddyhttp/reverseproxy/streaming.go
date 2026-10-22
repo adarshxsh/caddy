@@ -38,9 +38,23 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 type h2ReadWriteCloser struct {
 	io.ReadCloser
 	http.ResponseWriter
+}
+
+func (rwc h2ReadWriteCloser) CloseWrite() error {
+	if cw, ok := rwc.ResponseWriter.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	if cw, ok := rwc.ReadCloser.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
@@ -226,14 +240,44 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
+
+	closeBoth := sync.OnceFunc(func() {
+		conn.Close()
+		backConn.Close()
+	})
+
+	var closed bool
+	for i := 0; i < 2; i++ {
+		if closed {
+			err := <-errc
+			if err != nil && err != io.EOF {
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+			}
+			continue
 		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+		select {
+		case err := <-errc:
+			if err != nil && err != io.EOF {
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				closed = true
+				closeBoth()
+			}
+		case time := <-timeoutc:
+			if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", time))
+			}
+			closed = true
+			closeBoth()
+		case <-req.Context().Done():
+			if c := logger.Check(zapcore.DebugLevel, "request context canceled"); c != nil {
+				c.Write(zap.Error(req.Context().Err()))
+			}
+			closed = true
+			closeBoth()
 		}
 	}
 }
@@ -646,12 +690,22 @@ type switchProtocolCopier struct {
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	if err == nil {
+		if cw, ok := c.user.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	if err == nil {
+		if cw, ok := c.backend.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	errc <- err
 	c.wg.Done()
 }
