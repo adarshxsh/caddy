@@ -40,21 +40,21 @@ import (
 
 type h2ReadWriteCloser struct {
 	io.ReadCloser
-	http.ResponseWriter
+	writer *maxLatencyWriter
 }
 
 func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
-	n, err = rwc.ResponseWriter.Write(p)
-	if err != nil {
-		return 0, err
-	}
+	return rwc.writer.Write(p)
+}
 
-	//nolint:bodyclose
-	err = http.NewResponseController(rwc.ResponseWriter).Flush()
-	if err != nil {
-		return 0, err
+func (rwc h2ReadWriteCloser) Close() error {
+	if rwc.writer != nil {
+		rwc.writer.stop()
 	}
-	return n, nil
+	if rwc.ReadCloser != nil {
+		return rwc.ReadCloser.Close()
+	}
+	return nil
 }
 
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
@@ -115,7 +115,27 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			}
 			return
 		}
-		conn = h2ReadWriteCloser{req.Body, rw}
+		flushInterval := time.Duration(h.FlushInterval)
+		if flushInterval == 0 {
+			flushInterval = 10 * time.Millisecond
+		}
+		var mlwLogger *zap.Logger
+		if h.VerboseLogs {
+			mlwLogger = logger.Named("max_latency_writer")
+		} else {
+			mlwLogger = zap.NewNop()
+		}
+		mlw := &maxLatencyWriter{
+			dst: rw,
+			//nolint:bodyclose
+			flush:   http.NewResponseController(rw).Flush,
+			latency: flushInterval,
+			logger:  mlwLogger,
+		}
+		conn = h2ReadWriteCloser{
+			ReadCloser: req.Body,
+			writer:     mlw,
+		}
 		// bufio is not needed, use minimal buffer
 		brw = bufio.NewReadWriter(bufio.NewReaderSize(conn, 1), bufio.NewWriterSize(conn, 1))
 	} else {
@@ -630,7 +650,12 @@ func (m *maxLatencyWriter) delayedFlush() {
 func (m *maxLatencyWriter) stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.flushPending = false
+	if m.flushPending {
+		m.logger.Debug("flushing pending on stop")
+		//nolint:errcheck
+		m.flush()
+		m.flushPending = false
+	}
 	if m.t != nil {
 		m.t.Stop()
 	}
