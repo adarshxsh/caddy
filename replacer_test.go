@@ -514,10 +514,58 @@ func BenchmarkReplacer(b *testing.B) {
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
+		{
+			name:  "unclosed brace",
+			input: `unclosed {brace`,
+		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
+			}
+		})
+	}
+
+	b.Run("unmatched brace ReplaceKnown", func(b *testing.B) {
+		for b.Loop() {
+			rep.ReplaceKnown(`{"json": "object"}`, "")
+		}
+	})
+}
+
+func TestReplacerZeroAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+
+	inputs := []struct {
+		name string
+		fn   func() string
+	}{
+		{
+			name: "no braces",
+			fn:   func() string { return rep.ReplaceAll("simple string", "") },
+		},
+		{
+			name: "unclosed brace",
+			fn:   func() string { return rep.ReplaceAll("unclosed {brace", "") },
+		},
+		{
+			name: "unrecognized placeholder ReplaceKnown",
+			fn:   func() string { return rep.ReplaceKnown(`{"json": "object"}`, "") },
+		},
+		{
+			name: "closing brace only",
+			fn:   func() string { return rep.ReplaceAll("closing } brace", "") },
+		},
+	}
+
+	for _, tc := range inputs {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() {
+				_ = tc.fn()
+			})
+			if allocs > 0 {
+				t.Errorf("expected 0 allocs for %s, got %f", tc.name, allocs)
 			}
 		})
 	}
