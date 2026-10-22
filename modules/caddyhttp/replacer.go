@@ -411,6 +411,8 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 	repl.Map(httpVars)
 }
 
+var emptyCert = new(x509.Certificate)
+
 func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 	if req == nil || req.TLS == nil {
 		return nil, false
@@ -420,7 +422,14 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 		return nil, false
 	}
 
-	field := strings.ToLower(key[len(reqTLSReplPrefix):])
+	field := key[len(reqTLSReplPrefix):]
+	for i := 0; i < len(field); i++ {
+		c := field[i]
+		if c >= 'A' && c <= 'Z' {
+			field = strings.ToLower(field)
+			break
+		}
+	}
 
 	if strings.HasPrefix(field, "client.") {
 		cert := getTLSPeerCert(req.TLS)
@@ -433,8 +442,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 			// the client presented a cert. We also do not return true here
 			// because we probably should remain accurate about whether a
 			// placeholder is, in fact, known or not.
-			// (This allocation may be slightly inefficient.)
-			cert = new(x509.Certificate)
+			cert = emptyCert
 		}
 
 		// subject alternate names (SANs)
