@@ -210,30 +210,69 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 			log.Printf("[PANIC] distributed STEK rotation: %v\n%s", err, debug.Stack())
 		}
 	}()
+	numFailures := 0
 	for {
 		select {
 		case <-s.timer.C:
 			dstek, err := s.getSTEK()
 			if err != nil {
-				// TODO: improve this handling
+				numFailures++
 				log.Printf("[ERROR] Loading STEK: %v", err)
+				s.timer.Reset(calculateBackoff(numFailures, time.Duration(s.stekConfig.RotationInterval)))
 				continue
 			}
 
+			numFailures = 0
+
 			// send the updated keys to the service
-			keysChan <- dstek.Keys
+			select {
+			case keysChan <- dstek.Keys:
+			case <-doneChan:
+				if !s.timer.Stop() {
+					select {
+					case <-s.timer.C:
+					default:
+					}
+				}
+				return
+			}
 
 			// timer channel is already drained, so reset directly (see godoc)
-			s.timer.Reset(time.Until(dstek.NextRotation))
+			nextInterval := time.Until(dstek.NextRotation)
+			if nextInterval <= 0 {
+				nextInterval = time.Duration(s.stekConfig.RotationInterval)
+			}
+			s.timer.Reset(nextInterval)
 
 		case <-doneChan:
 			// again, see godocs for why timer is stopped this way
 			if !s.timer.Stop() {
-				<-s.timer.C
+				select {
+				case <-s.timer.C:
+				default:
+				}
 			}
 			return
 		}
 	}
+}
+
+func calculateBackoff(numFailures int, rotationInterval time.Duration) time.Duration {
+	if numFailures <= 0 {
+		if rotationInterval > 0 {
+			return rotationInterval
+		}
+		return 12 * time.Hour
+	}
+	shift := numFailures - 1
+	if shift > 30 {
+		shift = 30
+	}
+	backoff := time.Minute * (1 << shift)
+	if rotationInterval > 0 && (backoff > rotationInterval || backoff <= 0) {
+		return rotationInterval
+	}
+	return backoff
 }
 
 type distributedSTEK struct {

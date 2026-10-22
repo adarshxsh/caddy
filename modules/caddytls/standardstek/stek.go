@@ -87,6 +87,7 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			log.Printf("[PANIC] standard STEK rotation: %v\n%s", err, debug.Stack())
 		}
 	}()
+	numFailures := 0
 	for {
 		select {
 		case now := <-s.timer.C:
@@ -99,10 +100,13 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			var err error
 			keysCopy, err = s.stekConfig.RotateSTEKs(keysCopy)
 			if err != nil {
-				// TODO: improve this handling
+				numFailures++
 				log.Printf("[ERROR] Generating STEK: %v", err)
+				s.timer.Reset(calculateBackoff(numFailures, time.Duration(s.stekConfig.RotationInterval)))
 				continue
 			}
+
+			numFailures = 0
 
 			// replace keys slice with updated value and
 			// record the timestamp of rotation
@@ -112,7 +116,17 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			mutex.Unlock()
 
 			// send the updated keys to the service
-			keysChan <- keysCopy
+			select {
+			case keysChan <- keysCopy:
+			case <-doneChan:
+				if !s.timer.Stop() {
+					select {
+					case <-s.timer.C:
+					default:
+					}
+				}
+				return
+			}
 
 			// timer channel is already drained, so reset directly (see godoc)
 			s.timer.Reset(time.Duration(s.stekConfig.RotationInterval))
@@ -120,11 +134,32 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 		case <-doneChan:
 			// again, see godocs for why timer is stopped this way
 			if !s.timer.Stop() {
-				<-s.timer.C
+				select {
+				case <-s.timer.C:
+				default:
+				}
 			}
 			return
 		}
 	}
+}
+
+func calculateBackoff(numFailures int, rotationInterval time.Duration) time.Duration {
+	if numFailures <= 0 {
+		if rotationInterval > 0 {
+			return rotationInterval
+		}
+		return 12 * time.Hour
+	}
+	shift := numFailures - 1
+	if shift > 30 {
+		shift = 30
+	}
+	backoff := time.Minute * (1 << shift)
+	if rotationInterval > 0 && (backoff > rotationInterval || backoff <= 0) {
+		return rotationInterval
+	}
+	return backoff
 }
 
 var (
