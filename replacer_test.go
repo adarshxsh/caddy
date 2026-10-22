@@ -16,11 +16,14 @@ package caddy
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -529,4 +532,110 @@ func testReplacer() Replacer {
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
 	}
+}
+
+func TestTimeCache(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	fixedTime := time.Date(2026, 10, 21, 12, 30, 45, 123456789, time.UTC)
+	nowFunc = func() time.Time { return fixedTime }
+
+	repl := NewReplacer()
+
+	tests := []struct {
+		key      string
+		expected string
+	}{
+		{"time.now.http", fixedTime.UTC().Format(http.TimeFormat)},
+		{"time.now.common_log", fixedTime.Format("02/Jan/2006:15:04:05 -0700")},
+		{"time.now.year", strconv.Itoa(fixedTime.Year())},
+		{"time.now.unix", strconv.FormatInt(fixedTime.Unix(), 10)},
+		{"time.now.unix_ms", strconv.FormatInt(fixedTime.UnixNano()/int64(time.Millisecond), 10)},
+	}
+
+	for _, tc := range tests {
+		val, ok := repl.GetString(tc.key)
+		if !ok {
+			t.Errorf("expected key %s to be recognized", tc.key)
+		}
+		if val != tc.expected {
+			t.Errorf("key %s: expected %q, got %q", tc.key, tc.expected, val)
+		}
+	}
+}
+
+func TestTimeCacheUpdateOnSecondChange(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	t1 := time.Date(2026, 10, 21, 12, 30, 45, 0, time.UTC)
+	current := t1
+	nowFunc = func() time.Time { return current }
+
+	repl := NewReplacer()
+
+	val1, ok := repl.GetString("time.now.unix")
+	if !ok || val1 != strconv.FormatInt(t1.Unix(), 10) {
+		t.Fatalf("expected unix %d, got %q (ok=%v)", t1.Unix(), val1, ok)
+	}
+
+	// Advance time by 2 seconds
+	t2 := t1.Add(2 * time.Second)
+	current = t2
+
+	val2, ok := repl.GetString("time.now.unix")
+	if !ok || val2 != strconv.FormatInt(t2.Unix(), 10) {
+		t.Fatalf("expected updated unix %d, got %q (ok=%v)", t2.Unix(), val2, ok)
+	}
+}
+
+func TestTimeCacheZeroAllocations(t *testing.T) {
+	repl := NewReplacer()
+
+	keys := []string{
+		"time.now.http",
+		"time.now.common_log",
+		"time.now.year",
+		"time.now.unix",
+	}
+
+	var sink string
+	for _, key := range keys {
+		// Warm up cache for current second
+		_, _ = repl.GetString(key)
+
+		allocs := testing.AllocsPerRun(100, func() {
+			sink, _ = repl.GetString(key)
+		})
+
+		if allocs > 0 {
+			t.Errorf("expected 0 allocations for %s lookup on cache hit, got %f", key, allocs)
+		}
+	}
+	_ = sink
+}
+
+func TestTimeCacheConcurrency(t *testing.T) {
+	repl := NewReplacer()
+
+	var wg sync.WaitGroup
+	workers := 20
+	iterations := 1000
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				_, _ = repl.GetString("time.now.http")
+				_, _ = repl.GetString("time.now.common_log")
+				_, _ = repl.GetString("time.now.year")
+				_, _ = repl.GetString("time.now.unix")
+				_, _ = repl.GetString("time.now.unix_ms")
+			}
+		}()
+	}
+
+	wg.Wait()
 }
