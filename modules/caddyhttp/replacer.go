@@ -37,6 +37,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -420,7 +421,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 		return nil, false
 	}
 
-	field := strings.ToLower(key[len(reqTLSReplPrefix):])
+	field := fastToLower(key[len(reqTLSReplPrefix):])
 
 	if strings.HasPrefix(field, "client.") {
 		cert := getTLSPeerCert(req.TLS)
@@ -433,8 +434,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 			// the client presented a cert. We also do not return true here
 			// because we probably should remain accurate about whether a
 			// placeholder is, in fact, known or not.
-			// (This allocation may be slightly inefficient.)
-			cert = new(x509.Certificate)
+			cert = emptyCert
 		}
 
 		// subject alternate names (SANs)
@@ -585,6 +585,20 @@ func (rid *requestID) String() string {
 	}
 	return rid.value
 }
+
+// fastToLower returns s lowercased. If s contains no uppercase ASCII
+// characters and no non-ASCII bytes, it returns s unchanged without allocations.
+func fastToLower(s string) string {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || c >= utf8.RuneSelf {
+			return strings.ToLower(s)
+		}
+	}
+	return s
+}
+
+var emptyCert = new(x509.Certificate)
 
 const (
 	reqCookieReplPrefix      = "http.request.cookie."

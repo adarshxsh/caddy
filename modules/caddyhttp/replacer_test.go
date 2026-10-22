@@ -296,3 +296,58 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestTLSReplacerAllocations(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version: tls.VersionTLS13,
+	}
+
+	// 1. Verify fastToLower is zero-allocation for lowercase keys
+	keysToTest := []string{
+		"version",
+		"client.issuer",
+		"client.subject",
+		"client.san.dns_names.0",
+	}
+
+	for _, key := range keysToTest {
+		allocs := testing.AllocsPerRun(100, func() {
+			_ = fastToLower(key)
+		})
+		if allocs != 0 {
+			t.Errorf("expected 0 allocations for fastToLower(%q), got %f", key, allocs)
+		}
+	}
+
+	// 2. Verify placeholder replacement for SAN index with missing client cert has zero allocations
+	// (no new(x509.Certificate) allocation and no interface boxing for nil)
+	allocs := testing.AllocsPerRun(100, func() {
+		getReqTLSReplacement(req, "http.request.tls.client.san.dns_names.0")
+	})
+	if allocs != 0 {
+		t.Errorf("expected 0 allocations for getReqTLSReplacement with missing client cert SAN index, got %f", allocs)
+	}
+}
+
+func TestTLSReplacerCaseInsensitive(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version: tls.VersionTLS13,
+	}
+
+	val1, ok1 := getReqTLSReplacement(req, "http.request.tls.version")
+	val2, ok2 := getReqTLSReplacement(req, "http.request.tls.VERSION")
+	val3, ok3 := getReqTLSReplacement(req, "http.request.tls.Version")
+
+	if !ok1 || !ok2 || !ok3 || val1 != val2 || val1 != val3 {
+		t.Errorf("case insensitivity mismatch for TLS version: %v (ok=%t), %v (ok=%t), %v (ok=%t)",
+			val1, ok1, val2, ok2, val3, ok3)
+	}
+
+	_, okClientLower := getReqTLSReplacement(req, "http.request.tls.client.issuer")
+	_, okClientUpper := getReqTLSReplacement(req, "http.request.tls.CLIENT.ISSUER")
+	if !okClientLower || !okClientUpper {
+		t.Errorf("case insensitivity mismatch for client issuer: lower ok=%t, upper ok=%t", okClientLower, okClientUpper)
+	}
+}
