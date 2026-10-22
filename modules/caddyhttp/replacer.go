@@ -59,23 +59,48 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 	SetVar(req.Context(), "start_time", time.Now())
 	SetVar(req.Context(), "uuid", new(requestID))
 
+	var (
+		reqQueryParams url.Values
+		queryParsed    bool
+	)
+
 	httpVars := func(key string) (any, bool) {
 		if req != nil {
 			// query string parameters
 			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
-				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
-				// always return true, since the query param might
-				// be present only in some requests
-				return strings.Join(vals, ","), true
+				if !queryParsed {
+					if req.URL != nil {
+						reqQueryParams = req.URL.Query()
+					}
+					queryParsed = true
+				}
+				param := key[len(reqURIQueryReplPrefix):]
+				vals := reqQueryParams[param]
+				switch len(vals) {
+				case 0:
+					return "", true
+				case 1:
+					return vals[0], true
+				default:
+					return strings.Join(vals, ","), true
+				}
 			}
 
 			// request header fields
 			if strings.HasPrefix(key, reqHeaderReplPrefix) {
 				field := key[len(reqHeaderReplPrefix):]
-				vals := req.Header[textproto.CanonicalMIMEHeaderKey(field)]
-				// always return true, since the header field might
-				// be present only in some requests
-				return strings.Join(vals, ","), true
+				vals, ok := req.Header[field]
+				if !ok {
+					vals = req.Header[textproto.CanonicalMIMEHeaderKey(field)]
+				}
+				switch len(vals) {
+				case 0:
+					return "", true
+				case 1:
+					return vals[0], true
+				default:
+					return strings.Join(vals, ","), true
+				}
 			}
 
 			// cookies
@@ -385,10 +410,19 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// response header fields
 			if strings.HasPrefix(key, respHeaderReplPrefix) {
 				field := key[len(respHeaderReplPrefix):]
-				vals := w.Header()[textproto.CanonicalMIMEHeaderKey(field)]
-				// always return true, since the header field might
-				// be present only in some responses
-				return strings.Join(vals, ","), true
+				hdr := w.Header()
+				vals, ok := hdr[field]
+				if !ok {
+					vals = hdr[textproto.CanonicalMIMEHeaderKey(field)]
+				}
+				switch len(vals) {
+				case 0:
+					return "", true
+				case 1:
+					return vals[0], true
+				default:
+					return strings.Join(vals, ","), true
+				}
 			}
 		}
 
