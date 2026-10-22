@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types/ref"
@@ -428,14 +429,26 @@ func (m MatchVarsRE) Validate() error {
 	return nil
 }
 
+var varMapLocks [256]sync.RWMutex
+
+func lockVarMap(varMap map[string]any) *sync.RWMutex {
+	ptr := reflect.ValueOf(varMap).Pointer()
+	idx := (ptr >> 4) & 255
+	return &varMapLocks[idx]
+}
+
 // GetVar gets a value out of the context's variable table by key.
 // If the key does not exist, the return value will be nil.
 func GetVar(ctx context.Context, key string) any {
 	varMap, ok := ctx.Value(VarsCtxKey).(map[string]any)
-	if !ok {
+	if !ok || varMap == nil {
 		return nil
 	}
-	return varMap[key]
+	mu := lockVarMap(varMap)
+	mu.RLock()
+	val := varMap[key]
+	mu.RUnlock()
+	return val
 }
 
 // SetVar sets a value in the context's variable table with
@@ -447,16 +460,17 @@ func GetVar(ctx context.Context, key string) any {
 // the table, the key+value will be deleted from the table.
 func SetVar(ctx context.Context, key string, value any) {
 	varMap, ok := ctx.Value(VarsCtxKey).(map[string]any)
-	if !ok {
+	if !ok || varMap == nil {
 		return
 	}
+	mu := lockVarMap(varMap)
+	mu.Lock()
 	if value == nil {
-		if _, ok := varMap[key]; ok {
-			delete(varMap, key)
-			return
-		}
+		delete(varMap, key)
+	} else {
+		varMap[key] = value
 	}
-	varMap[key] = value
+	mu.Unlock()
 }
 
 // Interface guards
