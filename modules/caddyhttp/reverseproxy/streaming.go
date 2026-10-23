@@ -34,6 +34,10 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http/httpguts"
+	"golang.org/x/net/http2"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -679,3 +683,105 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+// cancelDownstreamHTTP3Stream inspects err for QUIC/HTTP error reset codes
+// and, if rw implements http3.HTTPStreamer, cancels writing on the downstream
+// HTTP/3 stream with the extracted error code. It returns the extracted code and true
+// if a reset code was found.
+func cancelDownstreamHTTP3Stream(rw http.ResponseWriter, err error) (quic.StreamErrorCode, bool) {
+	code, hasCode := extractQUICResetCode(err)
+	if !hasCode {
+		return 0, false
+	}
+	streamer := getHTTPStreamer(rw)
+	if streamer == nil {
+		return code, true
+	}
+	str := streamer.HTTPStream()
+	if str == nil {
+		return code, true
+	}
+	str.CancelWrite(code)
+	return code, true
+}
+
+func extractQUICResetCode(err error) (quic.StreamErrorCode, bool) {
+	if err == nil {
+		return 0, false
+	}
+	var h3Err *http3.Error
+	if errors.As(err, &h3Err) && h3Err != nil {
+		return quic.StreamErrorCode(h3Err.ErrorCode), true
+	}
+	var qAppErr *quic.ApplicationError
+	if errors.As(err, &qAppErr) && qAppErr != nil {
+		return quic.StreamErrorCode(qAppErr.ErrorCode), true
+	}
+	var qStreamErr *quic.StreamError
+	if errors.As(err, &qStreamErr) && qStreamErr != nil {
+		return qStreamErr.ErrorCode, true
+	}
+	var h2Err http2.StreamError
+	if errors.As(err, &h2Err) {
+		return http2ErrCodeToQUIC(h2Err.Code), true
+	}
+	return 0, false
+}
+
+func getHTTPStreamer(rw http.ResponseWriter) http3.HTTPStreamer {
+	for rw != nil {
+		if streamer, ok := rw.(http3.HTTPStreamer); ok {
+			return streamer
+		}
+		switch u := rw.(type) {
+		case interface{ Unwrap() http.ResponseWriter }:
+			rw = u.Unwrap()
+		case interface{ Unwrap() []http.ResponseWriter }:
+			rws := u.Unwrap()
+			for _, w := range rws {
+				if streamer := getHTTPStreamer(w); streamer != nil {
+					return streamer
+				}
+			}
+			return nil
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+func http2ErrCodeToQUIC(code http2.ErrCode) quic.StreamErrorCode {
+	switch code {
+	case http2.ErrCodeNo:
+		return quic.StreamErrorCode(http3.ErrCodeNoError)
+	case http2.ErrCodeProtocol:
+		return quic.StreamErrorCode(http3.ErrCodeGeneralProtocolError)
+	case http2.ErrCodeInternal:
+		return quic.StreamErrorCode(http3.ErrCodeInternalError)
+	case http2.ErrCodeFlowControl:
+		return quic.StreamErrorCode(http3.ErrCodeGeneralProtocolError)
+	case http2.ErrCodeSettingsTimeout:
+		return quic.StreamErrorCode(http3.ErrCodeSettingsError)
+	case http2.ErrCodeStreamClosed:
+		return quic.StreamErrorCode(http3.ErrCodeStreamCreationError)
+	case http2.ErrCodeFrameSize:
+		return quic.StreamErrorCode(http3.ErrCodeFrameError)
+	case http2.ErrCodeRefusedStream:
+		return quic.StreamErrorCode(http3.ErrCodeRequestRejected)
+	case http2.ErrCodeCancel:
+		return quic.StreamErrorCode(http3.ErrCodeRequestCanceled)
+	case http2.ErrCodeCompression:
+		return quic.StreamErrorCode(http3.ErrCodeGeneralProtocolError)
+	case http2.ErrCodeConnect:
+		return quic.StreamErrorCode(http3.ErrCodeConnectError)
+	case http2.ErrCodeEnhanceYourCalm:
+		return quic.StreamErrorCode(http3.ErrCodeExcessiveLoad)
+	case http2.ErrCodeInadequateSecurity:
+		return quic.StreamErrorCode(http3.ErrCodeGeneralProtocolError)
+	case http2.ErrCodeHTTP11Required:
+		return quic.StreamErrorCode(http3.ErrCodeVersionFallback)
+	default:
+		return quic.StreamErrorCode(http3.ErrCodeInternalError)
+	}
+}
