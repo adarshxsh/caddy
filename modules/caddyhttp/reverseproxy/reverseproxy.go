@@ -1276,8 +1276,14 @@ func (h *Handler) finalizeResponse(
 		// we'll just log the error and abort the stream here and panic just as
 		// the standard lib's proxy to propagate the stream error.
 		// see issue https://github.com/caddyserver/caddy/issues/5951
+		code, hasCode := cancelDownstreamHTTP3Stream(rw, err)
+
 		if c := logger.Check(zapcore.WarnLevel, "aborting with incomplete response"); c != nil {
-			c.Write(zap.Error(err))
+			if hasCode {
+				c.Write(zap.Error(err), zap.Uint64("quic_reset_code", uint64(code)))
+			} else {
+				c.Write(zap.Error(err))
+			}
 		}
 		// no extra logging from stdlib
 		panic(http.ErrAbortHandler)
