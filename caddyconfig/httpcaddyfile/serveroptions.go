@@ -59,7 +59,9 @@ type serverOptions struct {
 	Trace                 bool // TODO: EXPERIMENTAL
 	// If set, overrides whether QUIC listeners allow 0-RTT (early data).
 	// If nil, the default behavior is used (currently allowed).
-	Allow0RTT *bool
+	Allow0RTT       *bool
+	EarlyDataPolicy string
+	StrictEarlyData *bool
 }
 
 func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
@@ -323,6 +325,33 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
 			boolVal := false
 			serverOpts.Allow0RTT = &boolVal
 
+		case "early_data_policy":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			policy := d.Val()
+			if policy != "reject_unsafe" && policy != "reject_all" && policy != "allow_all" {
+				return nil, d.Errf("invalid early_data_policy '%s' (expected reject_unsafe, reject_all, or allow_all)", policy)
+			}
+			serverOpts.EarlyDataPolicy = policy
+
+		case "strict_early_data":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			val := d.Val()
+			boolVal, err := strconv.ParseBool(val)
+			if err != nil {
+				if val == "off" {
+					boolVal = false
+				} else if val == "on" {
+					boolVal = true
+				} else {
+					return nil, d.Errf("invalid strict_early_data boolean '%s'", val)
+				}
+			}
+			serverOpts.StrictEarlyData = &boolVal
+
 		default:
 			return nil, d.Errf("unrecognized servers option '%s'", d.Val())
 		}
@@ -388,6 +417,8 @@ func applyServerOptions(
 		server.TrustedProxiesUnix = opts.TrustedProxiesUnix
 		server.Metrics = opts.Metrics
 		server.Allow0RTT = opts.Allow0RTT
+		server.EarlyDataPolicy = opts.EarlyDataPolicy
+		server.StrictEarlyData = opts.StrictEarlyData
 		if opts.ShouldLogCredentials {
 			if server.Logs == nil {
 				server.Logs = new(caddyhttp.ServerLogConfig)
