@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -575,4 +577,89 @@ func TestServer_DetermineTrustedProxy_MatchRightMostUntrustedFirst(t *testing.T)
 
 	assert.True(t, trusted)
 	assert.Equal(t, clientIP, "90.100.110.120")
+}
+
+func TestLoggableTLSConnState_EarlyData(t *testing.T) {
+	tests := []struct {
+		name      string
+		earlyData string
+		expected  string
+	}{
+		{
+			name:      "Accepted early data",
+			earlyData: EarlyDataAccepted,
+			expected:  `"early_data":"accepted"`,
+		},
+		{
+			name:      "Rejected early data",
+			earlyData: EarlyDataRejected,
+			expected:  `"early_data":"rejected"`,
+		},
+		{
+			name:      "No early data (none)",
+			earlyData: EarlyDataNone,
+			expected:  `"early_data":"none"`,
+		},
+		{
+			name:      "Empty early data defaults to none",
+			earlyData: "",
+			expected:  `"early_data":"none"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tlsState := LoggableTLSConnState{
+				ConnectionState: tls.ConnectionState{
+					DidResume:          tt.earlyData == EarlyDataAccepted || tt.earlyData == EarlyDataRejected,
+					Version:            tls.VersionTLS13,
+					CipherSuite:        tls.TLS_AES_128_GCM_SHA256,
+					NegotiatedProtocol: "h3",
+					ServerName:         "example.com",
+				},
+				EarlyData: tt.earlyData,
+			}
+
+			buf := bytes.Buffer{}
+			logger := testLogger(buf.Write)
+			logger.Info("tls test", zap.Object("tls", tlsState))
+
+			assert.Contains(t, buf.String(), tt.expected)
+		})
+	}
+}
+
+func TestLoggableHTTPRequest_EarlyDataInContext(t *testing.T) {
+	ctx := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataAccepted)
+	req := httptest.NewRequest("GET", "https://example.com/", nil).WithContext(ctx)
+	req.TLS = &tls.ConnectionState{
+		Version:            tls.VersionTLS13,
+		CipherSuite:        tls.TLS_AES_128_GCM_SHA256,
+		NegotiatedProtocol: "h3",
+		ServerName:         "example.com",
+	}
+
+	logReq := LoggableHTTPRequest{Request: req}
+	buf := bytes.Buffer{}
+	logger := testLogger(buf.Write)
+	logger.Info("req test", zap.Object("request", logReq))
+
+	assert.Contains(t, buf.String(), `"early_data":"accepted"`)
+}
+
+func TestServeHTTP3_ConnContextSetup(t *testing.T) {
+	s := &Server{}
+	tlsCfg := &tls.Config{}
+	
+	// Create a dummy net.Listener wrapping mock/nil QUIC listener
+	// Note: serveHTTP3 will create s.h3server and set ConnContext
+	_ = s.serveHTTP3(caddy.NetworkAddress{Network: "udp", Host: "127.0.0.1", StartPort: 0, EndPort: 0}, tlsCfg)
+
+	require.NotNil(t, s.h3server)
+	require.NotNil(t, s.h3server.ConnContext)
+
+	// Verify ConnContext returns ctx when c is nil
+	baseCtx := context.Background()
+	ctx := s.h3server.ConnContext(baseCtx, nil)
+	assert.Equal(t, baseCtx, ctx)
 }
