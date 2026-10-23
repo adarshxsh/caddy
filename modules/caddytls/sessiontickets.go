@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	weakrand "math/rand/v2"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -52,6 +53,7 @@ type SessionTicketService struct {
 	stopChan    chan struct{}
 	currentKeys [][32]byte
 	mu          *sync.Mutex
+	randReader  io.Reader
 }
 
 func (s *SessionTicketService) provision(ctx caddy.Context) error {
@@ -184,9 +186,35 @@ func (s *SessionTicketService) unregister(cfg *tls.Config) {
 	s.mu.Unlock()
 }
 
+func (s *SessionTicketService) muLock() {
+	if s == nil {
+		return
+	}
+	if s.mu == nil {
+		// Note: value struct receiver or unit test before provision
+		// initialized in provision, but guard lazily if unprovisioned
+		s.mu = new(sync.Mutex)
+	}
+	s.mu.Lock()
+}
+
+func (s *SessionTicketService) muUnlock() {
+	if s == nil || s.mu == nil {
+		return
+	}
+	s.mu.Unlock()
+}
+
+// SetRandReaderForTest sets a custom random reader for testing STEK generation.
+func (s *SessionTicketService) SetRandReaderForTest(r io.Reader) {
+	s.muLock()
+	defer s.muUnlock()
+	s.randReader = r
+}
+
 // RotateSTEKs rotates the keys in keys by producing a new key and eliding
 // the oldest one. The new slice of keys is returned.
-func (s SessionTicketService) RotateSTEKs(keys [][32]byte) ([][32]byte, error) {
+func (s *SessionTicketService) RotateSTEKs(keys [][32]byte) ([][32]byte, error) {
 	// produce a new key
 	newKey, err := s.generateSTEK()
 	if err != nil {
@@ -217,8 +245,58 @@ func (s SessionTicketService) RotateSTEKs(keys [][32]byte) ([][32]byte, error) {
 // session ticket ephemeral key.
 func (s *SessionTicketService) generateSTEK() ([32]byte, error) {
 	var newTicketKey [32]byte
-	_, err := io.ReadFull(rand.Reader, newTicketKey[:])
+	var r io.Reader
+	s.muLock()
+	r = s.randReader
+	s.muUnlock()
+	if r == nil {
+		r = rand.Reader
+	}
+	_, err := io.ReadFull(r, newTicketKey[:])
 	return newTicketKey, err
+}
+
+// CalculateSTEKBackoff calculates the exponential backoff duration for STEK rotation retries based on consecutive failure count.
+func CalculateSTEKBackoff(numFailures int, rotationInterval time.Duration) time.Duration {
+	if numFailures <= 0 {
+		numFailures = 1
+	}
+	if rotationInterval <= 0 {
+		rotationInterval = defaultSTEKRotationInterval
+	}
+
+	minBackoff := 10 * time.Second
+	if rotationInterval < minBackoff {
+		minBackoff = rotationInterval
+	}
+
+	maxBackoff := 1 * time.Hour
+	if rotationInterval < maxBackoff {
+		maxBackoff = rotationInterval
+	}
+
+	shift := numFailures - 1
+	if shift > 30 {
+		shift = 30
+	}
+	backoff := minBackoff * (1 << shift)
+	if backoff > maxBackoff || backoff <= 0 {
+		backoff = maxBackoff
+	}
+
+	if backoff > 0 {
+		jitterMax := backoff / 5
+		if jitterMax > 0 {
+			jitter := time.Duration(weakrand.Int64N(int64(jitterMax)))
+			backoff += jitter
+		}
+	}
+
+	if backoff > maxBackoff {
+		backoff = maxBackoff
+	}
+
+	return backoff
 }
 
 // STEKProvider is a type that can provide session ticket ephemeral
