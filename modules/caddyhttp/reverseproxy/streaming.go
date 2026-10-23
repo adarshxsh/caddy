@@ -21,10 +21,10 @@ package reverseproxy
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	weakrand "math/rand/v2"
 	"mime"
 	"net/http"
 	"sync"
@@ -554,10 +554,10 @@ func maskBytes(key [4]byte, pos int, b []byte) int {
 	return pos & 3
 }
 
-// Copied from https://github.com/gorilla/websocket/blob/v1.5.0/conn.go#L184
 func newMaskKey() [4]byte {
-	n := weakrand.Uint32()
-	return [4]byte{byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
+	var key [4]byte
+	_, _ = rand.Read(key[:])
+	return key
 }
 
 // isWebsocket returns true if r looks to be an upgrade request for WebSockets.
