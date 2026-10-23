@@ -13,6 +13,8 @@ import (
 	"testing"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -783,5 +785,128 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	expectedBody := "hello world"
 	if rec.Body.String() != expectedBody {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
+	}
+}
+
+// TestBodyConsumptionGuardOnTransportError verifies that unbuffered requests whose
+// body bytes have been read (read > 0) will NOT retry on transport errors and emit a debug log.
+func TestBodyConsumptionGuardOnTransportError(t *testing.T) {
+	// Good server: 200 OK
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	t.Cleanup(goodServer.Close)
+
+	// Broken server: reads partial body bytes and hijacks/closes connection to trigger transport error
+	brokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 5)
+		_, _ = io.ReadFull(r.Body, buf)
+		hj, ok := w.(http.Hijacker)
+		if ok {
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+		}
+	}))
+	t.Cleanup(brokenServer.Close)
+
+	// RoundRobin picks index 1 (broken) first, then index 0 (good)
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: brokenServer.Listener.Addr().String()},
+	}
+
+	retryMatch := caddyhttp.MatcherSets{
+		caddyhttp.MatcherSet{
+			newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true"),
+		},
+	}
+
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+
+	core, observed := observer.New(zapcore.DebugLevel)
+	h.logger = zap.New(core)
+
+	bodyReader := newCloseOnCloseReader("hello body consumption guard")
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+	req.Body = bodyReader
+	req.ContentLength = int64(len("hello body consumption guard"))
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	// Should fail - retry suppressed because body was consumed
+	if err == nil {
+		t.Fatalf("expected error from ServeHTTP due to consumed body on transport error")
+	}
+
+	logs := observed.FilterMessage("cannot retry request with consumed body").All()
+	if len(logs) == 0 {
+		t.Errorf("expected debug log message 'cannot retry request with consumed body'")
+	}
+}
+
+// TestBodyConsumptionGuardBufferedRequestRetries verifies that buffered requests
+// (via request_buffers or pre-buffered) reset their body reader and remain eligible for retry.
+func TestBodyConsumptionGuardBufferedRequestRetries(t *testing.T) {
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+	}))
+	t.Cleanup(goodServer.Close)
+
+	brokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 5)
+		_, _ = io.ReadFull(r.Body, buf)
+		hj, ok := w.(http.Hijacker)
+		if ok {
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+		}
+	}))
+	t.Cleanup(brokenServer.Close)
+
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: brokenServer.Listener.Addr().String()},
+	}
+
+	retryMatch := caddyhttp.MatcherSets{
+		caddyhttp.MatcherSet{
+			newExpressionMatcher(t, "{http.reverse_proxy.is_transport_error} == true"),
+		},
+	}
+
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+	h.RequestBuffers = 1024 // Enable request body buffering
+
+	const requestBody = "buffered body retry test"
+	bodyReader := newCloseOnCloseReader(requestBody)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", bodyReader)
+	req.Body = bodyReader
+	req.ContentLength = int64(len(requestBody))
+	req = prepareTestRequest(req)
+
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	}))
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200 OK", rec.Code)
+	}
+	if rec.Body.String() != requestBody {
+		t.Errorf("body: got %q, want %q", rec.Body.String(), requestBody)
 	}
 }
