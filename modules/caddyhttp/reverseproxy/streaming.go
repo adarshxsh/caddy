@@ -28,6 +28,7 @@ import (
 	"mime"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -204,17 +205,21 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
+	var activity atomic.Int64
+	activity.Store(time.Now().UnixNano())
+
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
+		user:       activityRWC{ReadWriteCloser: conn, activity: &activity},
+		backend:    activityRWC{ReadWriteCloser: backConn, activity: &activity},
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
 	}
 
 	// setup the timeout if requested
 	var timeoutc <-chan time.Time
+	var timer *time.Timer
 	if h.StreamTimeout > 0 {
-		timer := time.NewTimer(time.Duration(h.StreamTimeout))
+		timer = time.NewTimer(time.Duration(h.StreamTimeout))
 		defer timer.Stop()
 		timeoutc = timer.C
 	}
@@ -226,16 +231,45 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+	for {
+		select {
+		case err := <-errc:
+			if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+				c.Write(zap.Error(err))
+			}
+			return
+		case t := <-timeoutc:
+			idle := time.Since(time.Unix(0, activity.Load()))
+			if idle >= time.Duration(h.StreamTimeout) {
+				if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+					c.Write(zap.Time("timeout", t))
+				}
+				return
+			}
+			timer.Reset(time.Duration(h.StreamTimeout) - idle)
 		}
 	}
+}
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	activity *atomic.Int64
+}
+
+func (a activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 {
+		a.activity.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (a activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 {
+		a.activity.Store(time.Now().UnixNano())
+	}
+	return n, err
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
