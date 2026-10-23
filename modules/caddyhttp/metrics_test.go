@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -628,4 +629,43 @@ func BenchmarkSingleRouteMetrics(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		ih.ServeHTTP(w, r)
 	}
+}
+
+func TestEarlyDataMetrics(t *testing.T) {
+	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
+	metrics := &Metrics{
+		httpMetrics: &httpMetrics{},
+	}
+
+	handler := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+
+	route := newMetricsInstrumentedRoute(ctx, "test_handler", handler, metrics)
+
+	// Request with no early data context (defaults to "none")
+	req1 := httptest.NewRequest("GET", "/", nil)
+	w1 := httptest.NewRecorder()
+	require.NoError(t, route.ServeHTTP(w1, req1))
+
+	// Request with "accepted" early data
+	req2Ctx := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataAccepted)
+	req2 := httptest.NewRequest("GET", "/", nil).WithContext(req2Ctx)
+	w2 := httptest.NewRecorder()
+	require.NoError(t, route.ServeHTTP(w2, req2))
+
+	// Request with "rejected" early data
+	req3Ctx := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataRejected)
+	req3 := httptest.NewRequest("GET", "/", nil).WithContext(req3Ctx)
+	w3 := httptest.NewRecorder()
+	require.NoError(t, route.ServeHTTP(w3, req3))
+
+	require.NoError(t, testutil.GatherAndCompare(ctx.GetMetricsRegistry(), strings.NewReader(`
+# HELP caddy_http_early_data_handshakes_total Counter of QUIC 0-RTT early data handshakes by status.
+# TYPE caddy_http_early_data_handshakes_total counter
+caddy_http_early_data_handshakes_total{server="UNKNOWN",status="accepted"} 1
+caddy_http_early_data_handshakes_total{server="UNKNOWN",status="none"} 1
+caddy_http_early_data_handshakes_total{server="UNKNOWN",status="rejected"} 1
+`), "caddy_http_early_data_handshakes_total"))
 }

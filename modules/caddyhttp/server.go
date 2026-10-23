@@ -690,6 +690,19 @@ func (s *Server) serveHTTP3(addr caddy.NetworkAddress, tlsCfg *tls.Config) error
 				Tracer:   h3qlog.DefaultConnectionTracer,
 			},
 			IdleTimeout: time.Duration(s.IdleTimeout),
+			ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+				if c == nil {
+					return ctx
+				}
+				cs := c.ConnectionState()
+				status := EarlyDataNone
+				if cs.Used0RTT {
+					status = EarlyDataAccepted
+				} else if cs.TLS.DidResume {
+					status = EarlyDataRejected
+				}
+				return context.WithValue(ctx, EarlyDataCtxKey, status)
+			},
 		}
 	}
 
@@ -1208,11 +1221,21 @@ const (
 	// used to get the tls connection state in the context, if available
 	tlsConnectionStateFuncCtxKey caddy.CtxKey = "tls_connection_state_func"
 
+	// used to get the early data (0-RTT) status in the context
+	EarlyDataCtxKey caddy.CtxKey = "early_data"
+
 	// For tracking whether the client is a trusted proxy
 	TrustedProxyVarKey string = "trusted_proxy"
 
 	// For tracking the real client IP (affected by trusted_proxy)
 	ClientIPVarKey string = "client_ip"
+)
+
+// Early data (0-RTT) status values.
+const (
+	EarlyDataAccepted = "accepted"
+	EarlyDataRejected = "rejected"
+	EarlyDataNone     = "none"
 )
 
 var networkTypesHTTP3 = map[string]string{

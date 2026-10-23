@@ -95,11 +95,15 @@ type httpMetrics struct {
 	requestErrors    *prometheus.CounterVec
 	requestDuration  *prometheus.HistogramVec
 	requestSize      *prometheus.HistogramVec
-	responseSize     *prometheus.HistogramVec
-	responseDuration *prometheus.HistogramVec
+	responseSize        *prometheus.HistogramVec
+	responseDuration    *prometheus.HistogramVec
+	earlyDataHandshakes *prometheus.CounterVec
 }
 
 func initHTTPMetrics(ctx caddy.Context, metrics *Metrics) {
+	if metrics.httpMetrics == nil {
+		metrics.httpMetrics = new(httpMetrics)
+	}
 	const ns, sub = "caddy", "http"
 	registry := ctx.GetMetricsRegistry()
 	basicLabels := []string{"server", "handler"}
@@ -161,6 +165,12 @@ func initHTTPMetrics(ctx caddy.Context, metrics *Metrics) {
 		Help:      "Histogram of times to first byte in response bodies.",
 		Buckets:   durationBuckets,
 	}, httpLabels)
+	metrics.httpMetrics.earlyDataHandshakes = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns,
+		Subsystem: sub,
+		Name:      "early_data_handshakes_total",
+		Help:      "Counter of QUIC 0-RTT early data handshakes by status.",
+	}, []string{"server", "status"})
 }
 
 // provisionOTLP wires a MeterProvider that periodically reads the process-wide
@@ -353,6 +363,15 @@ func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Requ
 	err := h.next.ServeHTTP(wrec, r)
 	dur := time.Since(start).Seconds()
 	h.metrics.httpMetrics.requestCount.With(labels).Inc()
+
+	earlyDataStatus := EarlyDataNone
+	if s, ok := r.Context().Value(EarlyDataCtxKey).(string); ok && s != "" {
+		earlyDataStatus = s
+	}
+	h.metrics.httpMetrics.earlyDataHandshakes.With(prometheus.Labels{
+		"server": server,
+		"status": earlyDataStatus,
+	}).Inc()
 
 	observeRequest := func(status int) {
 		// If the code hasn't been set yet, and we didn't encounter an error, we're
