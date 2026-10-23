@@ -39,7 +39,7 @@ import (
 )
 
 func init() {
-	caddy.RegisterModule(TLS{})
+	caddy.RegisterModule(&TLS{})
 	caddy.RegisterModule(AutomateLoader{})
 }
 
@@ -138,6 +138,7 @@ type TLS struct {
 	ctx                caddy.Context
 	storageCleanTicker *time.Ticker
 	storageCleanStop   chan struct{}
+	stopOnce           sync.Once
 	logger             *zap.Logger
 	events             *caddyevents.App
 
@@ -151,7 +152,7 @@ type TLS struct {
 }
 
 // CaddyModule returns the Caddy module information.
-func (TLS) CaddyModule() caddy.ModuleInfo {
+func (*TLS) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "tls",
 		New: func() caddy.Module { return new(TLS) },
@@ -464,13 +465,17 @@ func (t *TLS) Start() error {
 
 // Stop stops the TLS module and cleans up any allocations.
 func (t *TLS) Stop() error {
-	// stop the storage cleaner goroutine and ticker
-	if t.storageCleanStop != nil {
-		close(t.storageCleanStop)
-	}
-	if t.storageCleanTicker != nil {
-		t.storageCleanTicker.Stop()
-	}
+	t.stopOnce.Do(func() {
+		// stop the storage cleaner goroutine and ticker
+		if t.storageCleanStop != nil {
+			close(t.storageCleanStop)
+			t.storageCleanStop = nil
+		}
+		if t.storageCleanTicker != nil {
+			t.storageCleanTicker.Stop()
+			t.storageCleanTicker = nil
+		}
+	})
 	return nil
 }
 
@@ -909,6 +914,8 @@ func (t *TLS) HasCertificateForSubject(subject string) bool {
 func (t *TLS) keepStorageClean() {
 	t.storageCleanTicker = time.NewTicker(t.storageCleanInterval())
 	t.storageCleanStop = make(chan struct{})
+	stop := t.storageCleanStop
+	ticker := t.storageCleanTicker
 	go func() {
 		defer func() {
 			if err := recover(); err != nil {
@@ -918,9 +925,9 @@ func (t *TLS) keepStorageClean() {
 		t.cleanStorageUnits()
 		for {
 			select {
-			case <-t.storageCleanStop:
+			case <-stop:
 				return
-			case <-t.storageCleanTicker.C:
+			case <-ticker.C:
 				t.cleanStorageUnits()
 			}
 		}
