@@ -226,14 +226,20 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errc:
+			if err != nil && !errors.Is(err, io.EOF) {
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				return
+			}
+		case time := <-timeoutc:
+			if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", time))
+			}
+			return
 		}
 	}
 }
@@ -636,6 +642,16 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
+func closeWrite(w any) {
+	if cw, ok := w.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
@@ -646,12 +662,18 @@ type switchProtocolCopier struct {
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	if err == nil || errors.Is(err, io.EOF) {
+		closeWrite(c.user)
+	}
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	if err == nil || errors.Is(err, io.EOF) {
+		closeWrite(c.backend)
+	}
 	errc <- err
 	c.wg.Done()
 }
