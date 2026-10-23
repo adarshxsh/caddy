@@ -26,6 +26,7 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -142,6 +143,9 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 			return
 		}
 	}
+
+	conn = newSyncWriter(conn)
+	backConn = newSyncWriter(backConn)
 
 	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
 	backConnCloseCh := make(chan struct{})
@@ -505,7 +509,9 @@ func writeCloseControl(conn io.Writer, isClient bool) error {
 	}
 
 	// simply best-effort, but return error for logging purposes
-	// TODO: we might need to ensure we are the exclusive writer by this point (io.Copy is stopped)?
+	if cfw, ok := conn.(closeFrameWriter); ok {
+		return cfw.writeCloseFrame(buf[:msgLength])
+	}
 	_, err := conn.Write(buf[:msgLength])
 	return err
 }
@@ -565,6 +571,72 @@ func newMaskKey() [4]byte {
 func isWebsocket(r *http.Request) bool {
 	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+type closeFrameWriter interface {
+	writeCloseFrame(p []byte) error
+}
+
+// syncWriter wraps an io.ReadWriteCloser with a mutex to serialize concurrent
+// socket writes (between background copiers and close frame dispatches) and
+// maintain a closed state guard to reject post-shutdown writes.
+type syncWriter struct {
+	rwc       io.ReadWriteCloser
+	mu        sync.Mutex
+	closeSent bool
+}
+
+func newSyncWriter(rwc io.ReadWriteCloser) *syncWriter {
+	if rwc == nil {
+		return nil
+	}
+	if sw, ok := rwc.(*syncWriter); ok {
+		return sw
+	}
+	return &syncWriter{rwc: rwc}
+}
+
+func (s *syncWriter) Read(p []byte) (int, error) {
+	if s == nil || s.rwc == nil {
+		return 0, net.ErrClosed
+	}
+	return s.rwc.Read(p)
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	if s == nil || s.rwc == nil {
+		return 0, net.ErrClosed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeSent {
+		return 0, net.ErrClosed
+	}
+	return s.rwc.Write(p)
+}
+
+func (s *syncWriter) Close() error {
+	if s == nil || s.rwc == nil {
+		return nil
+	}
+	s.mu.Lock()
+	s.closeSent = true
+	s.mu.Unlock()
+	return s.rwc.Close()
+}
+
+func (s *syncWriter) writeCloseFrame(p []byte) error {
+	if s == nil || s.rwc == nil {
+		return net.ErrClosed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeSent {
+		return net.ErrClosed
+	}
+	_, err := s.rwc.Write(p)
+	s.closeSent = true
+	return err
 }
 
 // openConnection maps an open connection to
