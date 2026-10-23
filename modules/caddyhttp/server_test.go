@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -575,4 +578,73 @@ func TestServer_DetermineTrustedProxy_MatchRightMostUntrustedFirst(t *testing.T)
 
 	assert.True(t, trusted)
 	assert.Equal(t, clientIP, "90.100.110.120")
+}
+
+type mockQUICListener struct{}
+
+func (m mockQUICListener) Accept(ctx context.Context) (*quic.Conn, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (m mockQUICListener) Addr() net.Addr {
+	return &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443}
+}
+
+func (m mockQUICListener) Close() error {
+	return nil
+}
+
+func TestServer_ServeHTTP_AltSvcTLSGuard(t *testing.T) {
+	h3srv := &http3.Server{}
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go func() {
+		_ = h3srv.ServeListener(mockQUICListener{})
+	}()
+
+	// give ServeListener a moment to register the listener
+	time.Sleep(10 * time.Millisecond)
+
+	s := &Server{
+		logger:      zap.NewNop(),
+		errorLogger: zap.NewNop(),
+		h3server:    h3srv,
+		primaryHandlerChain: HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			return nil
+		}),
+	}
+
+	t.Run("unencrypted HTTP request omits Alt-Svc header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		rec := httptest.NewRecorder()
+
+		s.ServeHTTP(rec, req)
+
+		assert.Empty(t, rec.Header().Get("Alt-Svc"))
+	})
+
+	t.Run("encrypted HTTPS request includes Alt-Svc header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+		req.TLS = &tls.ConnectionState{HandshakeComplete: true}
+		rec := httptest.NewRecorder()
+
+		s.ServeHTTP(rec, req)
+
+		assert.NotEmpty(t, rec.Header().Get("Alt-Svc"))
+	})
+
+	t.Run("encrypted HTTPS request with TLS state in context includes Alt-Svc header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		reqCtx := context.WithValue(req.Context(), tlsConnectionStateFuncCtxKey, func() *tls.ConnectionState {
+			return &tls.ConnectionState{HandshakeComplete: true}
+		})
+		req = req.WithContext(reqCtx)
+		rec := httptest.NewRecorder()
+
+		s.ServeHTTP(rec, req)
+
+		assert.NotEmpty(t, rec.Header().Get("Alt-Svc"))
+	})
 }
