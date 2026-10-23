@@ -57,6 +57,17 @@ func (rwc h2ReadWriteCloser) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+func (rwc h2ReadWriteCloser) SetWriteDeadline(t time.Time) error {
+	return http.NewResponseController(rwc.ResponseWriter).SetWriteDeadline(t)
+}
+
+func (rwc h2ReadWriteCloser) SetReadDeadline(t time.Time) error {
+	if rc, ok := rwc.ReadCloser.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return rc.SetReadDeadline(t)
+	}
+	return http.NewResponseController(rwc.ResponseWriter).SetReadDeadline(t)
+}
+
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
@@ -143,22 +154,31 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 	}
 
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+			backConn.Close()
+		})
+	}
+	defer closeBoth()
+
 	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
 	backConnCloseCh := make(chan struct{})
 	go func() {
-		// Ensure that the cancellation of a request closes the backend.
+		// Ensure that the cancellation of a request closes both connections.
 		// See issue https://golang.org/issue/35559.
 		select {
 		case <-req.Context().Done():
+			closeBoth()
 		case <-backConnCloseCh:
 		}
-		backConn.Close()
 	}()
 	defer close(backConnCloseCh)
 
 	start := time.Now()
 	defer func() {
-		conn.Close()
+		closeBoth()
 		if c := logger.Check(zapcore.DebugLevel, "connection closed"); c != nil {
 			c.Write(zap.Duration("duration", time.Since(start)))
 		}
@@ -204,11 +224,17 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
+	writeTimeout := defaultWriteDeadline
+	if h.StreamTimeout > 0 {
+		writeTimeout = time.Duration(h.StreamTimeout)
+	}
+
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         wg,
-		bufferSize: h.StreamBufferSize,
+		user:         conn,
+		backend:      backConn,
+		wg:           wg,
+		bufferSize:   h.StreamBufferSize,
+		writeTimeout: writeTimeout,
 	}
 
 	// setup the timeout if requested
@@ -235,7 +261,12 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
 			c.Write(zap.Time("timeout", time))
 		}
+	case <-req.Context().Done():
+		if c := logger.Check(zapcore.DebugLevel, "request context canceled"); c != nil {
+			c.Write(zap.Error(req.Context().Err()))
+		}
 	}
+	closeBoth()
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
@@ -642,16 +673,27 @@ type switchProtocolCopier struct {
 	user, backend io.ReadWriteCloser
 	wg            *sync.WaitGroup
 	bufferSize    int
+	writeTimeout  time.Duration
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	buf := c.buffer()
+	if len(buf) == defaultBufferSize {
+		defer streamingBufPool.Put(&buf)
+	}
+	w := writeDeadlineWriter{w: c.user, timeout: c.writeTimeout}
+	_, err := io.CopyBuffer(w, c.backend, buf)
 	errc <- err
 	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	buf := c.buffer()
+	if len(buf) == defaultBufferSize {
+		defer streamingBufPool.Put(&buf)
+	}
+	w := writeDeadlineWriter{w: c.backend, timeout: c.writeTimeout}
+	_, err := io.CopyBuffer(w, c.user, buf)
 	errc <- err
 	c.wg.Done()
 }
@@ -661,7 +703,42 @@ func (c switchProtocolCopier) buffer() []byte {
 	if size <= 0 {
 		size = defaultBufferSize
 	}
+	if size == defaultBufferSize {
+		bp := streamingBufPool.Get().(*[]byte)
+		return *bp
+	}
 	return make([]byte, size)
+}
+
+const defaultWriteDeadline = 10 * time.Second
+
+type writeDeadlineWriter struct {
+	w       io.Writer
+	timeout time.Duration
+}
+
+func (w writeDeadlineWriter) Write(p []byte) (int, error) {
+	if w.timeout > 0 {
+		_ = setWriteDeadline(w.w, time.Now().Add(w.timeout))
+	}
+	return w.w.Write(p)
+}
+
+func setWriteDeadline(w io.Writer, t time.Time) error {
+	for w != nil {
+		if dw, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			return dw.SetWriteDeadline(t)
+		}
+		if rw, ok := w.(http.ResponseWriter); ok {
+			return http.NewResponseController(rw).SetWriteDeadline(t)
+		}
+		if u, ok := w.(interface{ Unwrap() io.Writer }); ok {
+			w = u.Unwrap()
+			continue
+		}
+		break
+	}
+	return nil
 }
 
 var streamingBufPool = sync.Pool{
