@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -278,4 +281,251 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+type mockH3Transport struct {
+	roundTripFunc func(req *http.Request) (*http.Response, error)
+	closed        bool
+	idleClosed    bool
+}
+
+func (m *mockH3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m.roundTripFunc(req)
+}
+
+func (m *mockH3Transport) CloseIdleConnections() {
+	m.idleClosed = true
+}
+
+func (m *mockH3Transport) Close() error {
+	m.closed = true
+	return nil
+}
+
+type trackingReadCloser struct {
+	io.Reader
+	closed bool
+}
+
+func (t *trackingReadCloser) Close() error {
+	t.closed = true
+	return nil
+}
+
+func TestHTTPTransport_RoundTrip_H3_Status425_1RTTFallback(t *testing.T) {
+	t.Run("successful 1-RTT retry on 425 response", func(t *testing.T) {
+		attempts := 0
+
+		mockH3 := &mockH3Transport{
+			roundTripFunc: func(req *http.Request) (*http.Response, error) {
+				attempts++
+				if attempts == 1 {
+					// First attempt returns 425 Too Early
+					rc := &trackingReadCloser{Reader: strings.NewReader("too early")}
+					t.Cleanup(func() {
+						if !rc.closed {
+							t.Error("expected initial response body to be closed")
+						}
+					})
+					return &http.Response{
+						StatusCode: http.StatusTooEarly,
+						Body:       rc,
+					}, nil
+				}
+				// Retry attempt
+				if isRetry, _ := req.Context().Value(h3RetryKey{}).(bool); !isRetry {
+					t.Error("expected h3RetryKey to be set in context on retry request")
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("success")),
+				}, nil
+			},
+		}
+
+		ht := &HTTPTransport{
+			h3Transport: mockH3,
+		}
+
+		req, err := http.NewRequest("GET", "https://example.com/test", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+
+		resp, err := ht.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("unexpected error from RoundTrip: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+		}
+		if attempts != 2 {
+			t.Errorf("expected 2 attempts, got %d", attempts)
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		if string(bodyBytes) != "success" {
+			t.Errorf("expected body 'success', got %q", string(bodyBytes))
+		}
+	})
+
+	t.Run("request body rewound and retransmitted on retry", func(t *testing.T) {
+		attempts := 0
+		var retriedBodyContent string
+
+		mockH3 := &mockH3Transport{
+			roundTripFunc: func(req *http.Request) (*http.Response, error) {
+				attempts++
+				if attempts == 1 {
+					body, _ := io.ReadAll(req.Body)
+					if string(body) != "payload data" {
+						t.Errorf("attempt 1: expected body 'payload data', got %q", string(body))
+					}
+					return &http.Response{
+						StatusCode: http.StatusTooEarly,
+						Body:       io.NopCloser(strings.NewReader("too early")),
+					}, nil
+				}
+				body, _ := io.ReadAll(req.Body)
+				retriedBodyContent = string(body)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("success")),
+				}, nil
+			},
+		}
+
+		ht := &HTTPTransport{
+			h3Transport: mockH3,
+		}
+
+		payload := "payload data"
+		req, err := http.NewRequest("POST", "https://example.com/upload", strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+
+		resp, err := ht.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("unexpected error from RoundTrip: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status %d, got %d", http.StatusOK, resp.StatusCode)
+		}
+		if retriedBodyContent != payload {
+			t.Errorf("expected retried body content %q, got %q", payload, retriedBodyContent)
+		}
+	})
+
+	t.Run("non-rewindable body returns clear error", func(t *testing.T) {
+		mockH3 := &mockH3Transport{
+			roundTripFunc: func(req *http.Request) (*http.Response, error) {
+				rc := &trackingReadCloser{Reader: strings.NewReader("too early")}
+				t.Cleanup(func() {
+					if !rc.closed {
+						t.Error("expected initial response body to be closed on non-rewindable body error")
+					}
+				})
+				return &http.Response{
+					StatusCode: http.StatusTooEarly,
+					Body:       rc,
+				}, nil
+			},
+		}
+
+		ht := &HTTPTransport{
+			h3Transport: mockH3,
+		}
+
+		req, err := http.NewRequest("POST", "https://example.com/upload", strings.NewReader("payload"))
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		// Clear GetBody to simulate non-rewindable body stream
+		req.GetBody = nil
+
+		resp, err := ht.RoundTrip(req)
+		if err == nil {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			t.Fatal("expected error for non-rewindable body, got nil error")
+		}
+		if !strings.Contains(err.Error(), "non-rewindable body") {
+			t.Errorf("expected 'non-rewindable body' error message, got %v", err)
+		}
+	})
+
+	t.Run("max one retry enforced to prevent infinite loop", func(t *testing.T) {
+		attempts := 0
+		mockH3 := &mockH3Transport{
+			roundTripFunc: func(req *http.Request) (*http.Response, error) {
+				attempts++
+				return &http.Response{
+					StatusCode: http.StatusTooEarly,
+					Body:       io.NopCloser(strings.NewReader("too early")),
+				}, nil
+			},
+		}
+
+		ht := &HTTPTransport{
+			h3Transport: mockH3,
+		}
+
+		req, err := http.NewRequest("GET", "https://example.com/test", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+
+		resp, err := ht.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusTooEarly {
+			t.Errorf("expected status %d after max retry, got %d", http.StatusTooEarly, resp.StatusCode)
+		}
+		if attempts != 2 {
+			t.Errorf("expected exactly 2 attempts (initial + 1 retry), got %d", attempts)
+		}
+	})
+
+	t.Run("non-425 responses returned without retry", func(t *testing.T) {
+		attempts := 0
+		mockH3 := &mockH3Transport{
+			roundTripFunc: func(req *http.Request) (*http.Response, error) {
+				attempts++
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       io.NopCloser(strings.NewReader("not found")),
+				}, nil
+			},
+		}
+
+		ht := &HTTPTransport{
+			h3Transport: mockH3,
+		}
+
+		req, err := http.NewRequest("GET", "https://example.com/test", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+
+		resp, err := ht.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected status %d, got %d", http.StatusNotFound, resp.StatusCode)
+		}
+		if attempts != 1 {
+			t.Errorf("expected 1 attempt, got %d", attempts)
+		}
+	})
 }
