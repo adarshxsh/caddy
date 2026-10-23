@@ -85,6 +85,14 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		return
 	}
 
+	if deadliner, ok := backConn.(interface{ SetDeadline(time.Time) error }); ok {
+		if err := deadliner.SetDeadline(time.Time{}); err != nil {
+			if c := logger.Check(zapcore.DebugLevel, "failed to clear backend deadline on upgrade"); c != nil {
+				c.Write(zap.Error(err))
+			}
+		}
+	}
+
 	// write header first, response headers should not be counted in size
 	// like the rest of handler chain.
 	copyHeader(rw.Header(), res.Header)
