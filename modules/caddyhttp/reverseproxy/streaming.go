@@ -594,8 +594,10 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 	}
 	if m.latency < 0 {
 		m.logger.Debug("flushing immediately")
-		//nolint:errcheck
-		m.flush()
+		if m.flush != nil {
+			//nolint:errcheck
+			m.flush()
+		}
 		return n, err
 	}
 	if m.flushPending {
@@ -622,8 +624,10 @@ func (m *maxLatencyWriter) delayedFlush() {
 		return
 	}
 	m.logger.Debug("delayed flush")
-	//nolint:errcheck
-	m.flush()
+	if m.flush != nil {
+		//nolint:errcheck
+		m.flush()
+	}
 	m.flushPending = false
 }
 
@@ -633,6 +637,10 @@ func (m *maxLatencyWriter) stop() {
 	m.flushPending = false
 	if m.t != nil {
 		m.t.Stop()
+	}
+	if m.flush != nil {
+		//nolint:errcheck
+		m.flush()
 	}
 }
 
