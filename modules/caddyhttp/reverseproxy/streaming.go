@@ -300,7 +300,7 @@ func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInter
 		defer mlw.stop()
 
 		// set up initial timer so headers get flushed even if body writes are delayed
-		mlw.flushPending = true
+		mlw.firstFlushPending = true
 		mlw.t = time.AfterFunc(flushInterval, mlw.delayedFlush)
 
 		w = mlw
@@ -579,10 +579,11 @@ type maxLatencyWriter struct {
 	flush   func() error
 	latency time.Duration // non-zero; negative means to flush immediately
 
-	mu           sync.Mutex // protects t, flushPending, and dst.Flush
-	t            *time.Timer
-	flushPending bool
-	logger       *zap.Logger
+	mu                sync.Mutex // protects t, firstFlushPending, flushPending, and dst.Flush
+	t                 *time.Timer
+	firstFlushPending bool
+	flushPending      bool
+	logger            *zap.Logger
 }
 
 func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
@@ -598,8 +599,21 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 		m.flush()
 		return n, err
 	}
+	if m.firstFlushPending {
+		m.firstFlushPending = false
+		if m.t != nil {
+			m.t.Stop()
+		}
+		m.logger.Debug("flushing initial response headers and payload immediately")
+		//nolint:errcheck
+		m.flush()
+		return n, err
+	}
 	if m.flushPending {
-		m.logger.Debug("delayed flush already pending")
+		if m.t != nil {
+			m.t.Reset(m.latency)
+		}
+		m.logger.Debug("reset delayed flush timer")
 		return n, err
 	}
 	if m.t == nil {
@@ -617,19 +631,21 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 func (m *maxLatencyWriter) delayedFlush() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.flushPending { // if stop was called but AfterFunc already started this goroutine
+	if !m.firstFlushPending && !m.flushPending { // if stop was called but AfterFunc already started this goroutine
 		m.logger.Debug("delayed flush is not pending")
 		return
 	}
 	m.logger.Debug("delayed flush")
 	//nolint:errcheck
 	m.flush()
+	m.firstFlushPending = false
 	m.flushPending = false
 }
 
 func (m *maxLatencyWriter) stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.firstFlushPending = false
 	m.flushPending = false
 	if m.t != nil {
 		m.t.Stop()
