@@ -16,6 +16,7 @@ package caddy
 
 import (
 	"crypto/tls"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -210,16 +211,14 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 
 	_, cancel := sqs.addState(updatedConfig)
-	sqs.rmu.Lock()
-	sqs.activeTlsConf = updatedConfig
-	sqs.rmu.Unlock()
 
+	combinedKeys := append(append([]tls.EncryptedClientHelloKey{}, initialKeys...), updatedKeys...)
 	keys, err = sqs.getEncryptedClientHelloKeys(hello)
 	if err != nil {
-		t.Fatalf("getting updated ECH keys: %v", err)
+		t.Fatalf("getting combined ECH keys: %v", err)
 	}
-	if !reflect.DeepEqual(keys, updatedKeys) {
-		t.Fatalf("unexpected updated ECH keys: got %#v, want %#v", keys, updatedKeys)
+	if !reflect.DeepEqual(keys, combinedKeys) {
+		t.Fatalf("unexpected combined ECH keys: got %#v, want %#v", keys, combinedKeys)
 	}
 
 	cancel(nil)
@@ -230,6 +229,76 @@ func TestSharedQUICStateGetEncryptedClientHelloKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(keys, initialKeys) {
 		t.Fatalf("unexpected restored ECH keys: got %#v, want %#v", keys, initialKeys)
+	}
+}
+
+func TestSharedQUICStateGetConfigForClientFallback(t *testing.T) {
+	config1Matched := &tls.Config{MinVersion: tls.VersionTLS13}
+	config2Matched := &tls.Config{MinVersion: tls.VersionTLS12}
+
+	config1 := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "server1.example.com" {
+				return config1Matched, nil
+			}
+			return nil, fmt.Errorf("no match server1")
+		},
+	}
+
+	config2 := &tls.Config{
+		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			if ch.ServerName == "server2.example.com" {
+				return config2Matched, nil
+			}
+			return nil, fmt.Errorf("no match server2")
+		},
+	}
+
+	sqs := newSharedQUICState(config1)
+	_, cancel2 := sqs.addState(config2)
+
+	// Primary server SNI match
+	ch1 := &tls.ClientHelloInfo{ServerName: "server1.example.com"}
+	res1, err := sqs.getConfigForClient(ch1)
+	if err != nil {
+		t.Fatalf("unexpected error for server1: %v", err)
+	}
+	if res1 != config1Matched {
+		t.Fatalf("expected config1Matched, got %v", res1)
+	}
+
+	// Secondary server SNI match (fallback)
+	ch2 := &tls.ClientHelloInfo{ServerName: "server2.example.com"}
+	res2, err := sqs.getConfigForClient(ch2)
+	if err != nil {
+		t.Fatalf("unexpected error for server2 fallback: %v", err)
+	}
+	if res2 != config2Matched {
+		t.Fatalf("expected config2Matched, got %v", res2)
+	}
+
+	// Unknown server SNI - both fail
+	ch3 := &tls.ClientHelloInfo{ServerName: "unknown.example.com"}
+	_, err = sqs.getConfigForClient(ch3)
+	if err == nil {
+		t.Fatalf("expected error for unknown domain, got nil")
+	}
+
+	// Cancel secondary server
+	cancel2(nil)
+
+	_, err = sqs.getConfigForClient(ch2)
+	if err == nil {
+		t.Fatalf("expected error for server2 after cancellation, got nil")
+	}
+
+	// Primary server still works
+	res1After, err := sqs.getConfigForClient(ch1)
+	if err != nil {
+		t.Fatalf("unexpected error for server1 after cancel: %v", err)
+	}
+	if res1After != config1Matched {
+		t.Fatalf("expected config1Matched, got %v", res1After)
 	}
 }
 
