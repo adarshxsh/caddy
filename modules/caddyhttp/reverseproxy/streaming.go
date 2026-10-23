@@ -204,9 +204,62 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
+	userConn := conn
+	backendConn := backConn
+	keepaliveInterval := time.Duration(h.WebSocketKeepAlive)
+
+	// when a stream timeout is encountered, no error will be read from errc
+	// a buffer size of 3 will allow the read, write, and keepalive goroutines to send the error and exit
+	// see: https://github.com/caddyserver/caddy/issues/7418
+	errc := make(chan error, 3)
+	done := make(chan struct{})
+	defer close(done)
+
+	if isWebsocket(req) && keepaliveInterval > 0 {
+		userWriter := newLockedWriter(conn)
+		backendWriter := newLockedWriter(backConn)
+
+		userConn = readWriterCloser{
+			Reader: conn,
+			Writer: userWriter,
+			Closer: conn,
+		}
+		backendConn = readWriterCloser{
+			Reader: backConn,
+			Writer: backendWriter,
+			Closer: backConn,
+		}
+
+		go func() {
+			ticker := time.NewTicker(keepaliveInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if err := writePingControl(userWriter, false); err != nil {
+						select {
+						case errc <- err:
+						default:
+						}
+						return
+					}
+					if err := writePingControl(backendWriter, true); err != nil {
+						select {
+						case errc <- err:
+						default:
+						}
+						return
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
+
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
+		user:       userConn,
+		backend:    backendConn,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
 	}
@@ -219,10 +272,6 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		timeoutc = timer.C
 	}
 
-	// when a stream timeout is encountered, no error will be read from errc
-	// a buffer size of 2 will allow both the read and write goroutines to send the error and exit
-	// see: https://github.com/caddyserver/caddy/issues/7418
-	errc := make(chan error, 2)
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
@@ -508,6 +557,73 @@ func writeCloseControl(conn io.Writer, isClient bool) error {
 	// TODO: we might need to ensure we are the exclusive writer by this point (io.Copy is stopped)?
 	_, err := conn.Write(buf[:msgLength])
 	return err
+}
+
+// writePingControl sends a Ping control message (opcode 0x9) to the given WebSocket connection.
+func writePingControl(conn io.Writer, isClient bool) error {
+	const pingMessage = 9
+	const finalBit = 1 << 7 // Frame header byte 0 bits from Section 5.2 of RFC 6455
+	const maskBit = 1 << 7  // Frame header byte 1 bits from Section 5.2 of RFC 6455
+
+	b0 := byte(pingMessage) | finalBit
+	b1 := byte(0) // minimal 0-byte payload for keepalive
+	if isClient {
+		b1 |= maskBit
+	}
+
+	if deadlineSetter, ok := conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = deadlineSetter.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		defer func() {
+			_ = deadlineSetter.SetWriteDeadline(time.Time{})
+		}()
+	}
+
+	if isClient {
+		key := newMaskKey()
+		buf := []byte{b0, b1, key[0], key[1], key[2], key[3]}
+		_, err := conn.Write(buf)
+		return err
+	}
+	buf := []byte{b0, b1}
+	_, err := conn.Write(buf)
+	return err
+}
+
+// lockedWriter synchronizes Write calls to an underlying io.Writer to prevent concurrent byte interleaving.
+type lockedWriter struct {
+	w  io.Writer
+	mu sync.Mutex
+}
+
+func newLockedWriter(w io.Writer) *lockedWriter {
+	return &lockedWriter{w: w}
+}
+
+func (lw *lockedWriter) Write(p []byte) (int, error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	return lw.w.Write(p)
+}
+
+func (lw *lockedWriter) SetWriteDeadline(t time.Time) error {
+	if deadlineSetter, ok := lw.w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return deadlineSetter.SetWriteDeadline(t)
+	}
+	return nil
+}
+
+// readWriterCloser combines io.Reader, io.Writer, and io.Closer into an io.ReadWriteCloser.
+type readWriterCloser struct {
+	io.Reader
+	io.Writer
+	io.Closer
+}
+
+func (rwc readWriterCloser) SetWriteDeadline(t time.Time) error {
+	if deadlineSetter, ok := rwc.Writer.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return deadlineSetter.SetWriteDeadline(t)
+	}
+	return nil
 }
 
 // Copied from https://github.com/gorilla/websocket/blob/v1.5.0/mask.go

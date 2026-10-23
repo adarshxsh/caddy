@@ -177,6 +177,11 @@ type Handler struct {
 	// request or response buffering.
 	StreamBufferSize int `json:"stream_buffer_size,omitempty"`
 
+	// How often to transmit WebSocket Ping control frames across active
+	// upgraded connections to keep them alive and detect dead connections.
+	// Default: 0 (disabled).
+	WebSocketKeepAlive caddy.Duration `json:"websocket_keepalive,omitempty"`
+
 	// If nonzero, streaming requests such as WebSockets will not be
 	// closed when the proxy config is unloaded, and instead the stream
 	// will remain open until the delay is complete. In other words,
