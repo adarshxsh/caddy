@@ -1354,6 +1354,17 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 		// because its retry decision was already made in reverseProxy()
 		// when the response matchers were evaluated
 		if !isDialError && !isRetryableResponse && (!isHandlerError || !errors.Is(herr, errNoUpstream)) {
+			if req != nil && req.Body != nil {
+				if b, ok := req.Body.(*bodyNopCloserIfNotRead); ok && b.read > 0 {
+					if logger != nil {
+						if c := logger.Check(zapcore.DebugLevel, "cannot retry request with consumed body"); c != nil {
+							c.Write(zap.Error(proxyErr))
+						}
+					}
+					return false
+				}
+			}
+
 			if lb.RetryMatch == nil && req.Method != "GET" {
 				// by default, don't retry requests if they aren't GET
 				return false
