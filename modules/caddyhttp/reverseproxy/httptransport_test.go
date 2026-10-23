@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +278,104 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestTCPRWTimeoutConn_SetDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	var serverConn net.Conn
+	go func() {
+		var acceptErr error
+		serverConn, acceptErr = ln.Accept()
+		if acceptErr != nil {
+			t.Errorf("accept failed: %v", acceptErr)
+		}
+		close(done)
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer clientConn.Close()
+	<-done
+	if serverConn != nil {
+		defer serverConn.Close()
+	}
+
+	tcpConn, ok := clientConn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("expected *net.TCPConn, got %T", clientConn)
+	}
+
+	timeoutConn := &tcpRWTimeoutConn{
+		TCPConn: tcpConn,
+		logger:  caddy.Log(),
+	}
+	timeoutConn.readTimeout.Store(int64(50 * time.Millisecond))
+	timeoutConn.writeTimeout.Store(int64(50 * time.Millisecond))
+
+	if got := time.Duration(timeoutConn.readTimeout.Load()); got != 50*time.Millisecond {
+		t.Errorf("readTimeout = %v, want 50ms", got)
+	}
+	if got := time.Duration(timeoutConn.writeTimeout.Load()); got != 50*time.Millisecond {
+		t.Errorf("writeTimeout = %v, want 50ms", got)
+	}
+
+	// Verify Read times out when readTimeout is active
+	buf := make([]byte, 10)
+	_, err = timeoutConn.Read(buf)
+	if err == nil {
+		t.Fatal("expected read timeout error, got nil")
+	}
+
+	// Test SetReadDeadline(time.Time{}) clears readTimeout
+	if err := timeoutConn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetReadDeadline error: %v", err)
+	}
+	if got := time.Duration(timeoutConn.readTimeout.Load()); got != 0 {
+		t.Errorf("readTimeout after SetReadDeadline(zero) = %v, want 0", got)
+	}
+
+	// Test SetWriteDeadline(time.Time{}) clears writeTimeout
+	if err := timeoutConn.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetWriteDeadline error: %v", err)
+	}
+	if got := time.Duration(timeoutConn.writeTimeout.Load()); got != 0 {
+		t.Errorf("writeTimeout after SetWriteDeadline(zero) = %v, want 0", got)
+	}
+
+	// Reset timeouts and test SetDeadline(time.Time{})
+	timeoutConn.readTimeout.Store(int64(50 * time.Millisecond))
+	timeoutConn.writeTimeout.Store(int64(50 * time.Millisecond))
+
+	if err := timeoutConn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetDeadline error: %v", err)
+	}
+	if got := time.Duration(timeoutConn.readTimeout.Load()); got != 0 {
+		t.Errorf("readTimeout after SetDeadline(zero) = %v, want 0", got)
+	}
+	if got := time.Duration(timeoutConn.writeTimeout.Load()); got != 0 {
+		t.Errorf("writeTimeout after SetDeadline(zero) = %v, want 0", got)
+	}
+
+	// Verify that after clearing deadline, a delayed write from server succeeds in Read
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		serverConn.Write([]byte("hello"))
+	}()
+
+	n, err := timeoutConn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after deadline cleared returned error: %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("Read payload = %q, want 'hello'", string(buf[:n]))
 	}
 }
