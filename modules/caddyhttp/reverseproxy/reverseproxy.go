@@ -133,9 +133,12 @@ type Handler struct {
 	// no periodic flushing is done. A negative value disables
 	// response buffering, and flushes immediately after each
 	// write to the client. This option is ignored when the upstream's
-	// response is recognized as a streaming response, or if its
-	// content length is -1; for such responses, writes are flushed
-	// to the client immediately.
+	// response is recognized as a streaming response (such as
+	// text/event-stream or HTTP/2 bidirectional streams); for such
+	// responses, writes are flushed to the client immediately. For
+	// responses with unset content length (-1), a positive flush interval
+	// will delay flushes, while an unconfigured flush interval defaults to
+	// immediate flushing.
 	FlushInterval caddy.Duration `json:"flush_interval,omitempty"`
 
 	// A list of IP ranges (supports CIDR notation) from which

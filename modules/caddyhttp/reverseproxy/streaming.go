@@ -238,7 +238,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	}
 }
 
-// flushInterval returns the p.FlushInterval value, conditionally
+// flushInterval returns the h.FlushInterval value, conditionally
 // overriding its value for a specific request/response.
 func (h Handler) flushInterval(req *http.Request, res *http.Response) time.Duration {
 	resCTHeader := res.Header.Get("Content-Type")
@@ -250,13 +250,17 @@ func (h Handler) flushInterval(req *http.Request, res *http.Response) time.Durat
 		return -1 // negative means immediately
 	}
 
-	// We might have the case of streaming for which Content-Length might be unset.
-	if res.ContentLength == -1 {
+	// for h2 and h2c upstream streaming data to client (issues #3556 and #3606)
+	if h.isBidirectionalStream(req, res) {
 		return -1
 	}
 
-	// for h2 and h2c upstream streaming data to client (issues #3556 and #3606)
-	if h.isBidirectionalStream(req, res) {
+	// We might have the case of streaming for which Content-Length might be unset.
+	// If FlushInterval is configured (> 0), respect it; otherwise, default to immediate flushing (-1).
+	if res.ContentLength == -1 {
+		if h.FlushInterval > 0 {
+			return time.Duration(h.FlushInterval)
+		}
 		return -1
 	}
 
