@@ -1,12 +1,16 @@
 package caddytls
 
 import (
+	"context"
 	"encoding/base64"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/libdns/libdns"
+	"go.uber.org/zap"
 )
 
 func TestRegisterServerNamesWithALPN(t *testing.T) {
@@ -62,4 +66,53 @@ func TestECHDNSPublisherPublishedSvcParams(t *testing.T) {
 	if !reflect.DeepEqual(got["ech"], []string{wantECH}) {
 		t.Fatalf("unexpected ECH params: got %v want %v", got["ech"], wantECH)
 	}
+}
+
+type mockECHPublisher struct{}
+
+func (mockECHPublisher) PublisherKey() string { return "mock" }
+func (mockECHPublisher) PublishECHConfigList(ctx context.Context, innerNames []string, echConfigList []byte) error {
+	return nil
+}
+
+func TestConcurrentRegisterServerNamesAndPublishECHConfigs(t *testing.T) {
+	caddyCtx, err := caddy.ProvisionContext(&caddy.Config{})
+	if err != nil {
+		t.Fatalf("ProvisionContext failed: %v", err)
+	}
+
+	tlsApp := &TLS{
+		serverNames:   make(map[string]serverNameRegistration),
+		serverNamesMu: new(sync.Mutex),
+		ctx:           caddyCtx,
+		logger:        zap.NewNop(),
+		EncryptedClientHello: &ECH{
+			configsMu: new(sync.RWMutex),
+			Publication: []*ECHPublication{
+				{
+					publishers: []ECHPublisher{mockECHPublisher{}},
+				},
+			},
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			domain := fmt.Sprintf("example%d.com", i)
+			tlsApp.RegisterServerNames([]string{domain}, []string{"h2", "http/1.1"})
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = tlsApp.publishECHConfigs(zap.NewNop())
+		}
+	}()
+
+	wg.Wait()
 }
