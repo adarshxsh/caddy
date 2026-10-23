@@ -162,9 +162,17 @@ type HTTPTransport struct {
 	// `HTTPS_PROXY`, and `NO_PROXY` environment variables.
 	NetworkProxyRaw json.RawMessage `json:"network_proxy,omitempty" caddy:"namespace=caddy.network_proxy inline_key=from"`
 
-	h3Transport   *http3.Transport // TODO: EXPERIMENTAL (May 2024)
-	quicTransport *quic.Transport  // used by h3Transport if sni placeholder is used, otherwise nil
+	h3Transport   h3TransportRunner
+	quicTransport *quic.Transport // used by h3Transport
 }
+
+type h3TransportRunner interface {
+	RoundTrip(*http.Request) (*http.Response, error)
+	CloseIdleConnections()
+	Close() error
+}
+
+type h3RetryKey struct{}
 
 // CaddyModule returns the Caddy module information.
 func (HTTPTransport) CaddyModule() caddy.ModuleInfo {
@@ -494,33 +502,39 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 	// do (that'd add latency and complexity, besides, we expect that
 	// site owners  control the backends), so it must be exclusive
 	if len(h.Versions) == 1 && h.Versions[0] == "3" {
-		h.h3Transport = new(http3.Transport)
+		h3 := new(http3.Transport)
 		if h.TLS != nil {
 			var err error
-			h.h3Transport.TLSClientConfig, err = h.TLS.MakeTLSClientConfig(caddyCtx)
+			h3.TLSClientConfig, err = h.TLS.MakeTLSClientConfig(caddyCtx)
 			if err != nil {
 				return nil, fmt.Errorf("making TLS client config for HTTP/3 transport: %v", err)
 			}
 
-			if strings.Contains(h.TLS.ServerName, "{") {
-				// copied from quic-go
-				udpConn, err := net.ListenUDP("udp", nil)
-				if err != nil {
-					return nil, fmt.Errorf("making udp socket for HTTP/3 transport: %v", err)
-				}
-				h.quicTransport = &quic.Transport{Conn: udpConn}
-				h.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			udpConn, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, fmt.Errorf("making udp socket for HTTP/3 transport: %v", err)
+			}
+			h.quicTransport = &quic.Transport{Conn: udpConn}
+			h3.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				if strings.Contains(h.TLS.ServerName, "{") {
 					// tlsCfg is already cloned from h3Transport.TLSClientConfig
-					repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-					tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
-					udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
-					if err != nil {
-						return nil, err
+					repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+					if !ok || repl == nil {
+						repl = caddy.NewReplacer()
 					}
-					return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+					tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
 				}
+				udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
+				if err != nil {
+					return nil, err
+				}
+				if isRetry, _ := ctx.Value(h3RetryKey{}).(bool); isRetry {
+					return h.quicTransport.Dial(ctx, udpAddr, tlsCfg, cfg)
+				}
+				return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
 			}
 		}
+		h.h3Transport = h3
 	} else if len(h.Versions) > 1 && slices.Contains(h.Versions, "3") {
 		return nil, fmt.Errorf("if HTTP/3 is enabled to the upstream, no other HTTP versions are supported")
 	}
@@ -639,7 +653,35 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
 	if h.h3Transport != nil {
-		return h.h3Transport.RoundTrip(req)
+		res, err := h.h3Transport.RoundTrip(req)
+		if err != nil {
+			return nil, err
+		}
+		if res != nil && res.StatusCode == http.StatusTooEarly {
+			if isRetry, _ := req.Context().Value(h3RetryKey{}).(bool); isRetry {
+				return res, nil
+			}
+
+			if req.Body != nil && req.GetBody == nil {
+				_ = res.Body.Close()
+				return nil, fmt.Errorf("cannot retry 0-RTT HTTP 425 response for request with non-rewindable body")
+			}
+
+			_ = res.Body.Close()
+
+			retryReq := req.Clone(context.WithValue(req.Context(), h3RetryKey{}, true))
+
+			if req.Body != nil && req.GetBody != nil {
+				newBody, err := req.GetBody()
+				if err != nil {
+					return nil, fmt.Errorf("getting request body for 1-RTT fallback retry: %w", err)
+				}
+				retryReq.Body = newBody
+			}
+
+			return h.h3Transport.RoundTrip(retryReq)
+		}
+		return res, nil
 	}
 
 	return h.Transport.RoundTrip(req)
