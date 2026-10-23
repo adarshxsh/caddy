@@ -2,11 +2,13 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -275,6 +277,192 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			t.Cleanup(func() { conn.Close() })
 			if got := conn.RemoteAddr().String(); got != ln.Addr().String() {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_DialTLSContext_ReplacerFallback(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// Start a mock TLS server listener
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	var (
+		gotSNI string
+		sniMu  sync.Mutex
+	)
+	serverTLSConfig := &tls.Config{
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			sniMu.Lock()
+			gotSNI = hello.ServerName
+			sniMu.Unlock()
+			return nil, fmt.Errorf("stop handshake")
+		},
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			tlsConn := tls.Server(conn, serverTLSConfig)
+			_ = tlsConn.Handshake()
+			_ = tlsConn.Close()
+		}
+	}()
+
+	ht := &HTTPTransport{
+		TLS: &TLSConfig{
+			ServerName: "{custom_subdomain}.example.com",
+		},
+	}
+
+	rt, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+	if rt.DialTLSContext == nil {
+		t.Fatal("expected DialTLSContext to be non-nil when ServerName has placeholders")
+	}
+
+	validRepl := caddy.NewReplacer()
+	validRepl.Set("custom_subdomain", "app")
+
+	var typedNilRepl *caddy.Replacer
+
+	tests := []struct {
+		name        string
+		ctx         context.Context
+		expectedSNI string
+	}{
+		{
+			name:        "valid replacer in context",
+			ctx:         context.WithValue(context.Background(), caddy.ReplacerCtxKey, validRepl),
+			expectedSNI: "app.example.com",
+		},
+		{
+			name:        "missing replacer in context",
+			ctx:         context.Background(),
+			expectedSNI: ".example.com",
+		},
+		{
+			name:        "nil interface value for ReplacerCtxKey",
+			ctx:         context.WithValue(context.Background(), caddy.ReplacerCtxKey, nil),
+			expectedSNI: ".example.com",
+		},
+		{
+			name:        "typed nil *caddy.Replacer for ReplacerCtxKey",
+			ctx:         context.WithValue(context.Background(), caddy.ReplacerCtxKey, typedNilRepl),
+			expectedSNI: ".example.com",
+		},
+		{
+			name:        "invalid type for ReplacerCtxKey",
+			ctx:         context.WithValue(context.Background(), caddy.ReplacerCtxKey, "not-a-replacer"),
+			expectedSNI: ".example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sniMu.Lock()
+			gotSNI = ""
+			sniMu.Unlock()
+
+			// DialTLSContext should not panic under any context configuration
+			conn, err := rt.DialTLSContext(tt.ctx, "tcp", ln.Addr().String())
+			if conn != nil {
+				conn.Close()
+			}
+			_ = err
+
+			sniMu.Lock()
+			sni := gotSNI
+			sniMu.Unlock()
+
+			if sni != tt.expectedSNI {
+				t.Errorf("SNI = %q, want %q", sni, tt.expectedSNI)
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_H3Dial_ReplacerFallback(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{custom_subdomain}.example.com",
+		},
+	}
+
+	_, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport: %v", err)
+	}
+
+	if ht.h3Transport == nil || ht.h3Transport.Dial == nil {
+		t.Fatal("expected h3Transport.Dial to be initialized")
+	}
+
+	validRepl := caddy.NewReplacer()
+	validRepl.Set("custom_subdomain", "h3app")
+
+	var typedNilRepl *caddy.Replacer
+
+	tests := []struct {
+		name               string
+		ctx                context.Context
+		expectedServerName string
+	}{
+		{
+			name:               "valid replacer in context",
+			ctx:                context.WithValue(context.Background(), caddy.ReplacerCtxKey, validRepl),
+			expectedServerName: "h3app.example.com",
+		},
+		{
+			name:               "missing replacer in context",
+			ctx:                context.Background(),
+			expectedServerName: ".example.com",
+		},
+		{
+			name:               "nil interface value for ReplacerCtxKey",
+			ctx:                context.WithValue(context.Background(), caddy.ReplacerCtxKey, nil),
+			expectedServerName: ".example.com",
+		},
+		{
+			name:               "typed nil *caddy.Replacer for ReplacerCtxKey",
+			ctx:                context.WithValue(context.Background(), caddy.ReplacerCtxKey, typedNilRepl),
+			expectedServerName: ".example.com",
+		},
+		{
+			name:               "invalid type for ReplacerCtxKey",
+			ctx:                context.WithValue(context.Background(), caddy.ReplacerCtxKey, 12345),
+			expectedServerName: ".example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tlsCfg := &tls.Config{ServerName: ht.TLS.ServerName}
+
+			dialCtx, cancel := context.WithCancel(tt.ctx)
+			cancel()
+
+			// h3Transport.Dial should evaluate replacer safely without panic
+			_, err := ht.h3Transport.Dial(dialCtx, "127.0.0.1:12345", tlsCfg, nil)
+			_ = err
+
+			if tlsCfg.ServerName != tt.expectedServerName {
+				t.Errorf("ServerName = %q, want %q", tlsCfg.ServerName, tt.expectedServerName)
 			}
 		})
 	}
