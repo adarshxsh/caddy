@@ -2,9 +2,11 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -123,5 +125,69 @@ func TestAddForwardedHeaders_UnixSocketTrustedNoExistingHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Forwarded-Host"); got != "example.com" {
 		t.Errorf("X-Forwarded-Host = %q, want %q", got, "example.com")
+	}
+}
+
+func TestEarlyDataSanitization(t *testing.T) {
+	h := Handler{}
+
+	tests := []struct {
+		name          string
+		tls           *tls.ConnectionState
+		inputHeaders  map[string]string
+		wantEarlyData string
+	}{
+		{
+			name:          "standard HTTP request with client-supplied Early-Data",
+			tls:           nil,
+			inputHeaders:  map[string]string{"Early-Data": "1"},
+			wantEarlyData: "",
+		},
+		{
+			name:          "completed TLS request with client-supplied Early-Data",
+			tls:           &tls.ConnectionState{HandshakeComplete: true},
+			inputHeaders:  map[string]string{"Early-Data": "1"},
+			wantEarlyData: "",
+		},
+		{
+			name:          "TLS 0-RTT early data request without Early-Data",
+			tls:           &tls.ConnectionState{HandshakeComplete: false},
+			inputHeaders:  map[string]string{},
+			wantEarlyData: "1",
+		},
+		{
+			name:          "TLS 0-RTT early data request with spoofed Early-Data header",
+			tls:           &tls.ConnectionState{HandshakeComplete: false},
+			inputHeaders:  map[string]string{"Early-Data": "0"},
+			wantEarlyData: "1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com/", nil)
+			req.TLS = tc.tls
+			for k, v := range tc.inputHeaders {
+				req.Header.Set(k, v)
+			}
+
+			vars := map[string]any{
+				caddyhttp.TrustedProxyVarKey: false,
+				caddyhttp.ClientIPVarKey:     "127.0.0.1:12345",
+			}
+			ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars)
+			req = req.WithContext(ctx)
+
+			repl := caddy.NewReplacer()
+			outReq, err := h.prepareRequest(req, repl)
+			if err != nil {
+				t.Fatalf("unexpected error preparing request: %v", err)
+			}
+
+			got := outReq.Header.Get("Early-Data")
+			if got != tc.wantEarlyData {
+				t.Errorf("Early-Data header = %q, want %q", got, tc.wantEarlyData)
+			}
+		})
 	}
 }
