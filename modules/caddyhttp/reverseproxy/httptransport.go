@@ -511,13 +511,18 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				h.quicTransport = &quic.Transport{Conn: udpConn}
 				h.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 					// tlsCfg is already cloned from h3Transport.TLSClientConfig
-					repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-					tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
+					if repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer); ok {
+						tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
+					}
 					udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
 					if err != nil {
 						return nil, err
 					}
-					return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+					method, _ := ctx.Value(h3RequestMethodCtxKey).(string)
+					if isSafeMethod(method) {
+						return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+					}
+					return h.quicTransport.Dial(ctx, udpAddr, tlsCfg, cfg)
 				}
 			}
 		}
@@ -611,6 +616,19 @@ func (addrs addrList) first(strategy func(net.IPAddr) bool) net.IPAddr {
 	return addrs[0]
 }
 
+const h3RequestMethodCtxKey caddy.CtxKey = "h3_request_method"
+
+// isSafeMethod returns true if the HTTP method is considered safe for 0-RTT early data
+// as specified in RFC 8470 Section 3 and RFC 9114 Section 9.2.
+func isSafeMethod(method string) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
 // RequestHeaderOps implements TransportHeaderOpsProvider. It returns header
 // operations for requests when the transport's configuration indicates they
 // should be applied. In particular, when TLS is enabled for this transport,
@@ -639,7 +657,8 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
 	if h.h3Transport != nil {
-		return h.h3Transport.RoundTrip(req)
+		ctx := context.WithValue(req.Context(), h3RequestMethodCtxKey, req.Method)
+		return h.h3Transport.RoundTrip(req.WithContext(ctx))
 	}
 
 	return h.Transport.RoundTrip(req)

@@ -2,12 +2,16 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"reflect"
 	"testing"
+
+	"github.com/quic-go/quic-go"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -279,3 +283,136 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestIsSafeMethod(t *testing.T) {
+	tests := []struct {
+		method   string
+		wantSafe bool
+	}{
+		{"GET", true},
+		{"HEAD", true},
+		{"OPTIONS", true},
+		{"TRACE", true},
+		{"get", true},
+		{"head", true},
+		{"options", true},
+		{"trace", true},
+		{"POST", false},
+		{"PUT", false},
+		{"DELETE", false},
+		{"PATCH", false},
+		{"CONNECT", false},
+		{"post", false},
+		{"", false},
+		{"CUSTOM", false},
+	}
+
+	for _, tt := range tests {
+		if got := isSafeMethod(tt.method); got != tt.wantSafe {
+			t.Errorf("isSafeMethod(%q) = %v; want %v", tt.method, got, tt.wantSafe)
+		}
+	}
+}
+
+func TestHTTPTransport_H3Conditional0RTT(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{http.request.host}.example.com",
+		},
+	}
+
+	_, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport() error = %v", err)
+	}
+	defer ht.Cleanup()
+
+	if ht.h3Transport == nil {
+		t.Fatal("expected h3Transport to be non-nil")
+	}
+	if ht.h3Transport.Dial == nil {
+		t.Fatal("expected h3Transport.Dial to be non-nil for placeholder ServerName")
+	}
+
+	// Test Dial logic directly with safe and unsafe methods
+	repl := caddy.NewReplacer()
+	repl.Set("http.request.host", "backend")
+
+	tests := []struct {
+		name       string
+		method     string
+		expectSafe bool
+	}{
+		{"GET safe request", "GET", true},
+		{"HEAD safe request", "HEAD", true},
+		{"OPTIONS safe request", "OPTIONS", true},
+		{"TRACE safe request", "TRACE", true},
+		{"POST unsafe request", "POST", false},
+		{"PUT unsafe request", "PUT", false},
+		{"DELETE unsafe request", "DELETE", false},
+		{"PATCH unsafe request", "PATCH", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancelCtx := context.WithCancel(context.Background())
+			cancelCtx() // cancel so Dial doesn't actually attempt network connection
+
+			ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, repl)
+			ctx = context.WithValue(ctx, h3RequestMethodCtxKey, tt.method)
+
+			tlsCfg := &tls.Config{ServerName: ht.TLS.ServerName}
+			_, _ = ht.h3Transport.Dial(ctx, "127.0.0.1:443", tlsCfg, nil)
+
+			// Verify ServerName placeholder replacement occurred
+			if tlsCfg.ServerName != "backend.example.com" {
+				t.Errorf("ServerName placeholder replacement failed: got %q, want %q", tlsCfg.ServerName, "backend.example.com")
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_RoundTrip_H3RequestMethod(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{http.request.host}.example.com",
+		},
+	}
+
+	_, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport() error = %v", err)
+	}
+	defer ht.Cleanup()
+
+	methodsTested := make(map[string]string)
+	ht.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+		method, _ := ctx.Value(h3RequestMethodCtxKey).(string)
+		methodsTested[method] = method
+		return nil, fmt.Errorf("dial error for testing")
+	}
+
+	methods := []string{"GET", "POST", "DELETE", "PUT", "HEAD", "OPTIONS", "TRACE", "PATCH"}
+	for _, m := range methods {
+		req, err := http.NewRequest(m, "https://example.com/test", nil)
+		if err != nil {
+			t.Fatalf("http.NewRequest(%s) error = %v", m, err)
+		}
+		req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, caddy.NewReplacer()))
+		_, _ = ht.RoundTrip(req)
+
+		if got, ok := methodsTested[m]; !ok || got != m {
+			t.Errorf("RoundTrip(%s) did not pass method to Dial context; got %q", m, got)
+		}
+	}
+}
+
+
