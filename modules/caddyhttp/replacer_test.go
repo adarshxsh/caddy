@@ -296,3 +296,176 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestZeroAllocReplacerLookups(t *testing.T) {
+	// Cookie tests
+	t.Run("Cookies", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Add("Cookie", "session=abc123; theme=\"dark\"; USER=john")
+		req.Header.Add("Cookie", "extra=val")
+
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		tests := []struct {
+			key    string
+			expect string
+			found  bool
+		}{
+			{"http.request.cookie.session", "abc123", true},
+			{"http.request.cookie.SESSION", "abc123", true},
+			{"http.request.cookie.theme", "dark", true},
+			{"http.request.cookie.user", "john", true},
+			{"http.request.cookie.extra", "val", true},
+			{"http.request.cookie.missing", "", false},
+		}
+
+		for _, tc := range tests {
+			val, ok := repl.GetString(tc.key)
+			if ok != tc.found {
+				t.Errorf("key %s: expected found=%v, got %v", tc.key, tc.found, ok)
+			}
+			if val != tc.expect {
+				t.Errorf("key %s: expected %q, got %q", tc.key, tc.expect, val)
+			}
+		}
+	})
+
+	// Host labels tests
+	t.Run("HostLabels", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = "Sub.EXAMPLE.com:8080"
+
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		tests := []struct {
+			key    string
+			expect string
+			found  bool
+		}{
+			{"http.request.host.labels.0", "com", true},
+			{"http.request.host.labels.1", "example", true},
+			{"http.request.host.labels.2", "sub", true},
+			{"http.request.host.labels.3", "", true},
+			{"http.request.host.labels.-1", "", false},
+			{"http.request.host.labels.abc", "", false},
+		}
+
+		for _, tc := range tests {
+			val, ok := repl.GetString(tc.key)
+			if ok != tc.found {
+				t.Errorf("key %s: expected found=%v, got %v", tc.key, tc.found, ok)
+			}
+			if val != tc.expect {
+				t.Errorf("key %s: expected %q, got %q", tc.key, tc.expect, val)
+			}
+		}
+	})
+
+	// Path segments tests
+	t.Run("PathSegments", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/users/", nil)
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		tests := []struct {
+			key    string
+			expect string
+			found  bool
+		}{
+			{"http.request.uri.path.0", "api", true},
+			{"http.request.uri.path.1", "v1", true},
+			{"http.request.uri.path.2", "users", true},
+			{"http.request.uri.path.3", "", true},
+			{"http.request.uri.path.4", "", true},
+			{"http.request.uri.path.-1", "", false},
+			{"http.request.uri.path.invalid", "", false},
+		}
+
+		for _, tc := range tests {
+			val, ok := repl.GetString(tc.key)
+			if ok != tc.found {
+				t.Errorf("key %s: expected found=%v, got %v", tc.key, tc.found, ok)
+			}
+			if val != tc.expect {
+				t.Errorf("key %s: expected %q, got %q", tc.key, tc.expect, val)
+			}
+		}
+	})
+}
+
+func BenchmarkCookieLookup(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Add("Cookie", "session=abc123; theme=dark; user=john")
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.cookie.session")
+	}
+}
+
+func BenchmarkGetCookieValue(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Add("Cookie", "session=abc123; theme=dark; user=john")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = getCookieValue(req, "session")
+	}
+}
+
+func BenchmarkHostLabelLookup(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "sub.domain.example.com:8080"
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.host.labels.1")
+	}
+}
+
+func BenchmarkGetHostLabel(b *testing.B) {
+	reqHost := "sub.domain.example.com"
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = getHostLabel(reqHost, 1)
+	}
+}
+
+func BenchmarkPathSegmentLookup(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/api/users/123/profile", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.uri.path.2")
+	}
+}
+
+func BenchmarkGetPathSegment(b *testing.B) {
+	pathStr := "/v1/api/users/123/profile"
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = getPathSegment(pathStr, 2)
+	}
+}
