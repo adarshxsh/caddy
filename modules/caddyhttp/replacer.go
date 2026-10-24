@@ -81,12 +81,8 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// cookies
 			if strings.HasPrefix(key, reqCookieReplPrefix) {
 				name := key[len(reqCookieReplPrefix):]
-				for _, cookie := range req.Cookies() {
-					if strings.EqualFold(name, cookie.Name) {
-						// always return true, since the cookie might
-						// be present only in some requests
-						return cookie.Value, true
-					}
+				if val, ok := getCookieValue(req, name); ok {
+					return val, true
 				}
 			}
 
@@ -323,52 +319,28 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil {
 					reqHost = req.Host // OK; assume there was no port
 				}
-				hostLabels := strings.Split(reqHost, ".")
-				if idx >= len(hostLabels) {
-					return "", true
-				}
-				return strings.ToLower(hostLabels[len(hostLabels)-idx-1]), true
+				return getHostLabel(reqHost, idx)
 			}
 
 			// path parts
 			if strings.HasPrefix(key, reqURIPathReplPrefix) {
 				idxStr := key[len(reqURIPathReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
-				if err != nil {
+				if err != nil || idx < 0 {
 					return "", false
 				}
-				pathParts := strings.Split(req.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
-				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
-					return "", true
-				}
-				return pathParts[idx], true
+				return getPathSegment(req.URL.Path, idx)
 			}
 
 			// orig uri path parts
 			if strings.HasPrefix(key, reqOrigURIPathReplPrefix) {
 				idxStr := key[len(reqOrigURIPathReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
-				if err != nil {
+				if err != nil || idx < 0 {
 					return "", false
 				}
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				pathParts := strings.Split(or.URL.Path, "/")
-				if len(pathParts) > 0 && pathParts[0] == "" {
-					pathParts = pathParts[1:]
-				}
-				if idx < 0 {
-					return "", false
-				}
-				if idx >= len(pathParts) {
-					return "", true
-				}
-				return pathParts[idx], true
+				return getPathSegment(or.URL.Path, idx)
 			}
 
 			// middleware variables
@@ -597,3 +569,92 @@ const (
 	varsReplPrefix           = "http.vars."
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
+
+func getCookieValue(req *http.Request, name string) (string, bool) {
+	if req == nil || req.Header == nil {
+		return "", false
+	}
+	for _, cookieHeader := range req.Header["Cookie"] {
+		for cookieHeader != "" {
+			var part string
+			if idx := strings.IndexByte(cookieHeader, ';'); idx >= 0 {
+				part = cookieHeader[:idx]
+				cookieHeader = cookieHeader[idx+1:]
+			} else {
+				part = cookieHeader
+				cookieHeader = ""
+			}
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			var val string
+			if idx := strings.IndexByte(part, '='); idx >= 0 {
+				val = part[idx+1:]
+				part = part[:idx]
+			} else {
+				continue
+			}
+			part = strings.TrimSpace(part)
+			if strings.EqualFold(name, part) {
+				val = strings.TrimSpace(val)
+				if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
+					val = val[1 : len(val)-1]
+				}
+				return val, true
+			}
+		}
+	}
+	return "", false
+}
+
+func getHostLabel(host string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	end := len(host)
+	for i := 0; i <= idx; i++ {
+		dotIdx := strings.LastIndexByte(host[:end], '.')
+		if dotIdx < 0 {
+			if i == idx {
+				return strings.ToLower(host[:end]), true
+			}
+			return "", true
+		}
+		if i == idx {
+			return strings.ToLower(host[dotIdx+1 : end]), true
+		}
+		end = dotIdx
+	}
+	return "", true
+}
+
+func getPathSegment(p string, idx int) (string, bool) {
+	if idx < 0 {
+		return "", false
+	}
+	if strings.HasPrefix(p, "/") {
+		p = p[1:]
+	} else if p == "" {
+		return "", true
+	}
+
+	start := 0
+	for i := 0; i <= idx; i++ {
+		if start > len(p) {
+			return "", true
+		}
+		end := strings.IndexByte(p[start:], '/')
+		if end < 0 {
+			if i == idx {
+				return p[start:], true
+			}
+			return "", true
+		}
+		if i == idx {
+			return p[start : start+end], true
+		}
+		start += end + 1
+	}
+	return "", true
+}
