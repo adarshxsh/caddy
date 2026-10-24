@@ -18,10 +18,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -294,5 +297,136 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestHTTPRequestBodyReplacer(t *testing.T) {
+	bodyText := "hello world request body"
+	expectedBase64 := base64.StdEncoding.EncodeToString([]byte(bodyText))
+
+	req := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(strings.NewReader(bodyText)))
+	ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+	repl := caddy.NewReplacer()
+	ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// 1. Evaluate {http.request.body}
+	gotBody, ok := repl.GetString("http.request.body")
+	if !ok || gotBody != bodyText {
+		t.Fatalf("expected {http.request.body} = %q, got %q (ok=%t)", bodyText, gotBody, ok)
+	}
+
+	// 2. Verify cached []byte in context variable RequestBodyVarKey ("http.request.body_bytes")
+	cachedBytes, ok := GetVar(req.Context(), RequestBodyVarKey).([]byte)
+	if !ok {
+		t.Fatalf("expected context variable %q to hold []byte", RequestBodyVarKey)
+	}
+	if string(cachedBytes) != bodyText {
+		t.Fatalf("expected cached bytes %q, got %q", bodyText, string(cachedBytes))
+	}
+
+	// 3. Evaluate {http.request.body_base64} - should use cached bytes without re-reading
+	gotBase64, ok := repl.GetString("http.request.body_base64")
+	if !ok || gotBase64 != expectedBase64 {
+		t.Fatalf("expected {http.request.body_base64} = %q, got %q (ok=%t)", expectedBase64, gotBase64, ok)
+	}
+
+	// 4. Verify downstream handler can read replaced req.Body
+	downstreamRead, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read replaced req.Body: %v", err)
+	}
+	if string(downstreamRead) != bodyText {
+		t.Fatalf("expected downstream read %q, got %q", bodyText, string(downstreamRead))
+	}
+
+	// 5. Test Close() on req.Body (pooledReadCloser) and multiple Close() calls (sync.Once)
+	if err := req.Body.Close(); err != nil {
+		t.Fatalf("unexpected error on req.Body.Close(): %v", err)
+	}
+	if err := req.Body.Close(); err != nil {
+		t.Fatalf("unexpected error on second req.Body.Close(): %v", err)
+	}
+}
+
+func TestHTTPRequestBodyReplacerPoolingAndClose(t *testing.T) {
+	bodyText := "pooled buffer test body"
+	req := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(strings.NewReader(bodyText)))
+	ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+	repl := caddy.NewReplacer()
+	ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// First evaluation initializes bodyBufferPool allocation and pooledReadCloser
+	val, ok := repl.GetString("http.request.body")
+	if !ok || val != bodyText {
+		t.Fatalf("expected %q, got %q", bodyText, val)
+	}
+
+	prc, ok := req.Body.(*pooledReadCloser)
+	if !ok {
+		t.Fatalf("expected req.Body to be *pooledReadCloser, got %T", req.Body)
+	}
+
+	if prc.buf == nil {
+		t.Fatalf("expected prc.buf to be non-nil before Close()")
+	}
+
+	// Close resets buffer and returns to pool
+	if err := req.Body.Close(); err != nil {
+		t.Fatalf("req.Body.Close() error: %v", err)
+	}
+
+	if prc.buf != nil {
+		t.Fatalf("expected prc.buf to be nil after Close()")
+	}
+
+	// Second Close() should be a no-op via sync.Once
+	if err := req.Body.Close(); err != nil {
+		t.Fatalf("second req.Body.Close() error: %v", err)
+	}
+}
+
+func BenchmarkRequestBodyReplacer(b *testing.B) {
+	bodyText := "benchmark request body content"
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(strings.NewReader(bodyText)))
+		ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+		repl := caddy.NewReplacer()
+		ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, repl)
+		req = req.WithContext(ctx)
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		_, _ = repl.GetString("http.request.body")
+		_, _ = repl.GetString("http.request.body_base64")
+		_ = req.Body.Close()
+	}
+}
+
+func BenchmarkBodyPlaceholderEvaluation(b *testing.B) {
+	bodyText := "benchmark request body content"
+	req := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(strings.NewReader(bodyText)))
+	ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+	repl := caddy.NewReplacer()
+	ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Prime the body buffer
+	_, _ = repl.GetString("http.request.body")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = repl.GetString("http.request.body")
+		_, _ = repl.GetString("http.request.body_base64")
 	}
 }

@@ -428,6 +428,9 @@ func (m MatchVarsRE) Validate() error {
 	return nil
 }
 
+// RequestBodyVarKey is the key used in context variables for the cached request body bytes.
+const RequestBodyVarKey = "http.request.body_bytes"
+
 // GetVar gets a value out of the context's variable table by key.
 // If the key does not exist, the return value will be nil.
 func GetVar(ctx context.Context, key string) any {
