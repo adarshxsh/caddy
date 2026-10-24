@@ -2,12 +2,16 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"reflect"
 	"testing"
+
+	"github.com/quic-go/quic-go"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -275,6 +279,172 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 			t.Cleanup(func() { conn.Close() })
 			if got := conn.RemoteAddr().String(); got != ln.Addr().String() {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
+			}
+		})
+	}
+}
+
+type mockQuicDialer struct {
+	dialCalled      bool
+	dialEarlyCalled bool
+}
+
+func (m *mockQuicDialer) Dial(ctx context.Context, addr net.Addr, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error) {
+	m.dialCalled = true
+	return nil, fmt.Errorf("mock Dial called")
+}
+
+func (m *mockQuicDialer) DialEarly(ctx context.Context, addr net.Addr, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error) {
+	m.dialEarlyCalled = true
+	return nil, fmt.Errorf("mock DialEarly called")
+}
+
+func (m *mockQuicDialer) Close() error {
+	return nil
+}
+
+func TestHTTPTransport_QUICDial_MethodSafety(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{http.request.host}",
+		},
+	}
+
+	_, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport() failed: %v", err)
+	}
+
+	if ht.h3Transport == nil || ht.h3Transport.Dial == nil {
+		t.Fatalf("expected h3Transport and Dial to be set")
+	}
+
+	tests := []struct {
+		method           string
+		hasContextMethod bool
+		expectDialEarly  bool
+	}{
+		// Safe methods -> DialEarly
+		{method: http.MethodGet, hasContextMethod: true, expectDialEarly: true},
+		{method: http.MethodHead, hasContextMethod: true, expectDialEarly: true},
+		{method: http.MethodOptions, hasContextMethod: true, expectDialEarly: true},
+		{method: http.MethodTrace, hasContextMethod: true, expectDialEarly: true},
+
+		// Unsafe methods -> Dial
+		{method: http.MethodPost, hasContextMethod: true, expectDialEarly: false},
+		{method: http.MethodPut, hasContextMethod: true, expectDialEarly: false},
+		{method: http.MethodDelete, hasContextMethod: true, expectDialEarly: false},
+		{method: http.MethodPatch, hasContextMethod: true, expectDialEarly: false},
+		{method: "PURGE", hasContextMethod: true, expectDialEarly: false},
+
+		// Missing method context -> Dial
+		{method: "", hasContextMethod: false, expectDialEarly: false},
+	}
+
+	for _, tt := range tests {
+		name := tt.method
+		if !tt.hasContextMethod {
+			name = "missing_context"
+		}
+		t.Run(name, func(t *testing.T) {
+			mock := &mockQuicDialer{}
+			ht.quicTransport = mock
+
+			var ctx context.Context
+			if tt.hasContextMethod {
+				ctx = context.WithValue(context.Background(), requestMethodCtxKey, tt.method)
+			} else {
+				ctx = context.Background()
+			}
+
+			repl := caddy.NewReplacer()
+			ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, repl)
+
+			_, _ = ht.h3Transport.Dial(ctx, "localhost:443", &tls.Config{}, &quic.Config{})
+
+			if tt.expectDialEarly {
+				if !mock.dialEarlyCalled {
+					t.Errorf("method %q: expected DialEarly to be called, but it was not", tt.method)
+				}
+				if mock.dialCalled {
+					t.Errorf("method %q: expected Dial NOT to be called, but it was", tt.method)
+				}
+			} else {
+				if !mock.dialCalled {
+					t.Errorf("method %q (hasContextMethod=%v): expected Dial to be called, but it was not", tt.method, tt.hasContextMethod)
+				}
+				if mock.dialEarlyCalled {
+					t.Errorf("method %q (hasContextMethod=%v): expected DialEarly NOT to be called, but it was", tt.method, tt.hasContextMethod)
+				}
+			}
+		})
+	}
+}
+
+func TestHTTPTransport_RoundTrip_MethodContextPropagation(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	ht := &HTTPTransport{
+		Versions: []string{"3"},
+		TLS: &TLSConfig{
+			ServerName: "{http.request.host}",
+		},
+	}
+
+	_, err := ht.NewTransport(caddyCtx)
+	if err != nil {
+		t.Fatalf("NewTransport() failed: %v", err)
+	}
+
+	tests := []struct {
+		method          string
+		expectDialEarly bool
+	}{
+		{method: "GET", expectDialEarly: true},
+		{method: "HEAD", expectDialEarly: true},
+		{method: "OPTIONS", expectDialEarly: true},
+		{method: "TRACE", expectDialEarly: true},
+		{method: "POST", expectDialEarly: false},
+		{method: "PUT", expectDialEarly: false},
+		{method: "DELETE", expectDialEarly: false},
+		{method: "PATCH", expectDialEarly: false},
+		{method: "CUSTOM", expectDialEarly: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			mock := &mockQuicDialer{}
+			ht.quicTransport = mock
+
+			req, err := http.NewRequest(tt.method, "https://example.com/test", nil)
+			if err != nil {
+				t.Fatalf("NewRequest failed: %v", err)
+			}
+
+			repl := caddy.NewReplacer()
+			req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
+
+			_, _ = ht.RoundTrip(req)
+
+			if tt.expectDialEarly {
+				if !mock.dialEarlyCalled {
+					t.Errorf("RoundTrip %s: expected DialEarly to be invoked", tt.method)
+				}
+				if mock.dialCalled {
+					t.Errorf("RoundTrip %s: expected Dial NOT to be invoked", tt.method)
+				}
+			} else {
+				if !mock.dialCalled {
+					t.Errorf("RoundTrip %s: expected Dial to be invoked", tt.method)
+				}
+				if mock.dialEarlyCalled {
+					t.Errorf("RoundTrip %s: expected DialEarly NOT to be invoked", tt.method)
+				}
 			}
 		})
 	}
