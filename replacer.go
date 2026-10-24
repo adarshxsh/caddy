@@ -88,6 +88,11 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 	r.providers = append(r.providers, mapFunc)
 }
 
+// MapProvider adds provider to the list of value providers.
+func (r *Replacer) MapProvider(provider replacementProvider) {
+	r.providers = append(r.providers, provider)
+}
+
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
@@ -99,7 +104,7 @@ func (r *Replacer) Set(variable string, value any) {
 // the value and whether the variable was known.
 func (r *Replacer) Get(variable string) (any, bool) {
 	for _, mapFunc := range r.providers {
-		if val, ok := mapFunc.replace(variable); ok {
+		if val, ok := mapFunc.Replace(variable); ok {
 			return val, true
 		}
 	}
@@ -336,22 +341,28 @@ func ToString(val any) string {
 // not recognize the key, false should be returned.
 type ReplacerFunc func(key string) (any, bool)
 
+func (f ReplacerFunc) Replace(key string) (any, bool) {
+	return f(key)
+}
+
 func (f ReplacerFunc) replace(key string) (any, bool) {
 	return f(key)
 }
 
-// replacementProvider is a type that can provide replacements
+// ReplacementProvider is a type that can provide replacements
 // for placeholders. Allows for type assertion to determine
 // which type of provider it is.
-type replacementProvider interface {
-	replace(key string) (any, bool)
+type ReplacementProvider interface {
+	Replace(key string) (any, bool)
 }
+
+type replacementProvider = ReplacementProvider
 
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
 type fileReplacementProvider struct{}
 
-func (f fileReplacementProvider) replace(key string) (any, bool) {
+func (f fileReplacementProvider) Replace(key string) (any, bool) {
 	if !strings.HasPrefix(key, filePrefix) {
 		return nil, false
 	}
@@ -377,7 +388,7 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 // time, or environment variables.
 type globalDefaultReplacementProvider struct{}
 
-func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
+func (f globalDefaultReplacementProvider) Replace(key string) (any, bool) {
 	// check environment variable
 	const envPrefix = "env."
 	if strings.HasPrefix(key, envPrefix) {
