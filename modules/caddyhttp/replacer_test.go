@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -295,4 +296,98 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
 	}
+}
+
+func TestReplacerMemoization(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test?foo=bar", nil)
+	req.RemoteAddr = "192.168.1.50:54321"
+
+	origReq := http.Request{
+		URL: &url.URL{RawQuery: "baz=qux"},
+	}
+	ctx := context.WithValue(req.Context(), OriginalRequestCtxKey, origReq)
+	req = req.WithContext(ctx)
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// 1. http.request.uri.prefixed_query
+	val, ok := repl.GetString("http.request.uri.prefixed_query")
+	if !ok || val != "?foo=bar" {
+		t.Fatalf("expected '?foo=bar', got '%s' (ok=%t)", val, ok)
+	}
+
+	// 2. http.request.orig_uri.prefixed_query
+	val, ok = repl.GetString("http.request.orig_uri.prefixed_query")
+	if !ok || val != "?baz=qux" {
+		t.Fatalf("expected '?baz=qux', got '%s' (ok=%t)", val, ok)
+	}
+
+	// 3. http.request.remote.host/24
+	val, ok = repl.GetString("http.request.remote.host/24")
+	if !ok || val != "192.168.1.0/24" {
+		t.Fatalf("expected '192.168.1.0/24', got '%s' (ok=%t)", val, ok)
+	}
+
+	// 4. http.request.remote.host/24,64 with IPv6
+	req6 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req6.RemoteAddr = "[2001:db8::1234]:54321"
+	repl6 := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl6, req6, nil)
+
+	val6, ok6 := repl6.GetString("http.request.remote.host/24,64")
+	if !ok6 || val6 != "2001:db8::/64" {
+		t.Fatalf("expected '2001:db8::/64', got '%s' (ok=%t)", val6, ok6)
+	}
+
+	// 5. Invalid prefix config should return empty string and not store in static
+	valInvalid, okInvalid := repl.GetString("http.request.remote.host/999")
+	if !okInvalid || valInvalid != "" {
+		t.Fatalf("expected empty string for invalid prefix /999, got '%s' (ok=%t)", valInvalid, okInvalid)
+	}
+}
+
+func BenchmarkReplacerMemoization(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/test?a=1&b=2", nil)
+	req.RemoteAddr = "192.168.159.32:1234"
+
+	b.Run("prefixed_query", func(b *testing.B) {
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+		// Prime cache
+		_, _ = repl.GetString("http.request.uri.prefixed_query")
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		var s string
+		for i := 0; i < b.N; i++ {
+			s, _ = repl.GetString("http.request.uri.prefixed_query")
+		}
+		_ = s
+	})
+
+	b.Run("remote_host_prefix", func(b *testing.B) {
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+		// Prime cache
+		_, _ = repl.GetString("http.request.remote.host/24")
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		var s string
+		for i := 0; i < b.N; i++ {
+			s, _ = repl.GetString("http.request.remote.host/24")
+		}
+		_ = s
+	})
+
+	b.Run("remote_host_prefix_first_lookup", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			repl := caddy.NewReplacer()
+			addHTTPVarsToReplacer(repl, req, nil)
+			_, _ = repl.GetString("http.request.remote.host/24")
+		}
+	})
 }

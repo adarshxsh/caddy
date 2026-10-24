@@ -204,7 +204,11 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if req.URL.RawQuery == "" {
 					return "", true
 				}
-				return "?" + req.URL.RawQuery, true
+				res := "?" + req.URL.RawQuery
+				if repl != nil {
+					repl.Set(key, res)
+				}
+				return res, true
 			case "http.request.duration":
 				start := GetVar(req.Context(), "start_time").(time.Time)
 				return time.Since(start), true
@@ -278,19 +282,27 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if or.URL.RawQuery == "" {
 					return "", true
 				}
-				return "?" + or.URL.RawQuery, true
+				res := "?" + or.URL.RawQuery
+				if repl != nil {
+					repl.Set(key, res)
+				}
+				return res, true
 			}
 
 			// remote IP range/prefix (e.g. keep top 24 bits of 1.2.3.4  => "1.2.3.0/24")
 			// syntax: "/V4,V6" where V4 = IPv4 bits, and V6 = IPv6 bits; if no comma, then same bit length used for both
 			// (EXPERIMENTAL)
 			if strings.HasPrefix(key, "http.request.remote.host/") {
-				host, _, err := net.SplitHostPort(req.RemoteAddr)
-				if err != nil {
-					host = req.RemoteAddr // assume no port, I guess?
-				}
-				addr, err := netip.ParseAddr(host)
-				if err != nil {
+				var addr netip.Addr
+				if addrPort, err := netip.ParseAddrPort(req.RemoteAddr); err == nil {
+					addr = addrPort.Addr()
+				} else if a, err := netip.ParseAddr(req.RemoteAddr); err == nil {
+					addr = a
+				} else {
+					host, _, err := net.SplitHostPort(req.RemoteAddr)
+					if err != nil {
+						host = req.RemoteAddr // assume no port, I guess?
+					}
 					return host, true // not an IP address
 				}
 				// extract the bits from the end of the placeholder (start after "/") then split on ","
@@ -309,7 +321,11 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil {
 					return "", true
 				}
-				return prefix.String(), true
+				res := prefix.String()
+				if repl != nil {
+					repl.Set(key, res)
+				}
+				return res, true
 			}
 
 			// hostname labels (case insensitive, so normalize to lowercase)
