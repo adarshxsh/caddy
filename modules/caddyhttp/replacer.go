@@ -59,23 +59,32 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 	SetVar(req.Context(), "start_time", time.Now())
 	SetVar(req.Context(), "uuid", new(requestID))
 
+	var queryParams url.Values
+
 	httpVars := func(key string) (any, bool) {
 		if req != nil {
 			// query string parameters
 			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
-				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
+				if queryParams == nil {
+					if req.URL != nil {
+						queryParams = req.URL.Query()
+					} else {
+						queryParams = make(url.Values)
+					}
+				}
+				vals := queryParams[key[len(reqURIQueryReplPrefix):]]
 				// always return true, since the query param might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return joinHeaderOrQueryValues(vals), true
 			}
 
 			// request header fields
 			if strings.HasPrefix(key, reqHeaderReplPrefix) {
 				field := key[len(reqHeaderReplPrefix):]
-				vals := req.Header[textproto.CanonicalMIMEHeaderKey(field)]
+				vals := getHeader(req.Header, field)
 				// always return true, since the header field might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return joinHeaderOrQueryValues(vals), true
 			}
 
 			// cookies
@@ -385,10 +394,10 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// response header fields
 			if strings.HasPrefix(key, respHeaderReplPrefix) {
 				field := key[len(respHeaderReplPrefix):]
-				vals := w.Header()[textproto.CanonicalMIMEHeaderKey(field)]
+				vals := getHeader(w.Header(), field)
 				// always return true, since the header field might
 				// be present only in some responses
-				return strings.Join(vals, ","), true
+				return joinHeaderOrQueryValues(vals), true
 			}
 		}
 
@@ -570,6 +579,27 @@ func getTLSPeerCert(cs *tls.ConnectionState) *x509.Certificate {
 		return nil
 	}
 	return cs.PeerCertificates[0]
+}
+
+func getHeader(h http.Header, key string) []string {
+	if h == nil {
+		return nil
+	}
+	if vals, ok := h[key]; ok {
+		return vals
+	}
+	return h[textproto.CanonicalMIMEHeaderKey(key)]
+}
+
+func joinHeaderOrQueryValues(vals []string) string {
+	switch len(vals) {
+	case 0:
+		return ""
+	case 1:
+		return vals[0]
+	default:
+		return strings.Join(vals, ",")
+	}
 }
 
 type requestID struct {
