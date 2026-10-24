@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -401,19 +402,65 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 		return runtime.GOARCH, true
 	case "time.now":
 		return nowFunc(), true
-	case "time.now.http":
+	case "time.now.http", "time.now.common_log", "time.now.year", "time.now.unix":
+		now := nowFunc()
+		sec := now.Unix()
+		_, offset := now.Zone()
+		cached := timeSecCacheAtomic.Load()
+		if cached != nil && cached.sec == sec && cached.offset == offset {
+			switch key {
+			case "time.now.http":
+				return cached.http, true
+			case "time.now.common_log":
+				return cached.commonLog, true
+			case "time.now.year":
+				return cached.year, true
+			case "time.now.unix":
+				return cached.unix, true
+			}
+		}
 		// According to the comment for http.TimeFormat, the timezone must be in UTC
 		// to generate the correct format.
 		// https://github.com/caddyserver/caddy/issues/5773
-		return nowFunc().UTC().Format(http.TimeFormat), true
-	case "time.now.common_log":
-		return nowFunc().Format("02/Jan/2006:15:04:05 -0700"), true
-	case "time.now.year":
-		return strconv.Itoa(nowFunc().Year()), true
-	case "time.now.unix":
-		return strconv.FormatInt(nowFunc().Unix(), 10), true
+		httpStr := now.UTC().Format(http.TimeFormat)
+		commonLogStr := now.Format("02/Jan/2006:15:04:05 -0700")
+		yearStr := strconv.Itoa(now.Year())
+		unixStr := strconv.FormatInt(sec, 10)
+
+		newCache := &timeSecCache{
+			sec:       sec,
+			offset:    offset,
+			http:      httpStr,
+			commonLog: commonLogStr,
+			year:      yearStr,
+			unix:      unixStr,
+		}
+		timeSecCacheAtomic.Store(newCache)
+
+		switch key {
+		case "time.now.http":
+			return newCache.http, true
+		case "time.now.common_log":
+			return newCache.commonLog, true
+		case "time.now.year":
+			return newCache.year, true
+		case "time.now.unix":
+			return newCache.unix, true
+		}
 	case "time.now.unix_ms":
-		return strconv.FormatInt(nowFunc().UnixNano()/int64(time.Millisecond), 10), true
+		now := nowFunc()
+		ms := now.UnixNano() / int64(time.Millisecond)
+		cached := timeMsCacheAtomic.Load()
+		if cached != nil && cached.ms == ms {
+			return cached.unixMs, true
+		}
+		unixMsStr := strconv.FormatInt(ms, 10)
+		newCache := &timeMsCache{
+			ms:     ms,
+			unixMs: unixMsStr,
+		}
+		timeMsCacheAtomic.Store(newCache)
+		return newCache.unixMs, true
 	}
 
 	return nil, false
@@ -451,3 +498,22 @@ const ReplacerCtxKey CtxKey = "replacer"
 const phOpen, phClose, phEscape = '{', '}', '\\'
 
 const filePrefix = "file."
+
+type timeSecCache struct {
+	sec       int64
+	offset    int
+	http      any
+	commonLog any
+	year      any
+	unix      any
+}
+
+type timeMsCache struct {
+	ms     int64
+	unixMs any
+}
+
+var (
+	timeSecCacheAtomic atomic.Pointer[timeSecCache]
+	timeMsCacheAtomic  atomic.Pointer[timeMsCache]
+)
