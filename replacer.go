@@ -32,14 +32,11 @@ import (
 
 // NewReplacer returns a new Replacer.
 func NewReplacer() *Replacer {
-	rep := &Replacer{
-		static:   make(map[string]any),
-		mapMutex: &sync.RWMutex{},
-	}
+	rep := &Replacer{}
 	rep.providers = []replacementProvider{
 		globalDefaultReplacementProvider{},
 		fileReplacementProvider{},
-		ReplacerFunc(rep.fromStatic),
+		staticProvider{rep},
 	}
 	return rep
 }
@@ -47,12 +44,9 @@ func NewReplacer() *Replacer {
 // NewEmptyReplacer returns a new Replacer,
 // without the global default replacements.
 func NewEmptyReplacer() *Replacer {
-	rep := &Replacer{
-		static:   make(map[string]any),
-		mapMutex: &sync.RWMutex{},
-	}
+	rep := &Replacer{}
 	rep.providers = []replacementProvider{
-		ReplacerFunc(rep.fromStatic),
+		staticProvider{rep},
 	}
 	return rep
 }
@@ -63,7 +57,15 @@ func NewEmptyReplacer() *Replacer {
 type Replacer struct {
 	providers []replacementProvider
 	static    map[string]any
-	mapMutex  *sync.RWMutex
+	mapMutex  sync.RWMutex
+}
+
+type staticProvider struct {
+	r *Replacer
+}
+
+func (s staticProvider) replace(key string) (any, bool) {
+	return s.r.fromStatic(key)
 }
 
 // WithoutFile returns a copy of the current Replacer
@@ -91,6 +93,9 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
+	if r.static == nil {
+		r.static = make(map[string]any)
+	}
 	r.static[variable] = value
 	r.mapMutex.Unlock()
 }
@@ -117,7 +122,9 @@ func (r *Replacer) GetString(variable string) (string, bool) {
 // that was created using Set.
 func (r *Replacer) Delete(variable string) {
 	r.mapMutex.Lock()
-	delete(r.static, variable)
+	if r.static != nil {
+		delete(r.static, variable)
+	}
 	r.mapMutex.Unlock()
 }
 
@@ -125,9 +132,11 @@ func (r *Replacer) Delete(variable string) {
 // keys starting with the given prefix
 func (r *Replacer) DeleteByPrefix(prefix string) {
 	r.mapMutex.Lock()
-	for key := range r.static {
-		if strings.HasPrefix(key, prefix) {
-			delete(r.static, key)
+	if r.static != nil {
+		for key := range r.static {
+			if strings.HasPrefix(key, prefix) {
+				delete(r.static, key)
+			}
 		}
 	}
 	r.mapMutex.Unlock()
@@ -137,6 +146,9 @@ func (r *Replacer) DeleteByPrefix(prefix string) {
 func (r *Replacer) fromStatic(key string) (any, bool) {
 	r.mapMutex.RLock()
 	defer r.mapMutex.RUnlock()
+	if r.static == nil {
+		return nil, false
+	}
 	val, ok := r.static[key]
 	return val, ok
 }
