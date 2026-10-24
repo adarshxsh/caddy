@@ -525,8 +525,140 @@ func BenchmarkReplacer(b *testing.B) {
 
 func testReplacer() Replacer {
 	return Replacer{
-		providers: make([]replacementProvider, 0),
-		static:    make(map[string]any),
-		mapMutex:  &sync.RWMutex{},
+		providers:     make([]replacementProvider, 0),
+		static:        make(map[string]any),
+		staticStrings: make(map[string]string),
+		mapMutex:      &sync.RWMutex{},
 	}
+}
+
+func TestReplacerTypedSetters(t *testing.T) {
+	rep := NewReplacer()
+
+	// Test SetString
+	rep.SetString("strKey", "hello world")
+	if val, ok := rep.GetString("strKey"); !ok || val != "hello world" {
+		t.Errorf("GetString(strKey) = %q, %v; want %q, true", val, ok, "hello world")
+	}
+	if val, ok := rep.Get("strKey"); !ok || val != "hello world" {
+		t.Errorf("Get(strKey) = %v, %v; want %q, true", val, ok, "hello world")
+	}
+
+	// Test SetInt
+	rep.SetInt("intKey", 42)
+	if val, ok := rep.GetString("intKey"); !ok || val != "42" {
+		t.Errorf("GetString(intKey) = %q, %v; want %q, true", val, ok, "42")
+	}
+	if val, ok := rep.Get("intKey"); !ok || val != "42" {
+		t.Errorf("Get(intKey) = %v, %v; want %q, true", val, ok, "42")
+	}
+
+	// Test SetBool
+	rep.SetBool("boolTrueKey", true)
+	rep.SetBool("boolFalseKey", false)
+	if val, ok := rep.GetString("boolTrueKey"); !ok || val != "true" {
+		t.Errorf("GetString(boolTrueKey) = %q, %v; want %q, true", val, ok, "true")
+	}
+	if val, ok := rep.GetString("boolFalseKey"); !ok || val != "false" {
+		t.Errorf("GetString(boolFalseKey) = %q, %v; want %q, true", val, ok, "false")
+	}
+
+	// Test ReplaceAll with typed values
+	res := rep.ReplaceAll("str={strKey}, int={intKey}, bool={boolTrueKey}", "")
+	expected := "str=hello world, int=42, bool=true"
+	if res != expected {
+		t.Errorf("ReplaceAll result = %q; want %q", res, expected)
+	}
+
+	// Test cross-setter overwrites
+	rep.SetString("overwriteKey", "initial")
+	if val, ok := rep.GetString("overwriteKey"); !ok || val != "initial" {
+		t.Errorf("GetString(overwriteKey) = %q, %v; want %q, true", val, ok, "initial")
+	}
+
+	rep.Set("overwriteKey", 100)
+	if val, ok := rep.GetString("overwriteKey"); !ok || val != "100" {
+		t.Errorf("GetString(overwriteKey) after Set = %q, %v; want %q, true", val, ok, "100")
+	}
+
+	rep.SetString("overwriteKey", "final")
+	if val, ok := rep.GetString("overwriteKey"); !ok || val != "final" {
+		t.Errorf("GetString(overwriteKey) after SetString = %q, %v; want %q, true", val, ok, "final")
+	}
+
+	// Test Delete and DeleteByPrefix
+	rep.SetString("pref_1", "v1")
+	rep.SetInt("pref_2", 2)
+	rep.Delete("strKey")
+	if _, ok := rep.GetString("strKey"); ok {
+		t.Errorf("GetString(strKey) after Delete = true; want false")
+	}
+
+	rep.DeleteByPrefix("pref_")
+	if _, ok := rep.GetString("pref_1"); ok {
+		t.Errorf("GetString(pref_1) after DeleteByPrefix = true; want false")
+	}
+	if _, ok := rep.GetString("pref_2"); ok {
+		t.Errorf("GetString(pref_2) after DeleteByPrefix = true; want false")
+	}
+}
+
+func BenchmarkReplacerSet(b *testing.B) {
+	rep := NewReplacer()
+
+	b.Run("Set string interface", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			rep.Set("key", "value")
+		}
+	})
+
+	b.Run("SetString typed", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			rep.SetString("key", "value")
+		}
+	})
+
+	b.Run("SetInt typed", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			rep.SetInt("key", 12345)
+		}
+	})
+
+	b.Run("SetBool typed", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			rep.SetBool("key", true)
+		}
+	})
+}
+
+func BenchmarkReplacerReplaceAll(b *testing.B) {
+	repTyped := NewReplacer()
+	repTyped.SetString("str", "a string")
+	repTyped.SetInt("int", 12345)
+	repTyped.SetBool("bool", true)
+
+	repInterface := NewReplacer()
+	repInterface.Set("str", "a string")
+	repInterface.Set("int", 12345)
+	repInterface.Set("bool", true)
+
+	input := "str={str}, int={int}, bool={bool}"
+
+	b.Run("Typed Setters ReplaceAll", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = repTyped.ReplaceAll(input, "")
+		}
+	})
+
+	b.Run("Interface Set ReplaceAll", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = repInterface.ReplaceAll(input, "")
+		}
+	})
 }
