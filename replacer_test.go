@@ -530,3 +530,62 @@ func testReplacer() Replacer {
 		mapMutex:  &sync.RWMutex{},
 	}
 }
+
+func TestFilePlaceholderCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "test.txt")
+	if err := os.WriteFile(tmpFile, []byte("initial content\n"), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+
+	repl := NewReplacer()
+	key := "file." + tmpFile
+
+	// 1. Initial read on replacer 1
+	val1, ok1 := repl.Get(key)
+	if !ok1 || val1 != "initial content" {
+		t.Fatalf("expected 'initial content', got %v (ok=%v)", val1, ok1)
+	}
+
+	// Modify file on disk
+	if err := os.WriteFile(tmpFile, []byte("updated content\n"), 0644); err != nil {
+		t.Fatalf("failed to update temp file: %v", err)
+	}
+
+	// 2. Second read on same replacer should return cached initial content
+	val2, ok2 := repl.Get(key)
+	if !ok2 || val2 != "initial content" {
+		t.Fatalf("expected cached 'initial content', got %v (ok=%v)", val2, ok2)
+	}
+
+	// 3. New replacer should read updated content from disk
+	repl2 := NewReplacer()
+	val3, ok3 := repl2.Get(key)
+	if !ok3 || val3 != "updated content" {
+		t.Fatalf("expected 'updated content' on new replacer, got %v (ok=%v)", val3, ok3)
+	}
+
+	// 4. Test error caching on missing file
+	missingKey := "file." + filepath.Join(tmpDir, "nonexistent.txt")
+	errVal1, errOk1 := repl.Get(missingKey)
+	if !errOk1 || errVal1 != nil {
+		t.Fatalf("expected (nil, true) for missing file, got (%v, %v)", errVal1, errOk1)
+	}
+
+	// Re-evaluate error key on same replacer
+	errVal2, errOk2 := repl.Get(missingKey)
+	if !errOk2 || errVal2 != nil {
+		t.Fatalf("expected cached (nil, true) for missing file, got (%v, %v)", errVal2, errOk2)
+	}
+}
+
+func TestGetWorkingDir(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd error: %v", err)
+	}
+	cachedWd := getWorkingDir()
+	if cachedWd != wd {
+		t.Errorf("expected getWorkingDir() == %q, got %q", wd, cachedWd)
+	}
+}
