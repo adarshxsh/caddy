@@ -296,3 +296,86 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLazyQueryParsing(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/test?foo=bar&baz=qux", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// First query param lookup caches queryParams
+	val1, ok1 := repl.GetString("http.request.uri.query.foo")
+	if !ok1 || val1 != "bar" {
+		t.Fatalf("expected foo to be 'bar', got '%s' (ok=%t)", val1, ok1)
+	}
+
+	// Change raw query string on request URL to prove subsequent lookups use cached queryParams
+	req.URL.RawQuery = "foo=changed&baz=changed"
+
+	val2, ok2 := repl.GetString("http.request.uri.query.baz")
+	if !ok2 || val2 != "qux" {
+		t.Fatalf("expected baz to be 'qux' from cached parse, got '%s' (ok=%t)", val2, ok2)
+	}
+
+	val3, ok3 := repl.GetString("http.request.uri.query.foo")
+	if !ok3 || val3 != "bar" {
+		t.Fatalf("expected foo to still be 'bar' from cached parse, got '%s' (ok=%t)", val3, ok3)
+	}
+}
+
+func TestHeaderFastPathAndSingleValue(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	// Add canonical header
+	req.Header["X-Single-Header"] = []string{"single_val"}
+	req.Header["X-Multi-Header"] = []string{"val1", "val2"}
+	// Add header with non-canonical key in map
+	req.Header["x-custom-lowercase"] = []string{"lowercase_val"}
+
+	res := httptest.NewRecorder()
+	res.Header()["X-Response-Header"] = []string{"resp_val"}
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	tests := []struct {
+		key    string
+		expect string
+	}{
+		{"http.request.header.X-Single-Header", "single_val"},
+		{"http.request.header.x-single-header", "single_val"},
+		{"http.request.header.X-Multi-Header", "val1,val2"},
+		{"http.request.header.x-custom-lowercase", "lowercase_val"},
+		{"http.request.header.Nonexistent", ""},
+		{"http.response.header.X-Response-Header", "resp_val"},
+		{"http.response.header.x-response-header", "resp_val"},
+		{"http.response.header.Nonexistent", ""},
+	}
+
+	for _, tc := range tests {
+		got, ok := repl.GetString(tc.key)
+		if !ok {
+			t.Errorf("expected placeholder %s to be recognized", tc.key)
+		}
+		if got != tc.expect {
+			t.Errorf("for %s: expected '%s', got '%s'", tc.key, tc.expect, got)
+		}
+	}
+}
+
+func TestReplacerAllocations(t *testing.T) {
+	vals := []string{"single_value"}
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = joinHeaderOrQueryValues(vals)
+	})
+	if allocs > 0 {
+		t.Errorf("expected 0 allocations for joinHeaderOrQueryValues with single value, got %f", allocs)
+	}
+
+	header := http.Header{"X-Test-Header": []string{"value"}}
+	headerAllocs := testing.AllocsPerRun(100, func() {
+		_ = getHeader(header, "X-Test-Header")
+	})
+	if headerAllocs > 0 {
+		t.Errorf("expected 0 allocations for getHeader exact map lookup, got %f", headerAllocs)
+	}
+}
+
