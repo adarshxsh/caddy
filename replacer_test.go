@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -529,4 +530,107 @@ func testReplacer() Replacer {
 		static:    make(map[string]any),
 		mapMutex:  &sync.RWMutex{},
 	}
+}
+
+func TestTimePlaceholders(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	t0 := time.Date(2026, time.October, 23, 15, 30, 45, 123000000, time.UTC)
+	nowFunc = func() time.Time { return t0 }
+
+	rep := NewReplacer()
+
+	check := func(key, expected string) {
+		t.Helper()
+		val, found := rep.GetString(key)
+		if !found {
+			t.Errorf("expected key %s to be found", key)
+		}
+		if val != expected {
+			t.Errorf("key %s: expected %q, got %q", key, expected, val)
+		}
+	}
+
+	check("time.now.http", "Fri, 23 Oct 2026 15:30:45 GMT")
+	check("time.now.common_log", "23/Oct/2026:15:30:45 +0000")
+	check("time.now.year", "2026")
+	check("time.now.unix", "1792769445")
+	check("time.now.unix_ms", "1792769445123")
+
+	// Verify cache hit returns identical value
+	check("time.now.http", "Fri, 23 Oct 2026 15:30:45 GMT")
+
+	// Advance time by 500 ms (same second, new millisecond)
+	t1 := t0.Add(500 * time.Millisecond)
+	nowFunc = func() time.Time { return t1 }
+
+	check("time.now.http", "Fri, 23 Oct 2026 15:30:45 GMT")
+	check("time.now.unix_ms", "1792769445623")
+
+	// Advance time by 1 second
+	t2 := t0.Add(1 * time.Second)
+	nowFunc = func() time.Time { return t2 }
+
+	check("time.now.http", "Fri, 23 Oct 2026 15:30:46 GMT")
+	check("time.now.common_log", "23/Oct/2026:15:30:46 +0000")
+	check("time.now.unix", "1792769446")
+	check("time.now.unix_ms", "1792769446123")
+}
+
+func TestTimePlaceholdersAllocations(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	t0 := time.Date(2026, time.October, 23, 15, 30, 45, 123000000, time.UTC)
+	nowFunc = func() time.Time { return t0 }
+
+	rep := NewReplacer()
+
+	// Warm cache
+	keys := []string{
+		"time.now.http",
+		"time.now.common_log",
+		"time.now.year",
+		"time.now.unix",
+		"time.now.unix_ms",
+	}
+	for _, k := range keys {
+		rep.GetString(k)
+	}
+
+	for _, k := range keys {
+		allocs := testing.AllocsPerRun(100, func() {
+			_, _ = rep.GetString(k)
+		})
+		if allocs > 0 {
+			t.Errorf("key %s: expected 0 allocations on cache hit, got %f", k, allocs)
+		}
+	}
+}
+
+func TestTimePlaceholdersConcurrency(t *testing.T) {
+	origNowFunc := nowFunc
+	defer func() { nowFunc = origNowFunc }()
+
+	t0 := time.Date(2026, time.October, 23, 15, 30, 45, 123000000, time.UTC)
+	nowFunc = func() time.Time { return t0 }
+
+	rep := NewReplacer()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_, _ = rep.GetString("time.now.http")
+				_, _ = rep.GetString("time.now.common_log")
+				_, _ = rep.GetString("time.now.year")
+				_, _ = rep.GetString("time.now.unix")
+				_, _ = rep.GetString("time.now.unix_ms")
+			}
+		}()
+	}
+	wg.Wait()
 }
