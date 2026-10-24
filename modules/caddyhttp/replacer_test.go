@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -296,3 +297,56 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestToLowerCase(t *testing.T) {
+	for _, tc := range []struct {
+		input  string
+		expect string
+	}{
+		{"version", "version"},
+		{"VERSION", "version"},
+		{"Client.Fingerprint", "client.fingerprint"},
+		{"client.san.dns_names.0", "client.san.dns_names.0"},
+		{"VERY_LONG_KEY_NAME_THAT_EXCEEDS_SIXTY_FOUR_BYTES_AND_HAS_UPPERCASE_CHARACTERS_HERE", "very_long_key_name_that_exceeds_sixty_four_bytes_and_has_uppercase_characters_here"},
+	} {
+		actual := toLowerCase(tc.input)
+		if actual != tc.expect {
+			t.Errorf("toLowerCase(%q) = %q; expected %q", tc.input, actual, tc.expect)
+		}
+	}
+}
+
+func TestTLSReplacerEmptyCertAndAllocs(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:     tls.VersionTLS13,
+		CipherSuite: tls.TLS_AES_256_GCM_SHA384,
+		DidResume:   true,
+	}
+
+	val, ok := getReqTLSReplacement(req, "http.request.tls.client.issuer")
+	if !ok {
+		t.Errorf("expected true for known placeholder client.issuer on TLS request")
+	}
+	if !reflect.DeepEqual(val, emptyCert.Issuer) {
+		t.Errorf("expected val to be emptyCert.Issuer, got %#v", val)
+	}
+
+	// Verify lowercased key evaluation incurs 0 allocations for key lookup
+	allocs := testing.AllocsPerRun(100, func() {
+		getReqTLSReplacement(req, "http.request.tls.resumed")
+	})
+	if allocs > 0 {
+		t.Errorf("expected 0 allocations evaluating http.request.tls.resumed, got %f", allocs)
+	}
+
+	// Verify absent client certificate lookup reuses emptyCert with 0 allocations
+	allocs = testing.AllocsPerRun(100, func() {
+		getReqTLSReplacement(req, "http.request.tls.client.public_key")
+	})
+	if allocs > 0 {
+		t.Errorf("expected 0 allocations evaluating http.request.tls.client.public_key on absent client cert, got %f", allocs)
+	}
+}
+
+
