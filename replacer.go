@@ -38,7 +38,7 @@ func NewReplacer() *Replacer {
 	}
 	rep.providers = []replacementProvider{
 		globalDefaultReplacementProvider{},
-		fileReplacementProvider{},
+		newFileReplacementProvider(),
 		ReplacerFunc(rep.fromStatic),
 	}
 	return rep
@@ -75,6 +75,9 @@ func (r *Replacer) WithoutFile() *Replacer {
 	rep := &Replacer{static: r.static}
 	for _, v := range r.providers {
 		if _, ok := v.(fileReplacementProvider); ok {
+			continue
+		}
+		if _, ok := v.(*fileReplacementProvider); ok {
 			continue
 		}
 		rep.providers = append(rep.providers, v)
@@ -347,29 +350,76 @@ type replacementProvider interface {
 	replace(key string) (any, bool)
 }
 
+type fileCache struct {
+	mu    sync.RWMutex
+	items map[string]any
+}
+
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
-type fileReplacementProvider struct{}
+type fileReplacementProvider struct {
+	cache *fileCache
+}
+
+func newFileReplacementProvider() fileReplacementProvider {
+	return fileReplacementProvider{
+		cache: &fileCache{
+			items: make(map[string]any),
+		},
+	}
+}
 
 func (f fileReplacementProvider) replace(key string) (any, bool) {
 	if !strings.HasPrefix(key, filePrefix) {
 		return nil, false
 	}
 
+	if f.cache == nil {
+		filename := key[len(filePrefix):]
+		maxSize := 1024 * 1024
+		body, err := readFileIntoBuffer(filename, maxSize)
+		if err != nil {
+			Log().Error("placeholder: failed to read file",
+				zap.String("file", filename),
+				zap.String("working_dir", getWorkingDir()),
+				zap.Error(err))
+			return nil, true
+		}
+		body = bytes.TrimSuffix(body, []byte("\n"))
+		body = bytes.TrimSuffix(body, []byte("\r"))
+		return string(body), true
+	}
+
+	f.cache.mu.RLock()
+	if val, ok := f.cache.items[key]; ok {
+		f.cache.mu.RUnlock()
+		return val, true
+	}
+	f.cache.mu.RUnlock()
+
+	f.cache.mu.Lock()
+	defer f.cache.mu.Unlock()
+
+	if val, ok := f.cache.items[key]; ok {
+		return val, true
+	}
+
 	filename := key[len(filePrefix):]
 	maxSize := 1024 * 1024
 	body, err := readFileIntoBuffer(filename, maxSize)
 	if err != nil {
-		wd, _ := os.Getwd()
 		Log().Error("placeholder: failed to read file",
 			zap.String("file", filename),
-			zap.String("working_dir", wd),
+			zap.String("working_dir", getWorkingDir()),
 			zap.Error(err))
+		f.cache.items[key] = nil
 		return nil, true
 	}
 	body = bytes.TrimSuffix(body, []byte("\n"))
 	body = bytes.TrimSuffix(body, []byte("\r"))
-	return string(body), true
+	res := string(body)
+	f.cache.items[key] = res
+	return res, true
 }
 
 // globalDefaultReplacementProvider handles replacements
@@ -395,8 +445,7 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 		return runtime.GOOS, true
 	case "system.wd":
 		// OK if there is an error; just return empty string
-		wd, _ := os.Getwd()
-		return wd, true
+		return getWorkingDir(), true
 	case "system.arch":
 		return runtime.GOARCH, true
 	case "time.now":
@@ -419,6 +468,24 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	return nil, false
 }
 
+var (
+	workingDir     string
+	workingDirOnce sync.Once
+)
+
+func getWorkingDir() string {
+	workingDirOnce.Do(func() {
+		workingDir, _ = os.Getwd()
+	})
+	return workingDir
+}
+
+var fileBufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
 // readFileIntoBuffer reads the file at filePath into a size limited buffer.
 func readFileIntoBuffer(filename string, size int) ([]byte, error) {
 	file, err := os.Open(filename)
@@ -427,10 +494,22 @@ func readFileIntoBuffer(filename string, size int) ([]byte, error) {
 	}
 	defer file.Close()
 
+	buf := fileBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= size {
+			buf.Reset()
+			fileBufPool.Put(buf)
+		}
+	}()
+
 	// io.LimitReader ensures we never read more than 'size' bytes.
-	// io.ReadAll starts with a small buffer and grows it as needed,
-	// preventing a massive 1MB allocation for small files.
-	return io.ReadAll(io.LimitReader(file, int64(size)))
+	_, err = buf.ReadFrom(io.LimitReader(file, int64(size)))
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes.Clone(buf.Bytes()), nil
 }
 
 // ReplacementFunc is a function that is called when a
