@@ -163,7 +163,24 @@ type HTTPTransport struct {
 	NetworkProxyRaw json.RawMessage `json:"network_proxy,omitempty" caddy:"namespace=caddy.network_proxy inline_key=from"`
 
 	h3Transport   *http3.Transport // TODO: EXPERIMENTAL (May 2024)
-	quicTransport *quic.Transport  // used by h3Transport if sni placeholder is used, otherwise nil
+	quicTransport quicDialer       // used by h3Transport if sni placeholder is used, otherwise nil
+}
+
+const requestMethodCtxKey caddy.CtxKey = "request_method"
+
+type quicDialer interface {
+	Dial(ctx context.Context, addr net.Addr, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error)
+	DialEarly(ctx context.Context, addr net.Addr, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error)
+	Close() error
+}
+
+func isSafeMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
 }
 
 // CaddyModule returns the Caddy module information.
@@ -511,13 +528,18 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				h.quicTransport = &quic.Transport{Conn: udpConn}
 				h.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 					// tlsCfg is already cloned from h3Transport.TLSClientConfig
-					repl := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-					tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
+					if repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer); ok && repl != nil {
+						tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
+					}
 					udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
 					if err != nil {
 						return nil, err
 					}
-					return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+					method, _ := ctx.Value(requestMethodCtxKey).(string)
+					if isSafeMethod(method) {
+						return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+					}
+					return h.quicTransport.Dial(ctx, udpAddr, tlsCfg, cfg)
 				}
 			}
 		}
@@ -639,6 +661,7 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
 	if h.h3Transport != nil {
+		req = req.WithContext(context.WithValue(req.Context(), requestMethodCtxKey, req.Method))
 		return h.h3Transport.RoundTrip(req)
 	}
 
@@ -716,7 +739,9 @@ func (h HTTPTransport) Cleanup() error {
 		_ = h.h3Transport.Close()
 		if h.quicTransport != nil {
 			_ = h.quicTransport.Close()
-			_ = h.quicTransport.Conn.Close()
+			if qt, ok := h.quicTransport.(*quic.Transport); ok && qt.Conn != nil {
+				_ = qt.Conn.Close()
+			}
 		}
 	}
 	return nil
