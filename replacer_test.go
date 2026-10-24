@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -484,7 +485,29 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	allocsStatic := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("simple static string without placeholders", "")
+	})
+	if allocsStatic != 0 {
+		t.Errorf("expected 0 allocations for static string, got %f", allocsStatic)
+	}
+
+	allocsSingle := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("str={str}", "")
+	})
+	if allocsSingle > 1 {
+		t.Errorf("expected <= 1 allocation for single replacement, got %f", allocsSingle)
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
+	b.ReportAllocs()
+
 	type testCase struct {
 		name, input, empty string
 	}
@@ -514,12 +537,88 @@ func BenchmarkReplacer(b *testing.B) {
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
+		{
+			name:  "multi placeholder (3 vars)",
+			input: `a={str} b={int} c={str}`,
+		},
+		{
+			name:  "multi placeholder (5 vars)",
+			input: `1={str} 2={int} 3={str} 4={int} 5={str}`,
+		},
+		{
+			name:  "multi escaped placeholders",
+			input: `\{foo\} \{bar\} \{baz\} str={str} int={int}`,
+		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
+	}
+}
+
+func BenchmarkReplacerParallel(b *testing.B) {
+	b.ReportAllocs()
+
+	b.Run("ParallelReplaceAll", func(b *testing.B) {
+		b.ReportAllocs()
+		rep := testReplacer()
+		rep.Set("str", "a string")
+		rep.Set("int", 123.456)
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				rep.ReplaceAll("str={str} int={int}", "")
+			}
+		})
+	})
+
+	b.Run("ParallelReadWriteContention", func(b *testing.B) {
+		b.ReportAllocs()
+		rep := testReplacer()
+		rep.Set("str", "a string")
+		rep.Set("int", 123.456)
+		var mu sync.Mutex
+		var count atomic.Int64
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				n := count.Add(1)
+				switch n % 10 {
+				case 0:
+					rep.Set("key", n)
+				case 1:
+					rep.Delete("key")
+				case 2:
+					mu.Lock()
+					rep.Map(func(key string) (any, bool) {
+						if key == "dynamic" {
+							return "value", true
+						}
+						return nil, false
+					})
+					mu.Unlock()
+				case 3, 4:
+					rep.Get("str")
+				default:
+					rep.ReplaceAll("str={str} int={int}", "")
+				}
+			}
+		})
+	})
+}
+
+func BenchmarkNewReplacer(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = NewReplacer()
+	}
+}
+
+func BenchmarkNewEmptyReplacer(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = NewEmptyReplacer()
 	}
 }
 

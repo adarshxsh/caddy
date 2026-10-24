@@ -296,3 +296,50 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkHTTPReplacer(b *testing.B) {
+	b.ReportAllocs()
+
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	req.Header.Set("User-Agent", "CaddyBench/1.0")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("X-Forwarded-For", "203.0.113.195")
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+
+	b.Run("NewTestReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			r := req.Clone(req.Context())
+			_ = NewTestReplacer(r)
+		}
+	})
+
+	b.Run("addHTTPVarsToReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		repl := caddy.NewReplacer()
+		res := httptest.NewRecorder()
+		for b.Loop() {
+			addHTTPVarsToReplacer(repl, req, res)
+		}
+	})
+
+	b.Run("request_header_replacement", func(b *testing.B) {
+		b.ReportAllocs()
+		r := req.Clone(req.Context())
+		repl := NewTestReplacer(r)
+		for b.Loop() {
+			repl.ReplaceAll("User-Agent: {http.request.header.User-Agent}", "")
+		}
+	})
+
+	b.Run("request_uri_replacement", func(b *testing.B) {
+		b.ReportAllocs()
+		r := req.Clone(req.Context())
+		repl := NewTestReplacer(r)
+		for b.Loop() {
+			repl.ReplaceAll("URI: {http.request.uri} Path: {http.request.uri.path}", "")
+		}
+	})
+}
+
