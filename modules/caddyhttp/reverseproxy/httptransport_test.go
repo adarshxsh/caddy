@@ -2,12 +2,14 @@ package reverseproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -279,3 +281,142 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPTransport_DialReplacerFallback(t *testing.T) {
+	caddyCtx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// 1. Test DialTLSContext
+	t.Run("DialTLSContext replacer fallback", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		defer ln.Close()
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				c.Close()
+			}
+		}()
+
+		ht := &HTTPTransport{
+			TLS: &TLSConfig{
+				ServerName: "{my_host}",
+			},
+		}
+
+		rt, err := ht.NewTransport(caddyCtx)
+		if err != nil {
+			t.Fatalf("NewTransport error: %v", err)
+		}
+
+		if rt.DialTLSContext == nil {
+			t.Fatalf("expected DialTLSContext to be set")
+		}
+
+		contextsToTest := []struct {
+			name string
+			ctx  context.Context
+		}{
+			{"background context", context.Background()},
+			{"nil replacer context", context.WithValue(context.Background(), caddy.ReplacerCtxKey, nil)},
+			{"wrong type context", context.WithValue(context.Background(), caddy.ReplacerCtxKey, "not a replacer")},
+		}
+
+		for _, tc := range contextsToTest {
+			t.Run(tc.name, func(t *testing.T) {
+				conn, err := rt.DialTLSContext(tc.ctx, "tcp", ln.Addr().String())
+				if conn != nil {
+					conn.Close()
+				}
+				_ = err
+			})
+		}
+
+		t.Run("valid replacer", func(t *testing.T) {
+			repl := caddy.NewReplacer()
+			repl.Set("my_host", "example.com")
+			validCtx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+			conn, err := rt.DialTLSContext(validCtx, "tcp", ln.Addr().String())
+			if conn != nil {
+				conn.Close()
+			}
+			_ = err
+		})
+	})
+
+	// 2. Test h3Transport.Dial
+	t.Run("h3Transport.Dial replacer fallback", func(t *testing.T) {
+		ht := &HTTPTransport{
+			Versions: []string{"3"},
+			TLS: &TLSConfig{
+				ServerName: "{my_host}",
+			},
+		}
+
+		_, err := ht.NewTransport(caddyCtx)
+		if err != nil {
+			t.Fatalf("NewTransport error: %v", err)
+		}
+		if ht.quicTransport != nil {
+			t.Cleanup(func() {
+				_ = ht.quicTransport.Close()
+				if ht.quicTransport.Conn != nil {
+					_ = ht.quicTransport.Conn.Close()
+				}
+			})
+		}
+
+		if ht.h3Transport == nil || ht.h3Transport.Dial == nil {
+			t.Fatalf("expected h3Transport.Dial to be set")
+		}
+
+		contextsToTest := []struct {
+			name string
+			ctx  context.Context
+		}{
+			{"background context", context.Background()},
+			{"nil replacer context", context.WithValue(context.Background(), caddy.ReplacerCtxKey, nil)},
+			{"wrong type context", context.WithValue(context.Background(), caddy.ReplacerCtxKey, "not a replacer")},
+		}
+
+		for _, tc := range contextsToTest {
+			t.Run(tc.name, func(t *testing.T) {
+				tlsCfg := &tls.Config{ServerName: "prefix-{my_host}-suffix"}
+				dialCtx, cancel := context.WithTimeout(tc.ctx, 50*time.Millisecond)
+				defer cancel()
+				conn, err := ht.h3Transport.Dial(dialCtx, "127.0.0.1:12345", tlsCfg, nil)
+				if conn != nil {
+					_ = conn.CloseWithError(0, "")
+				}
+				_ = err
+				if tlsCfg.ServerName != "prefix--suffix" {
+					t.Errorf("expected tlsCfg.ServerName to be 'prefix--suffix', got %q", tlsCfg.ServerName)
+				}
+			})
+		}
+
+		t.Run("valid replacer", func(t *testing.T) {
+			repl := caddy.NewReplacer()
+			repl.Set("my_host", "example.com")
+			validCtx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, repl)
+			dialCtx, cancel := context.WithTimeout(validCtx, 50*time.Millisecond)
+			defer cancel()
+			tlsCfg := &tls.Config{ServerName: "prefix-{my_host}-suffix"}
+
+			conn, err := ht.h3Transport.Dial(dialCtx, "127.0.0.1:12345", tlsCfg, nil)
+			if conn != nil {
+				_ = conn.CloseWithError(0, "")
+			}
+			_ = err
+			if tlsCfg.ServerName != "prefix-example.com-suffix" {
+				t.Errorf("expected tlsCfg.ServerName to be 'prefix-example.com-suffix', got %q", tlsCfg.ServerName)
+			}
+		})
+	})
+}
+
