@@ -996,6 +996,9 @@ func PrepareRequest(r *http.Request, repl *caddy.Replacer, w http.ResponseWriter
 	ctx = context.WithValue(ctx, OriginalRequestCtxKey, originalRequest(r, &url2))
 
 	ctx = context.WithValue(ctx, ExtraLogFieldsCtxKey, new(ExtraLogFields))
+	if w != nil {
+		ctx = context.WithValue(ctx, ResponseWriterCtxKey, w)
+	}
 	r = r.WithContext(ctx)
 
 	// once the pointer to the request won't change
@@ -1213,6 +1216,9 @@ const (
 
 	// For tracking the real client IP (affected by trusted_proxy)
 	ClientIPVarKey string = "client_ip"
+
+	// For referencing the active response writer
+	ResponseWriterCtxKey caddy.CtxKey = "response_writer"
 )
 
 var networkTypesHTTP3 = map[string]string{

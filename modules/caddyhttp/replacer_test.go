@@ -296,3 +296,54 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestLazyRequestID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]any))
+	ctx = context.WithValue(ctx, ExtraLogFieldsCtxKey, new(ExtraLogFields))
+	req = req.WithContext(ctx)
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Verify requestID was not allocated before placeholder evaluation
+	if val := GetVar(req.Context(), "uuid"); val != nil {
+		t.Fatalf("expected GetVar('uuid') to be nil before evaluation, got: %v", val)
+	}
+
+	// Evaluate {http.request.uuid}
+	idStr1, ok1 := repl.GetString("http.request.uuid")
+	if !ok1 || idStr1 == "" {
+		t.Fatalf("expected non-empty uuid placeholder value, got ok=%v, val=%q", ok1, idStr1)
+	}
+
+	// Verify requestID was created in context
+	val := GetVar(req.Context(), "uuid")
+	if val == nil {
+		t.Fatalf("expected GetVar('uuid') to be non-nil after evaluation")
+	}
+
+	// Evaluate {http.request.uuid} second time and verify cached value
+	idStr2, ok2 := repl.GetString("http.request.uuid")
+	if !ok2 || idStr2 != idStr1 {
+		t.Fatalf("expected cached uuid value %q, got ok=%v, val=%q", idStr1, ok2, idStr2)
+	}
+}
+
+func TestResponseHeaderReplacer(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	rec.Header().Set("X-Custom-Header", "custom-value")
+
+	addHTTPVarsToReplacer(repl, req, rec)
+
+	val, ok := repl.GetString("http.response.header.X-Custom-Header")
+	if !ok || val != "custom-value" {
+		t.Errorf("expected 'custom-value', got ok=%v, val=%q", ok, val)
+	}
+}
