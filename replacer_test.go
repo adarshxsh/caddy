@@ -523,6 +523,59 @@ func BenchmarkReplacer(b *testing.B) {
 	}
 }
 
+var benchStringSink string
+
+func TestReplacerZeroAllocations(t *testing.T) {
+	rep := testReplacer()
+
+	// Warm up pool
+	_ = rep.ReplaceKnown("warmup {unknown}", "")
+
+	for _, tc := range []struct {
+		name  string
+		input string
+		fn    func(string) string
+	}{
+		{
+			name:  "no placeholders",
+			input: "simple string without braces",
+			fn: func(s string) string {
+				return rep.ReplaceAll(s, "")
+			},
+		},
+		{
+			name:  "unrecognized placeholder in ReplaceKnown",
+			input: "hello {unknown_placeholder} world",
+			fn: func(s string) string {
+				return rep.ReplaceKnown(s, "")
+			},
+		},
+		{
+			name:  "unclosed brace input",
+			input: "hello {unclosed brace input",
+			fn: func(s string) string {
+				return rep.ReplaceAll(s, "")
+			},
+		},
+		{
+			name:  "multiple unclosed braces",
+			input: "a { b { c { d { e { f",
+			fn: func(s string) string {
+				return rep.ReplaceKnown(s, "")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() {
+				benchStringSink = tc.fn(tc.input)
+			})
+			if allocs > 0 {
+				t.Errorf("%s: expected 0 allocs/op, got %f", tc.name, allocs)
+			}
+		})
+	}
+}
+
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
