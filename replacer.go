@@ -33,8 +33,9 @@ import (
 // NewReplacer returns a new Replacer.
 func NewReplacer() *Replacer {
 	rep := &Replacer{
-		static:   make(map[string]any),
-		mapMutex: &sync.RWMutex{},
+		static:        make(map[string]any),
+		staticStrings: make(map[string]string),
+		mapMutex:      &sync.RWMutex{},
 	}
 	rep.providers = []replacementProvider{
 		globalDefaultReplacementProvider{},
@@ -48,8 +49,9 @@ func NewReplacer() *Replacer {
 // without the global default replacements.
 func NewEmptyReplacer() *Replacer {
 	rep := &Replacer{
-		static:   make(map[string]any),
-		mapMutex: &sync.RWMutex{},
+		static:        make(map[string]any),
+		staticStrings: make(map[string]string),
+		mapMutex:      &sync.RWMutex{},
 	}
 	rep.providers = []replacementProvider{
 		ReplacerFunc(rep.fromStatic),
@@ -61,9 +63,10 @@ func NewEmptyReplacer() *Replacer {
 // A default/empty Replacer is not valid;
 // use NewReplacer to make one.
 type Replacer struct {
-	providers []replacementProvider
-	static    map[string]any
-	mapMutex  *sync.RWMutex
+	providers     []replacementProvider
+	static        map[string]any
+	staticStrings map[string]string
+	mapMutex      *sync.RWMutex
 }
 
 // WithoutFile returns a copy of the current Replacer
@@ -72,7 +75,11 @@ type Replacer struct {
 //
 // EXPERIMENTAL: Subject to change or removal.
 func (r *Replacer) WithoutFile() *Replacer {
-	rep := &Replacer{static: r.static}
+	rep := &Replacer{
+		static:        r.static,
+		staticStrings: r.staticStrings,
+		mapMutex:      r.mapMutex,
+	}
 	for _, v := range r.providers {
 		if _, ok := v.(fileReplacementProvider); ok {
 			continue
@@ -91,8 +98,44 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
+	if r.static == nil {
+		r.static = make(map[string]any)
+	}
+	if r.staticStrings != nil {
+		delete(r.staticStrings, variable)
+	}
 	r.static[variable] = value
 	r.mapMutex.Unlock()
+}
+
+// SetString sets a custom variable to a static string value,
+// avoiding interface boxing allocations.
+func (r *Replacer) SetString(variable, value string) {
+	r.mapMutex.Lock()
+	if r.staticStrings == nil {
+		r.staticStrings = make(map[string]string)
+	}
+	if r.static != nil {
+		delete(r.static, variable)
+	}
+	r.staticStrings[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetInt sets a custom variable to a static integer value,
+// avoiding interface boxing allocations.
+func (r *Replacer) SetInt(variable string, value int) {
+	r.SetString(variable, strconv.Itoa(value))
+}
+
+// SetBool sets a custom variable to a static boolean value,
+// avoiding interface boxing allocations.
+func (r *Replacer) SetBool(variable string, value bool) {
+	if value {
+		r.SetString(variable, "true")
+	} else {
+		r.SetString(variable, "false")
+	}
 }
 
 // Get gets a value from the replacer. It returns
@@ -109,15 +152,29 @@ func (r *Replacer) Get(variable string) (any, bool) {
 // GetString is the same as Get, but coerces the value to a
 // string representation as efficiently as possible.
 func (r *Replacer) GetString(variable string) (string, bool) {
+	r.mapMutex.RLock()
+	if r.staticStrings != nil {
+		if s, ok := r.staticStrings[variable]; ok {
+			r.mapMutex.RUnlock()
+			return s, true
+		}
+	}
+	r.mapMutex.RUnlock()
+
 	s, found := r.Get(variable)
 	return ToString(s), found
 }
 
 // Delete removes a variable with a static value
-// that was created using Set.
+// that was created using Set or SetString.
 func (r *Replacer) Delete(variable string) {
 	r.mapMutex.Lock()
-	delete(r.static, variable)
+	if r.static != nil {
+		delete(r.static, variable)
+	}
+	if r.staticStrings != nil {
+		delete(r.staticStrings, variable)
+	}
 	r.mapMutex.Unlock()
 }
 
@@ -125,20 +182,37 @@ func (r *Replacer) Delete(variable string) {
 // keys starting with the given prefix
 func (r *Replacer) DeleteByPrefix(prefix string) {
 	r.mapMutex.Lock()
-	for key := range r.static {
-		if strings.HasPrefix(key, prefix) {
-			delete(r.static, key)
+	if r.static != nil {
+		for key := range r.static {
+			if strings.HasPrefix(key, prefix) {
+				delete(r.static, key)
+			}
+		}
+	}
+	if r.staticStrings != nil {
+		for key := range r.staticStrings {
+			if strings.HasPrefix(key, prefix) {
+				delete(r.staticStrings, key)
+			}
 		}
 	}
 	r.mapMutex.Unlock()
 }
 
-// fromStatic provides values from r.static.
+// fromStatic provides values from r.staticStrings or r.static.
 func (r *Replacer) fromStatic(key string) (any, bool) {
 	r.mapMutex.RLock()
 	defer r.mapMutex.RUnlock()
-	val, ok := r.static[key]
-	return val, ok
+	if r.staticStrings != nil {
+		if val, ok := r.staticStrings[key]; ok {
+			return val, true
+		}
+	}
+	if r.static != nil {
+		val, ok := r.static[key]
+		return val, ok
+	}
+	return nil, false
 }
 
 // ReplaceOrErr is like ReplaceAll, but any placeholders
@@ -235,44 +309,83 @@ scan:
 		// trim opening bracket
 		key := input[i+1 : end]
 
-		// try to get a value for this key, handle empty values accordingly
-		val, found := r.Get(key)
-		if !found {
-			// placeholder is unknown (unrecognized); handle accordingly
-			if errOnUnknown {
-				return "", fmt.Errorf("unrecognized placeholder %s%s%s",
-					string(phOpen), key, string(phClose))
-			} else if !treatUnknownAsEmpty {
-				// if treatUnknownAsEmpty is true, we'll handle an empty
-				// val later; so only continue otherwise
-				lastWriteCursor = i
-				continue
+		// try fast path for static strings to avoid interface boxing and provider loops
+		var written bool
+		if r.staticStrings != nil {
+			r.mapMutex.RLock()
+			valStr, ok := r.staticStrings[key]
+			r.mapMutex.RUnlock()
+			if ok && !strings.HasPrefix(key, "env.") && !strings.HasPrefix(key, "file.") && !strings.HasPrefix(key, "system.") && !strings.HasPrefix(key, "time.") {
+				written = true
+				if f != nil {
+					newVal, err := f(key, valStr)
+					if err != nil {
+						return "", err
+					}
+					startLen := sb.Len()
+					writeValue(&sb, newVal)
+					if sb.Len() == startLen {
+						if errOnEmpty {
+							return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
+								string(phOpen), key, string(phClose))
+						} else if empty != "" {
+							sb.WriteString(empty)
+						}
+					}
+				} else {
+					if valStr == "" {
+						if errOnEmpty {
+							return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
+								string(phOpen), key, string(phClose))
+						} else if empty != "" {
+							sb.WriteString(empty)
+						}
+					} else {
+						sb.WriteString(valStr)
+					}
+				}
 			}
 		}
 
-		// apply any transformations
-		if f != nil {
-			var err error
-			val, err = f(key, val)
-			if err != nil {
-				return "", err
+		if !written {
+			// try to get a value for this key, handle empty values accordingly
+			val, found := r.Get(key)
+			if !found {
+				// placeholder is unknown (unrecognized); handle accordingly
+				if errOnUnknown {
+					return "", fmt.Errorf("unrecognized placeholder %s%s%s",
+						string(phOpen), key, string(phClose))
+				} else if !treatUnknownAsEmpty {
+					// if treatUnknownAsEmpty is true, we'll handle an empty
+					// val later; so only continue otherwise
+					lastWriteCursor = i
+					continue
+				}
 			}
-		}
 
-		// convert val to a string as efficiently as possible
-		valStr := ToString(val)
-
-		// write the value; if it's empty, either return
-		// an error or write a default value
-		if valStr == "" {
-			if errOnEmpty {
-				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
-					string(phOpen), key, string(phClose))
-			} else if empty != "" {
-				sb.WriteString(empty)
+			// apply any transformations
+			if f != nil {
+				var err error
+				val, err = f(key, val)
+				if err != nil {
+					return "", err
+				}
 			}
-		} else {
-			sb.WriteString(valStr)
+
+			// convert val to a string and write to buffer as efficiently as possible
+			startLen := sb.Len()
+			writeValue(&sb, val)
+
+			// if written value is empty, either return
+			// an error or write a default value
+			if sb.Len() == startLen {
+				if errOnEmpty {
+					return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
+						string(phOpen), key, string(phClose))
+				} else if empty != "" {
+					sb.WriteString(empty)
+				}
+			}
 		}
 
 		// advance cursor to end of placeholder
@@ -286,6 +399,69 @@ scan:
 	return sb.String(), nil
 }
 
+// writeValue writes val directly into sb using stack-buffered formatting helpers,
+// avoiding heap allocations for primitive types.
+func writeValue(sb *strings.Builder, val any) {
+	switch v := val.(type) {
+	case nil:
+		return
+	case string:
+		sb.WriteString(v)
+	case fmt.Stringer:
+		sb.WriteString(v.String())
+	case error:
+		sb.WriteString(v.Error())
+	case byte:
+		sb.WriteByte(v)
+	case []byte:
+		sb.Write(v)
+	case []rune:
+		for _, r := range v {
+			sb.WriteRune(r)
+		}
+	case int:
+		var buf [32]byte
+		b := strconv.AppendInt(buf[:0], int64(v), 10)
+		sb.Write(b)
+	case int32:
+		var buf [32]byte
+		b := strconv.AppendInt(buf[:0], int64(v), 10)
+		sb.Write(b)
+	case int64:
+		var buf [32]byte
+		b := strconv.AppendInt(buf[:0], v, 10)
+		sb.Write(b)
+	case uint:
+		var buf [32]byte
+		b := strconv.AppendUint(buf[:0], uint64(v), 10)
+		sb.Write(b)
+	case uint32:
+		var buf [32]byte
+		b := strconv.AppendUint(buf[:0], uint64(v), 10)
+		sb.Write(b)
+	case uint64:
+		var buf [32]byte
+		b := strconv.AppendUint(buf[:0], v, 10)
+		sb.Write(b)
+	case float32:
+		var buf [64]byte
+		b := strconv.AppendFloat(buf[:0], float64(v), 'f', -1, 32)
+		sb.Write(b)
+	case float64:
+		var buf [64]byte
+		b := strconv.AppendFloat(buf[:0], v, 'f', -1, 64)
+		sb.Write(b)
+	case bool:
+		if v {
+			sb.WriteString("true")
+		} else {
+			sb.WriteString("false")
+		}
+	default:
+		fmt.Fprintf(sb, "%+v", v)
+	}
+}
+
 // ToString returns val as a string, as efficiently as possible.
 // EXPERIMENTAL: may be changed or removed later.
 func ToString(val any) string {
@@ -294,39 +470,10 @@ func ToString(val any) string {
 		return ""
 	case string:
 		return v
-	case fmt.Stringer:
-		return v.String()
-	case error:
-		return v.Error()
-	case byte:
-		return string(v)
-	case []byte:
-		return string(v)
-	case []rune:
-		return string(v)
-	case int:
-		return strconv.Itoa(v)
-	case int32:
-		return strconv.Itoa(int(v))
-	case int64:
-		return strconv.Itoa(int(v))
-	case uint:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint32:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint64:
-		return strconv.FormatUint(v, 10)
-	case float32:
-		return strconv.FormatFloat(float64(v), 'f', -1, 32)
-	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
-	case bool:
-		if v {
-			return "true"
-		}
-		return "false"
 	default:
-		return fmt.Sprintf("%+v", v)
+		var sb strings.Builder
+		writeValue(&sb, val)
+		return sb.String()
 	}
 }
 
