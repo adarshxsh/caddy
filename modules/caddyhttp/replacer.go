@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/pem"
@@ -411,6 +412,39 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 	repl.Map(httpVars)
 }
 
+var (
+	emptyCert = new(x509.Certificate)
+
+	emptyPKIXNameAny        any = pkix.Name{}
+	emptyCertFingerprintAny any = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	emptyCertPEMAny         any = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"
+
+	trueAny  any = true
+	falseAny any = false
+
+	emptyStringAny any = ""
+	h2Any          any = "h2"
+	h3Any          any = "h3"
+	http11Any      any = "http/1.1"
+
+	tls13Any any = "tls1.3"
+	tls12Any any = "tls1.2"
+	tls11Any any = "tls1.1"
+	tls10Any any = "tls1.0"
+
+	cipherSuiteNamesAny map[uint16]any
+)
+
+func init() {
+	cipherSuiteNamesAny = make(map[uint16]any)
+	for _, cs := range tls.CipherSuites() {
+		cipherSuiteNamesAny[cs.ID] = cs.Name
+	}
+	for _, cs := range tls.InsecureCipherSuites() {
+		cipherSuiteNamesAny[cs.ID] = cs.Name
+	}
+}
+
 func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 	if req == nil || req.TLS == nil {
 		return nil, false
@@ -420,11 +454,23 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 		return nil, false
 	}
 
-	field := strings.ToLower(key[len(reqTLSReplPrefix):])
+	field := key[len(reqTLSReplPrefix):]
+	if val, ok := evalReqTLSReplacement(req, field); ok {
+		return val, true
+	}
 
+	if lower := strings.ToLower(field); lower != field {
+		return evalReqTLSReplacement(req, lower)
+	}
+
+	return nil, false
+}
+
+func evalReqTLSReplacement(req *http.Request, field string) (any, bool) {
 	if strings.HasPrefix(field, "client.") {
 		cert := getTLSPeerCert(req.TLS)
-		if cert == nil {
+		isNoCert := cert == nil
+		if isNoCert {
 			// Instead of returning (nil, false) here, we set it to a dummy
 			// value to fix #7530. This way, even if there is no client cert,
 			// evaluating placeholders with ReplaceKnown() will still remove
@@ -433,8 +479,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 			// the client presented a cert. We also do not return true here
 			// because we probably should remain accurate about whether a
 			// placeholder is, in fact, known or not.
-			// (This allocation may be slightly inefficient.)
-			cert = new(x509.Certificate)
+			cert = emptyCert
 		}
 
 		// subject alternate names (SANs)
@@ -497,6 +542,9 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 
 		switch field {
 		case "client.fingerprint":
+			if isNoCert {
+				return emptyCertFingerprintAny, true
+			}
 			return fmt.Sprintf("%x", sha256.Sum256(cert.Raw)), true
 		case "client.public_key", "client.public_key_sha256":
 			if cert.PublicKey == nil {
@@ -511,15 +559,27 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 			}
 			return fmt.Sprintf("%x", pubKeyBytes), true
 		case "client.issuer":
+			if isNoCert {
+				return emptyPKIXNameAny, true
+			}
 			return cert.Issuer, true
 		case "client.serial":
 			return cert.SerialNumber, true
 		case "client.subject":
+			if isNoCert {
+				return emptyPKIXNameAny, true
+			}
 			return cert.Subject, true
 		case "client.certificate_pem":
+			if isNoCert {
+				return emptyCertPEMAny, true
+			}
 			block := pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}
 			return pem.EncodeToMemory(&block), true
 		case "client.certificate_der_base64":
+			if isNoCert {
+				return emptyStringAny, true
+			}
 			return base64.StdEncoding.EncodeToString(cert.Raw), true
 		default:
 			return nil, false
@@ -528,20 +588,54 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 
 	switch field {
 	case "version":
-		return caddytls.ProtocolName(req.TLS.Version), true
+		switch req.TLS.Version {
+		case tls.VersionTLS13:
+			return tls13Any, true
+		case tls.VersionTLS12:
+			return tls12Any, true
+		case tls.VersionTLS11:
+			return tls11Any, true
+		case tls.VersionTLS10:
+			return tls10Any, true
+		default:
+			return caddytls.ProtocolName(req.TLS.Version), true
+		}
 	case "cipher_suite":
+		if csAny, ok := cipherSuiteNamesAny[req.TLS.CipherSuite]; ok {
+			return csAny, true
+		}
 		return tls.CipherSuiteName(req.TLS.CipherSuite), true
 	case "resumed":
-		return req.TLS.DidResume, true
+		if req.TLS.DidResume {
+			return trueAny, true
+		}
+		return falseAny, true
 	case "proto":
-		return req.TLS.NegotiatedProtocol, true
+		switch req.TLS.NegotiatedProtocol {
+		case "h2":
+			return h2Any, true
+		case "http/1.1":
+			return http11Any, true
+		case "h3":
+			return h3Any, true
+		case "":
+			return emptyStringAny, true
+		default:
+			return req.TLS.NegotiatedProtocol, true
+		}
 	case "proto_mutual":
 		// req.TLS.NegotiatedProtocolIsMutual is deprecated - it's always true.
-		return true, true
+		return trueAny, true
 	case "server_name":
+		if req.TLS.ServerName == "" {
+			return emptyStringAny, true
+		}
 		return req.TLS.ServerName, true
 	case "ech":
-		return req.TLS.ECHAccepted, true
+		if req.TLS.ECHAccepted {
+			return trueAny, true
+		}
+		return falseAny, true
 	}
 	return nil, false
 }

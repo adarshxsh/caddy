@@ -296,3 +296,87 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestTLSReplacementsNoCertAndMixedCase(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "https://example.com", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:            tls.VersionTLS13,
+		HandshakeComplete:  true,
+		ServerName:         "example.com",
+		CipherSuite:        tls.TLS_AES_256_GCM_SHA384,
+		NegotiatedProtocol: "h2",
+	}
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Test standard lowercase with no cert
+	val, ok := repl.GetString("http.request.tls.client.subject")
+	if !ok {
+		t.Errorf("expected to recognize http.request.tls.client.subject even without client cert")
+	}
+	if val != "" {
+		t.Errorf("expected empty string for subject without client cert, got %q", val)
+	}
+
+	// Test mixed-case lookup
+	val, ok = repl.GetString("http.request.tls.Version")
+	if !ok || val != "tls1.3" {
+		t.Errorf("expected tls1.3 for mixed-case http.request.tls.Version, got %q (ok=%t)", val, ok)
+	}
+
+	val, ok = repl.GetString("http.request.tls.Client.Subject")
+	if !ok {
+		t.Errorf("expected to recognize http.request.tls.Client.Subject")
+	}
+}
+
+func BenchmarkGetReqTLSReplacement(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "https://example.com", nil)
+	req.TLS = &tls.ConnectionState{
+		Version:            tls.VersionTLS13,
+		HandshakeComplete:  true,
+		ServerName:         "example.com",
+		CipherSuite:        tls.TLS_AES_256_GCM_SHA384,
+		NegotiatedProtocol: "h2",
+	}
+
+	b.Run("version", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _ = getReqTLSReplacement(req, "http.request.tls.version")
+		}
+	})
+
+	b.Run("cipher_suite", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _ = getReqTLSReplacement(req, "http.request.tls.cipher_suite")
+		}
+	})
+
+	b.Run("server_name", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _ = getReqTLSReplacement(req, "http.request.tls.server_name")
+		}
+	})
+
+	b.Run("client.subject", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _ = getReqTLSReplacement(req, "http.request.tls.client.subject")
+		}
+	})
+
+	b.Run("client.san.dns_names.0", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _ = getReqTLSReplacement(req, "http.request.tls.client.san.dns_names.0")
+		}
+	})
+}
