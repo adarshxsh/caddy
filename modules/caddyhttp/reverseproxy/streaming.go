@@ -26,6 +26,7 @@ import (
 	"io"
 	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -184,6 +185,10 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 	}
 
+	// Disable transport timeouts and clear deadlines for upgraded connections.
+	disableTransportTimeoutsAndDeadlines(conn)
+	disableTransportTimeoutsAndDeadlines(backConn)
+
 	// Ensure the hijacked client connection, and the new connection established
 	// with the backend, are both closed in the event of a server shutdown. This
 	// is done by registering them. We also try to gracefully close connections
@@ -235,6 +240,41 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
 			c.Write(zap.Time("timeout", time))
 		}
+	}
+}
+
+func disableTransportTimeoutsAndDeadlines(conn any) {
+	if conn == nil {
+		return
+	}
+	curr := conn
+	for i := 0; i < 10 && curr != nil; i++ {
+		if d, ok := curr.(interface{ DisableTimeouts() }); ok {
+			d.DisableTimeouts()
+		}
+		if d, ok := curr.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = d.SetDeadline(time.Time{})
+		}
+		if d, ok := curr.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = d.SetReadDeadline(time.Time{})
+		}
+		if d, ok := curr.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = d.SetWriteDeadline(time.Time{})
+		}
+
+		var next any
+		if u, ok := curr.(interface{ Unwrap() net.Conn }); ok {
+			next = u.Unwrap()
+		} else if u, ok := curr.(interface{ Unwrap() io.ReadWriteCloser }); ok {
+			next = u.Unwrap()
+		} else if u, ok := curr.(interface{ Unwrap() any }); ok {
+			next = u.Unwrap()
+		}
+
+		if next == nil || next == curr {
+			break
+		}
+		curr = next
 	}
 }
 

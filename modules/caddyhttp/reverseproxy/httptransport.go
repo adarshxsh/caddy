@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -355,12 +356,13 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 		// if read/write timeouts are configured and this is a TCP connection,
 		// enforce the timeouts by wrapping the connection with our own type
 		if tcpConn, ok := conn.(*net.TCPConn); ok && (h.ReadTimeout > 0 || h.WriteTimeout > 0) {
-			conn = &tcpRWTimeoutConn{
-				TCPConn:      tcpConn,
-				readTimeout:  time.Duration(h.ReadTimeout),
-				writeTimeout: time.Duration(h.WriteTimeout),
-				logger:       caddyCtx.Logger(),
+			tConn := &tcpRWTimeoutConn{
+				TCPConn: tcpConn,
+				logger:  caddyCtx.Logger(),
 			}
+			tConn.readTimeout.Store(int64(h.ReadTimeout))
+			tConn.writeTimeout.Store(int64(h.WriteTimeout))
+			conn = tConn
 		}
 
 		return conn, nil
@@ -927,13 +929,13 @@ type KeepAlive struct {
 // the standard library does: https://github.com/golang/go/blob/c5da4fb7ac5cb7434b41fc9a1df3bee66c7f1a4d/src/net/http/server.go#L981-L986)
 type tcpRWTimeoutConn struct {
 	*net.TCPConn
-	readTimeout, writeTimeout time.Duration
+	readTimeout, writeTimeout atomic.Int64
 	logger                    *zap.Logger
 }
 
 func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
-	if c.readTimeout > 0 {
-		err := c.TCPConn.SetReadDeadline(time.Now().Add(c.readTimeout))
+	if readTimeout := time.Duration(c.readTimeout.Load()); readTimeout > 0 {
+		err := c.TCPConn.SetReadDeadline(time.Now().Add(readTimeout))
 		if err != nil {
 			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
 				ce.Write(zap.Error(err))
@@ -944,8 +946,8 @@ func (c *tcpRWTimeoutConn) Read(b []byte) (int, error) {
 }
 
 func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
-	if c.writeTimeout > 0 {
-		err := c.TCPConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	if writeTimeout := time.Duration(c.writeTimeout.Load()); writeTimeout > 0 {
+		err := c.TCPConn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if err != nil {
 			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
 				ce.Write(zap.Error(err))
@@ -953,6 +955,26 @@ func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
 		}
 	}
 	return c.TCPConn.Write(b)
+}
+
+// DisableTimeouts clears per-read and per-write timeouts and removes existing deadlines on the underlying connection.
+func (c *tcpRWTimeoutConn) DisableTimeouts() {
+	if c == nil {
+		return
+	}
+	c.readTimeout.Store(0)
+	c.writeTimeout.Store(0)
+	if c.TCPConn != nil {
+		_ = c.TCPConn.SetDeadline(time.Time{})
+	}
+}
+
+// Unwrap returns the underlying net.Conn.
+func (c *tcpRWTimeoutConn) Unwrap() net.Conn {
+	if c == nil {
+		return nil
+	}
+	return c.TCPConn
 }
 
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.
