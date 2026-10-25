@@ -90,9 +90,13 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 	for {
 		select {
 		case now := <-s.timer.C:
-			// copy the slice header to avoid races
+			// deep copy the slice to avoid races on shared backing array
 			mutex.RLock()
-			keysCopy := keys
+			var keysCopy [][32]byte
+			if keys != nil {
+				keysCopy = make([][32]byte, len(keys))
+				copy(keysCopy, keys)
+			}
 			mutex.RUnlock()
 
 			// generate a new key, rotating old ones
