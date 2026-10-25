@@ -90,32 +90,40 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 	for {
 		select {
 		case now := <-s.timer.C:
-			// copy the slice header to avoid races
-			mutex.RLock()
-			keysCopy := keys
-			mutex.RUnlock()
+			func() {
+				// timer channel is already drained, so reset directly via defer (see godoc)
+				defer func() {
+					s.timer.Reset(time.Duration(s.stekConfig.RotationInterval))
+				}()
 
-			// generate a new key, rotating old ones
-			var err error
-			keysCopy, err = s.stekConfig.RotateSTEKs(keysCopy)
-			if err != nil {
-				// TODO: improve this handling
-				log.Printf("[ERROR] Generating STEK: %v", err)
-				continue
-			}
+				// copy the slice header to avoid races
+				mutex.RLock()
+				keysCopy := keys
+				mutex.RUnlock()
 
-			// replace keys slice with updated value and
-			// record the timestamp of rotation
-			mutex.Lock()
-			keys = keysCopy
-			lastRotation = now
-			mutex.Unlock()
+				// generate a new key, rotating old ones
+				var err error
+				keysCopy, err = s.stekConfig.RotateSTEKs(keysCopy)
+				if err != nil {
+					// TODO: improve this handling
+					log.Printf("[ERROR] Generating STEK: %v", err)
+					return
+				}
 
-			// send the updated keys to the service
-			keysChan <- keysCopy
+				// replace keys slice with updated value and
+				// record the timestamp of rotation
+				mutex.Lock()
+				keys = keysCopy
+				lastRotation = now
+				mutex.Unlock()
 
-			// timer channel is already drained, so reset directly (see godoc)
-			s.timer.Reset(time.Duration(s.stekConfig.RotationInterval))
+				// send the updated keys to the service
+				select {
+				case keysChan <- keysCopy:
+				case <-doneChan:
+					return
+				}
+			}()
 
 		case <-doneChan:
 			// again, see godocs for why timer is stopped this way
