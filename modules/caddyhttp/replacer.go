@@ -63,19 +63,27 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 		if req != nil {
 			// query string parameters
 			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
-				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
+				param := key[len(reqURIQueryReplPrefix):]
+				queryVals, ok := req.Context().Value(parsedQueryCtxKey).(url.Values)
+				if !ok {
+					if req.URL != nil {
+						queryVals, _ = url.ParseQuery(req.URL.RawQuery)
+					}
+					*req = *req.WithContext(context.WithValue(req.Context(), parsedQueryCtxKey, queryVals))
+				}
+				vals := queryVals[param]
 				// always return true, since the query param might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return joinValues(vals), true
 			}
 
 			// request header fields
 			if strings.HasPrefix(key, reqHeaderReplPrefix) {
 				field := key[len(reqHeaderReplPrefix):]
-				vals := req.Header[textproto.CanonicalMIMEHeaderKey(field)]
+				vals := getHeader(req.Header, field)
 				// always return true, since the header field might
 				// be present only in some requests
-				return strings.Join(vals, ","), true
+				return joinValues(vals), true
 			}
 
 			// cookies
@@ -385,10 +393,10 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// response header fields
 			if strings.HasPrefix(key, respHeaderReplPrefix) {
 				field := key[len(respHeaderReplPrefix):]
-				vals := w.Header()[textproto.CanonicalMIMEHeaderKey(field)]
+				vals := getHeader(w.Header(), field)
 				// always return true, since the header field might
 				// be present only in some responses
-				return strings.Join(vals, ","), true
+				return joinValues(vals), true
 			}
 		}
 
@@ -586,14 +594,51 @@ func (rid *requestID) String() string {
 	return rid.value
 }
 
+func joinValues(vals []string) string {
+	switch len(vals) {
+	case 0:
+		return ""
+	case 1:
+		return vals[0]
+	default:
+		return strings.Join(vals, ",")
+	}
+}
+
+func getHeader(h http.Header, field string) []string {
+	if h == nil {
+		return nil
+	}
+	if vals, ok := h[field]; ok {
+		return vals
+	}
+	if len(field) <= 64 {
+		var buf [64]byte
+		upper := true
+		for i := 0; i < len(field); i++ {
+			c := field[i]
+			if upper && 'a' <= c && c <= 'z' {
+				c -= 'a' - 'A'
+			} else if !upper && 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			buf[i] = c
+			upper = c == '-'
+		}
+		return h[string(buf[:len(field)])]
+	}
+	return h[textproto.CanonicalMIMEHeaderKey(field)]
+}
+
 const (
-	reqCookieReplPrefix      = "http.request.cookie."
-	reqHeaderReplPrefix      = "http.request.header."
-	reqHostLabelsReplPrefix  = "http.request.host.labels."
-	reqTLSReplPrefix         = "http.request.tls."
-	reqURIPathReplPrefix     = "http.request.uri.path."
-	reqURIQueryReplPrefix    = "http.request.uri.query."
-	respHeaderReplPrefix     = "http.response.header."
-	varsReplPrefix           = "http.vars."
-	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
+	reqCookieReplPrefix                   = "http.request.cookie."
+	reqHeaderReplPrefix                   = "http.request.header."
+	reqHostLabelsReplPrefix               = "http.request.host.labels."
+	reqTLSReplPrefix                      = "http.request.tls."
+	reqURIPathReplPrefix                  = "http.request.uri.path."
+	reqURIQueryReplPrefix                 = "http.request.uri.query."
+	respHeaderReplPrefix                  = "http.response.header."
+	varsReplPrefix                        = "http.vars."
+	reqOrigURIPathReplPrefix              = "http.request.orig_uri.path."
+	parsedQueryCtxKey        caddy.CtxKey = "parsed_query"
 )
