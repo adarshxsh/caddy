@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -295,4 +296,143 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
 	}
+}
+
+var benchStringSink string
+
+func TestZeroAllocHeaderAndQueryLookups(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/foo?a=val1&b=val2&multi=1&multi=2", nil)
+	req.Header.Set("X-Single-Header", "single-val")
+	req.Header.Set("x-uncanonical-header", "uncanonical-val")
+	req.Header["X-Multi-Header"] = []string{"val1", "val2"}
+
+	longKey := "X-Long-Header-Key-That-Exceeds-Sixty-Four-Bytes-Length-For-Stack-Buffer-Testing"
+	req.Header.Set(longKey, "long-val")
+
+	res := httptest.NewRecorder()
+	res.Header().Set("X-Resp-Header", "resp-val")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	// Correctness assertions
+	tests := []struct {
+		key      string
+		expected string
+	}{
+		{"http.request.header.X-Single-Header", "single-val"},
+		{"http.request.header.x-single-header", "single-val"},
+		{"http.request.header.x-uncanonical-header", "uncanonical-val"},
+		{"http.request.header.X-Uncanonical-Header", "uncanonical-val"},
+		{"http.request.header." + longKey, "long-val"},
+		{"http.request.header.X-Missing-Header", ""},
+		{"http.request.header.X-Multi-Header", "val1,val2"},
+		{"http.response.header.X-Resp-Header", "resp-val"},
+		{"http.response.header.x-resp-header", "resp-val"},
+		{"http.response.header.X-Missing-Resp", ""},
+		{"http.request.uri.query.a", "val1"},
+		{"http.request.uri.query.b", "val2"},
+		{"http.request.uri.query.missing", ""},
+		{"http.request.uri.query.multi", "1,2"},
+	}
+
+	for _, tc := range tests {
+		val, ok := repl.GetString(tc.key)
+		if !ok {
+			t.Errorf("expected key %q to be recognized", tc.key)
+		}
+		if val != tc.expected {
+			t.Errorf("key %q: expected %q, got %q", tc.key, tc.expected, val)
+		}
+	}
+
+	// Prime query cache
+	_, _ = repl.GetString("http.request.uri.query.a")
+
+	// Verify getHeader zero allocations
+	allocs := testing.AllocsPerRun(100, func() {
+		vals := getHeader(req.Header, "X-Single-Header")
+		benchStringSink = vals[0]
+	})
+	if allocs > 0 {
+		t.Errorf("expected 0 allocs for exact canonical getHeader, got %f", allocs)
+	}
+
+	allocs = testing.AllocsPerRun(100, func() {
+		vals := getHeader(req.Header, "x-single-header")
+		benchStringSink = vals[0]
+	})
+	if allocs > 0 {
+		t.Errorf("expected 0 allocs for uncanonicalized getHeader, got %f", allocs)
+	}
+
+	allocs = testing.AllocsPerRun(100, func() {
+		vals := getHeader(res.Header(), "X-Resp-Header")
+		benchStringSink = vals[0]
+	})
+	if allocs > 0 {
+		t.Errorf("expected 0 allocs for response getHeader, got %f", allocs)
+	}
+
+	// Verify cached query parameter lookup zero allocations
+	allocs = testing.AllocsPerRun(100, func() {
+		queryVals := req.Context().Value(parsedQueryCtxKey).(url.Values)
+		vals := queryVals["b"]
+		benchStringSink = joinValues(vals)
+	})
+	if allocs > 0 {
+		t.Errorf("expected 0 allocs for cached query lookup, got %f", allocs)
+	}
+}
+
+func BenchmarkHeaderLookup(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("User-Agent", "Caddy/v2")
+	req.Header.Set("x-custom-header", "custom-value")
+	res := httptest.NewRecorder()
+	res.Header().Set("Content-Type", "text/html")
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	b.Run("ExactCanonical", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			s, _ := repl.GetString("http.request.header.User-Agent")
+			benchStringSink = s
+		}
+	})
+
+	b.Run("UncanonicalizedKey", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			s, _ := repl.GetString("http.request.header.user-agent")
+			benchStringSink = s
+		}
+	})
+
+	b.Run("ResponseHeader", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			s, _ := repl.GetString("http.response.header.Content-Type")
+			benchStringSink = s
+		}
+	})
+}
+
+func BenchmarkQueryLookup(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/test?foo=bar&baz=qux", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Warm up cache
+	_, _ = repl.GetString("http.request.uri.query.foo")
+
+	b.Run("CachedQueryLookup", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			s, _ := repl.GetString("http.request.uri.query.baz")
+			benchStringSink = s
+		}
+	})
 }
