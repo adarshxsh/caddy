@@ -296,3 +296,77 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestReplacerLazyMemoizationAndZeroAlloc(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/path?foo=bar", nil)
+	req.RemoteAddr = "192.168.1.50:12345"
+
+	origURL, _ := req.URL.Parse("/orig?baz=qux")
+	origReq := *req
+	origReq.URL = origURL
+	ctx := context.WithValue(req.Context(), OriginalRequestCtxKey, origReq)
+	req = req.WithContext(ctx)
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	placeholders := []struct {
+		key    string
+		expect string
+	}{
+		{key: "http.request.remote.host/24", expect: "192.168.1.0/24"},
+		{key: "http.request.uri.prefixed_query", expect: "?foo=bar"},
+		{key: "http.request.orig_uri.prefixed_query", expect: "?baz=qux"},
+	}
+
+	for _, ph := range placeholders {
+		// First lookup computes and caches value
+		val1, ok1 := repl.GetString(ph.key)
+		if !ok1 || val1 != ph.expect {
+			t.Errorf("First lookup for %s: expected %q, got %q (ok=%t)", ph.key, ph.expect, val1, ok1)
+		}
+
+		// Second lookup returns cached value
+		val2, ok2 := repl.GetString(ph.key)
+		if !ok2 || val2 != ph.expect {
+			t.Errorf("Second lookup for %s: expected %q, got %q (ok=%t)", ph.key, ph.expect, val2, ok2)
+		}
+
+		// Subsequent lookups must be 0 allocations
+		var sink string
+		allocs := testing.AllocsPerRun(10, func() {
+			sink, _ = repl.GetString(ph.key)
+		})
+		if sink != ph.expect {
+			t.Errorf("AllocsPerRun sink for %s: expected %q, got %q", ph.key, ph.expect, sink)
+		}
+		if allocs > 0 {
+			t.Errorf("Repeated lookup for %s allocated %f allocs/op, expected 0", ph.key, allocs)
+		}
+	}
+
+	// Test IPv6 dual prefix syntax
+	reqv6 := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqv6.RemoteAddr = "[2001:db8::1234]:54321"
+	replv6 := caddy.NewReplacer()
+	addHTTPVarsToReplacer(replv6, reqv6, nil)
+
+	phv6 := "http.request.remote.host/24,64"
+	expectv6 := "2001:db8::/64"
+
+	valv6_1, ok1 := replv6.GetString(phv6)
+	if !ok1 || valv6_1 != expectv6 {
+		t.Errorf("First IPv6 lookup: expected %q, got %q (ok=%t)", expectv6, valv6_1, ok1)
+	}
+
+	var sinkv6 string
+	allocsv6 := testing.AllocsPerRun(10, func() {
+		sinkv6, _ = replv6.GetString(phv6)
+	})
+	if sinkv6 != expectv6 {
+		t.Errorf("AllocsPerRun IPv6 sink: expected %q, got %q", expectv6, sinkv6)
+	}
+	if allocsv6 > 0 {
+		t.Errorf("Repeated IPv6 lookup for %s allocated %f allocs/op, expected 0", phv6, allocsv6)
+	}
+}
