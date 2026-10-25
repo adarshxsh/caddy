@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -295,4 +296,96 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
 	}
+}
+
+func TestAddHTTPVarsToReplacerZeroAllocations(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	w := httptest.NewRecorder()
+
+	// Warm up pool
+	pWarm := httpVarsPool.Get().(*httpVarsProvider)
+	httpVarsPool.Put(pWarm)
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, w)
+		repl.Recycle()
+	})
+
+	// NewReplacer allocates 5 objects (Replacer struct, static map, RWMutex, providers slice, static ReplacerFunc).
+	// addHTTPVarsToReplacer adds 0 allocations.
+	if allocs > 5 {
+		t.Errorf("Expected <= 5 allocations for NewReplacer + addHTTPVarsToReplacer, got %f", allocs)
+	}
+}
+
+func TestLazyRequestIDAllocation(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, ExtraLogFieldsCtxKey, new(ExtraLogFields))
+	ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]any))
+	req = req.WithContext(ctx)
+
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Before accessing uuid, "uuid" key should not exist in vars table
+	if v := GetVar(req.Context(), "uuid"); v != nil {
+		t.Fatalf("Expected uuid var to be nil before evaluation, got %v", v)
+	}
+
+	// Access http.request.uuid
+	uuidVal, ok := repl.GetString("http.request.uuid")
+	if !ok || uuidVal == "" {
+		t.Fatalf("Expected valid uuid on evaluation, got ok=%t val=%q", ok, uuidVal)
+	}
+
+	// After accessing, "uuid" key should exist and match
+	if v := GetVar(req.Context(), "uuid"); v == nil {
+		t.Fatalf("Expected uuid var to be set after evaluation, got nil")
+	} else if id, ok := v.(*requestID); !ok || id.String() != uuidVal {
+		t.Fatalf("Expected uuid var string to match %q, got %v", uuidVal, id)
+	}
+
+	// Second evaluation returns same cached UUID
+	uuidVal2, _ := repl.GetString("http.request.uuid")
+	if uuidVal2 != uuidVal {
+		t.Fatalf("Expected cached uuid %q, got %q", uuidVal, uuidVal2)
+	}
+}
+
+func TestHTTPVarsProviderConcurrentPoolSafety(t *testing.T) {
+	const goroutines = 10
+	const iterations = 100
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				req := httptest.NewRequest(http.MethodGet, "/foo?bar=baz", nil)
+				w := httptest.NewRecorder()
+				repl := caddy.NewReplacer()
+				ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+				ctx = context.WithValue(ctx, ExtraLogFieldsCtxKey, new(ExtraLogFields))
+				ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]any))
+				req = req.WithContext(ctx)
+
+				addHTTPVarsToReplacer(repl, req, w)
+
+				if val, ok := repl.GetString("http.request.method"); !ok || val != "GET" {
+					t.Errorf("Concurrent test failed method check: %s", val)
+				}
+				if val, ok := repl.GetString("http.request.uri.query"); !ok || val != "bar=baz" {
+					t.Errorf("Concurrent test failed query check: %s", val)
+				}
+				if i%2 == 0 {
+					repl.GetString("http.request.uuid")
+				}
+				repl.Recycle()
+			}
+		}()
+	}
+	wg.Wait()
 }
