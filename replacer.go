@@ -351,25 +351,101 @@ type replacementProvider interface {
 // reading a file from disk and replacing with its contents.
 type fileReplacementProvider struct{}
 
+type fileCacheEntry struct {
+	modTime time.Time
+	content string
+}
+
+type fileCacheStore struct {
+	mu    sync.RWMutex
+	items map[string]fileCacheEntry
+}
+
+func (c *fileCacheStore) get(filename string) (fileCacheEntry, bool) {
+	c.mu.RLock()
+	entry, ok := c.items[filename]
+	c.mu.RUnlock()
+	return entry, ok
+}
+
+func (c *fileCacheStore) set(filename string, modTime time.Time, content string) {
+	c.mu.Lock()
+	if c.items == nil {
+		c.items = make(map[string]fileCacheEntry)
+	}
+	c.items[filename] = fileCacheEntry{
+		modTime: modTime,
+		content: content,
+	}
+	c.mu.Unlock()
+}
+
+func (c *fileCacheStore) delete(filename string) {
+	c.mu.Lock()
+	if c.items != nil {
+		delete(c.items, filename)
+	}
+	c.mu.Unlock()
+}
+
+var fileCache = fileCacheStore{
+	items: make(map[string]fileCacheEntry),
+}
+
+var fileBufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
 func (f fileReplacementProvider) replace(key string) (any, bool) {
 	if !strings.HasPrefix(key, filePrefix) {
 		return nil, false
 	}
 
 	filename := key[len(filePrefix):]
-	maxSize := 1024 * 1024
-	body, err := readFileIntoBuffer(filename, maxSize)
+
+	info, err := os.Stat(filename)
 	if err != nil {
-		wd, _ := os.Getwd()
+		fileCache.delete(filename)
 		Log().Error("placeholder: failed to read file",
 			zap.String("file", filename),
 			zap.String("working_dir", wd),
 			zap.Error(err))
 		return nil, true
 	}
+
+	modTime := info.ModTime()
+	if entry, ok := fileCache.get(filename); ok && entry.modTime.Equal(modTime) {
+		return entry.content, true
+	}
+
+	maxSize := 1024 * 1024
+	buf := fileBufPool.Get().(*bytes.Buffer)
+	defer func() {
+		if buf.Cap() <= maxSize {
+			fileBufPool.Put(buf)
+		}
+	}()
+
+	err = readFileIntoBuffer(filename, maxSize, buf)
+	if err != nil {
+		fileCache.delete(filename)
+		Log().Error("placeholder: failed to read file",
+			zap.String("file", filename),
+			zap.String("working_dir", wd),
+			zap.Error(err))
+		return nil, true
+	}
+
+	body := buf.Bytes()
 	body = bytes.TrimSuffix(body, []byte("\n"))
 	body = bytes.TrimSuffix(body, []byte("\r"))
-	return string(body), true
+	content := string(body)
+
+	fileCache.set(filename, modTime, content)
+
+	return content, true
 }
 
 // globalDefaultReplacementProvider handles replacements
@@ -394,8 +470,6 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	case "system.os":
 		return runtime.GOOS, true
 	case "system.wd":
-		// OK if there is an error; just return empty string
-		wd, _ := os.Getwd()
 		return wd, true
 	case "system.arch":
 		return runtime.GOARCH, true
@@ -420,17 +494,16 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 }
 
 // readFileIntoBuffer reads the file at filePath into a size limited buffer.
-func readFileIntoBuffer(filename string, size int) ([]byte, error) {
+func readFileIntoBuffer(filename string, size int, buf *bytes.Buffer) error {
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer file.Close()
 
-	// io.LimitReader ensures we never read more than 'size' bytes.
-	// io.ReadAll starts with a small buffer and grows it as needed,
-	// preventing a massive 1MB allocation for small files.
-	return io.ReadAll(io.LimitReader(file, int64(size)))
+	buf.Reset()
+	_, err = buf.ReadFrom(io.LimitReader(file, int64(size)))
+	return err
 }
 
 // ReplacementFunc is a function that is called when a
