@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -372,10 +373,79 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 	return string(body), true
 }
 
+type timeSecCache struct {
+	sec       int64
+	offset    int
+	http      any
+	commonLog any
+	year      any
+	unix      any
+}
+
+type timeMsCache struct {
+	ms     int64
+	unixMs any
+}
+
+var (
+	timeSecCacheAtomic atomic.Pointer[timeSecCache]
+	timeMsCacheAtomic  atomic.Pointer[timeMsCache]
+)
+
 // globalDefaultReplacementProvider handles replacements
 // that can be used in any context, such as system variables,
 // time, or environment variables.
 type globalDefaultReplacementProvider struct{}
+
+func (f globalDefaultReplacementProvider) getSecTime(key string) (any, bool) {
+	now := nowFunc()
+	sec := now.Unix()
+	_, offset := now.Zone()
+
+	snap := timeSecCacheAtomic.Load()
+	if snap == nil || snap.sec != sec || snap.offset != offset {
+		// According to the comment for http.TimeFormat, the timezone must be in UTC
+		// to generate the correct format.
+		// https://github.com/caddyserver/caddy/issues/5773
+		snap = &timeSecCache{
+			sec:       sec,
+			offset:    offset,
+			http:      now.UTC().Format(http.TimeFormat),
+			commonLog: now.Format("02/Jan/2006:15:04:05 -0700"),
+			year:      strconv.Itoa(now.Year()),
+			unix:      strconv.FormatInt(sec, 10),
+		}
+		timeSecCacheAtomic.Store(snap)
+	}
+
+	switch key {
+	case "time.now.http":
+		return snap.http, true
+	case "time.now.common_log":
+		return snap.commonLog, true
+	case "time.now.year":
+		return snap.year, true
+	case "time.now.unix":
+		return snap.unix, true
+	default:
+		return nil, false
+	}
+}
+
+func (f globalDefaultReplacementProvider) getMsTime() any {
+	now := nowFunc()
+	ms := now.UnixNano() / int64(time.Millisecond)
+
+	snap := timeMsCacheAtomic.Load()
+	if snap == nil || snap.ms != ms {
+		snap = &timeMsCache{
+			ms:     ms,
+			unixMs: strconv.FormatInt(ms, 10),
+		}
+		timeMsCacheAtomic.Store(snap)
+	}
+	return snap.unixMs
+}
 
 func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	// check environment variable
@@ -401,19 +471,10 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 		return runtime.GOARCH, true
 	case "time.now":
 		return nowFunc(), true
-	case "time.now.http":
-		// According to the comment for http.TimeFormat, the timezone must be in UTC
-		// to generate the correct format.
-		// https://github.com/caddyserver/caddy/issues/5773
-		return nowFunc().UTC().Format(http.TimeFormat), true
-	case "time.now.common_log":
-		return nowFunc().Format("02/Jan/2006:15:04:05 -0700"), true
-	case "time.now.year":
-		return strconv.Itoa(nowFunc().Year()), true
-	case "time.now.unix":
-		return strconv.FormatInt(nowFunc().Unix(), 10), true
+	case "time.now.http", "time.now.common_log", "time.now.year", "time.now.unix":
+		return f.getSecTime(key)
 	case "time.now.unix_ms":
-		return strconv.FormatInt(nowFunc().UnixNano()/int64(time.Millisecond), 10), true
+		return f.getMsTime(), true
 	}
 
 	return nil, false
