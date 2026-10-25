@@ -219,21 +219,43 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		timeoutc = timer.C
 	}
 
-	// when a stream timeout is encountered, no error will be read from errc
-	// a buffer size of 2 will allow both the read and write goroutines to send the error and exit
+	// a buffer size of 2 will allow both the read and write goroutines to send the result and exit
 	// see: https://github.com/caddyserver/caddy/issues/7418
-	errc := make(chan error, 2)
+	resCh := make(chan streamResult, 2)
 	wg.Add(2)
-	go spc.copyToBackend(errc)
-	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
-		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+	go spc.copyToBackend(resCh)
+	go spc.copyFromBackend(resCh)
+
+	completed := 0
+	for completed < 2 {
+		select {
+		case res := <-resCh:
+			if res.err != nil {
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(res.err))
+				}
+				return
+			}
+			if res.fromBackend {
+				if cw, ok := conn.(closeWriter); ok {
+					_ = cw.CloseWrite()
+				}
+			} else {
+				if cw, ok := backConn.(closeWriter); ok {
+					_ = cw.CloseWrite()
+				}
+			}
+			completed++
+		case <-req.Context().Done():
+			if c := logger.Check(zapcore.DebugLevel, "request context canceled"); c != nil {
+				c.Write(zap.Error(req.Context().Err()))
+			}
+			return
+		case time := <-timeoutc:
+			if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", time))
+			}
+			return
 		}
 	}
 }
@@ -644,15 +666,24 @@ type switchProtocolCopier struct {
 	bufferSize    int
 }
 
-func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
+type streamResult struct {
+	fromBackend bool
+	err         error
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+func (c switchProtocolCopier) copyFromBackend(resCh chan<- streamResult) {
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
-	errc <- err
+	resCh <- streamResult{fromBackend: true, err: err}
 	c.wg.Done()
 }
 
-func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
+func (c switchProtocolCopier) copyToBackend(resCh chan<- streamResult) {
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
-	errc <- err
+	resCh <- streamResult{fromBackend: false, err: err}
 	c.wg.Done()
 }
 
