@@ -143,22 +143,37 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 	}
 
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			if conn != nil {
+				conn.Close()
+			}
+			if backConn != nil {
+				backConn.Close()
+			}
+		})
+	}
+
 	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
 	backConnCloseCh := make(chan struct{})
 	go func() {
-		// Ensure that the cancellation of a request closes the backend.
+		// Ensure that the cancellation of a request closes both client and backend connections.
 		// See issue https://golang.org/issue/35559.
 		select {
 		case <-req.Context().Done():
+			closeBoth()
 		case <-backConnCloseCh:
 		}
-		backConn.Close()
 	}()
-	defer close(backConnCloseCh)
+	defer func() {
+		close(backConnCloseCh)
+		closeBoth()
+	}()
 
 	start := time.Now()
 	defer func() {
-		conn.Close()
+		closeBoth()
 		if c := logger.Check(zapcore.DebugLevel, "connection closed"); c != nil {
 			c.Write(zap.Duration("duration", time.Since(start)))
 		}
@@ -209,6 +224,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		backend:    backConn,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
+		closeBoth:  closeBoth,
 	}
 
 	// setup the timeout if requested
@@ -381,6 +397,9 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 // The caller should call the returned delete() function when the
 // connection is done to remove it from memory.
 func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (del func()) {
+	if h.connectionsMu == nil {
+		return func() {}
+	}
 	h.connectionsMu.Lock()
 	h.connections[conn] = openConnection{conn, gracefulClose}
 	h.connectionsMu.Unlock()
@@ -642,18 +661,29 @@ type switchProtocolCopier struct {
 	user, backend io.ReadWriteCloser
 	wg            *sync.WaitGroup
 	bufferSize    int
+	closeBoth     func()
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
+	defer func() {
+		if c.closeBoth != nil {
+			c.closeBoth()
+		}
+		c.wg.Done()
+	}()
 	_, err := io.CopyBuffer(c.user, c.backend, c.buffer())
 	errc <- err
-	c.wg.Done()
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
+	defer func() {
+		if c.closeBoth != nil {
+			c.closeBoth()
+		}
+		c.wg.Done()
+	}()
 	_, err := io.CopyBuffer(c.backend, c.user, c.buffer())
 	errc <- err
-	c.wg.Done()
 }
 
 func (c switchProtocolCopier) buffer() []byte {
