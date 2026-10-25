@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -481,6 +482,57 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 		} else if !tc.notFound {
 			t.Errorf("Expected key '%s' to be recognized", tc.variable)
 		}
+	}
+}
+
+func TestFileReplacementProviderCacheAndPool(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "secret.txt")
+
+	if err := os.WriteFile(filePath, []byte("secret123\n"), 0600); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	repl := NewReplacer()
+	key := "file." + filePath
+
+	// 1. Initial lookup (cache miss -> read disk)
+	val1 := repl.ReplaceAll("{"+key+"}", "")
+	if val1 != "secret123" {
+		t.Fatalf("Expected 'secret123', got '%s'", val1)
+	}
+
+	// 2. Second lookup (cache hit)
+	val2 := repl.ReplaceAll("{"+key+"}", "")
+	if val2 != "secret123" {
+		t.Fatalf("Expected 'secret123', got '%s'", val2)
+	}
+
+	// 3. Test zero allocations on direct cache store lookup
+	cacheAllocs := testing.AllocsPerRun(50, func() {
+		_, _ = fileCache.get(filePath)
+	})
+	if cacheAllocs > 0 {
+		t.Errorf("Expected 0 allocations on fileCache.get, got %f", cacheAllocs)
+	}
+
+	// 4. Update file on disk with new modTime
+	time.Sleep(10 * time.Millisecond) // ensure modTime changes
+	if err := os.WriteFile(filePath, []byte("newsecret456\n"), 0600); err != nil {
+		t.Fatalf("Failed to update test file: %v", err)
+	}
+
+	// 5. Lookup after file update (cache invalidation -> re-read disk)
+	val3 := repl.ReplaceAll("{"+key+"}", "")
+	if val3 != "newsecret456" {
+		t.Fatalf("Expected 'newsecret456', got '%s'", val3)
+	}
+
+	// 6. Test failed file read
+	badKey := "file." + filepath.Join(tmpDir, "nonexistent.txt")
+	val4 := repl.ReplaceAll("{"+badKey+"}", "EMPTY")
+	if val4 != "EMPTY" {
+		t.Fatalf("Expected 'EMPTY' on failed file read, got '%s'", val4)
 	}
 }
 
