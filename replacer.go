@@ -36,11 +36,10 @@ func NewReplacer() *Replacer {
 		static:   make(map[string]any),
 		mapMutex: &sync.RWMutex{},
 	}
-	rep.providers = []replacementProvider{
-		globalDefaultReplacementProvider{},
-		fileReplacementProvider{},
-		ReplacerFunc(rep.fromStatic),
-	}
+	rep.providers = make([]ReplacementProvider, 3, 8)
+	rep.providers[0] = globalDefaultReplacementProvider{}
+	rep.providers[1] = fileReplacementProvider{}
+	rep.providers[2] = ReplacerFunc(rep.fromStatic)
 	return rep
 }
 
@@ -51,7 +50,7 @@ func NewEmptyReplacer() *Replacer {
 		static:   make(map[string]any),
 		mapMutex: &sync.RWMutex{},
 	}
-	rep.providers = []replacementProvider{
+	rep.providers = []ReplacementProvider{
 		ReplacerFunc(rep.fromStatic),
 	}
 	return rep
@@ -61,7 +60,7 @@ func NewEmptyReplacer() *Replacer {
 // A default/empty Replacer is not valid;
 // use NewReplacer to make one.
 type Replacer struct {
-	providers []replacementProvider
+	providers []ReplacementProvider
 	static    map[string]any
 	mapMutex  *sync.RWMutex
 }
@@ -88,6 +87,26 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 	r.providers = append(r.providers, mapFunc)
 }
 
+// MapProvider adds a ReplacementProvider to the list of value providers.
+func (r *Replacer) MapProvider(provider ReplacementProvider) {
+	r.providers = append(r.providers, provider)
+}
+
+// ProviderRecycler is an optional interface implemented by replacement
+// providers that can be recycled back to a pool after use.
+type ProviderRecycler interface {
+	Recycle()
+}
+
+// Recycle recycles any providers in the replacer that implement ProviderRecycler.
+func (r *Replacer) Recycle() {
+	for _, p := range r.providers {
+		if pr, ok := p.(ProviderRecycler); ok {
+			pr.Recycle()
+		}
+	}
+}
+
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
@@ -99,7 +118,7 @@ func (r *Replacer) Set(variable string, value any) {
 // the value and whether the variable was known.
 func (r *Replacer) Get(variable string) (any, bool) {
 	for _, mapFunc := range r.providers {
-		if val, ok := mapFunc.replace(variable); ok {
+		if val, ok := mapFunc.Replace(variable); ok {
 			return val, true
 		}
 	}
@@ -336,22 +355,28 @@ func ToString(val any) string {
 // not recognize the key, false should be returned.
 type ReplacerFunc func(key string) (any, bool)
 
+func (f ReplacerFunc) Replace(key string) (any, bool) {
+	return f(key)
+}
+
 func (f ReplacerFunc) replace(key string) (any, bool) {
 	return f(key)
 }
 
-// replacementProvider is a type that can provide replacements
+// ReplacementProvider is a type that can provide replacements
 // for placeholders. Allows for type assertion to determine
 // which type of provider it is.
-type replacementProvider interface {
-	replace(key string) (any, bool)
+type ReplacementProvider interface {
+	Replace(key string) (any, bool)
 }
+
+type replacementProvider = ReplacementProvider
 
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
 type fileReplacementProvider struct{}
 
-func (f fileReplacementProvider) replace(key string) (any, bool) {
+func (f fileReplacementProvider) Replace(key string) (any, bool) {
 	if !strings.HasPrefix(key, filePrefix) {
 		return nil, false
 	}
@@ -372,12 +397,16 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 	return string(body), true
 }
 
+func (f fileReplacementProvider) replace(key string) (any, bool) {
+	return f.Replace(key)
+}
+
 // globalDefaultReplacementProvider handles replacements
 // that can be used in any context, such as system variables,
 // time, or environment variables.
 type globalDefaultReplacementProvider struct{}
 
-func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
+func (f globalDefaultReplacementProvider) Replace(key string) (any, bool) {
 	// check environment variable
 	const envPrefix = "env."
 	if strings.HasPrefix(key, envPrefix) {
@@ -417,6 +446,10 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	}
 
 	return nil, false
+}
+
+func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
+	return f.Replace(key)
 }
 
 // readFileIntoBuffer reads the file at filePath into a size limited buffer.

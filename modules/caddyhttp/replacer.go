@@ -36,6 +36,8 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -55,12 +57,54 @@ func NewTestReplacer(req *http.Request) *caddy.Replacer {
 	return repl
 }
 
-func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.ResponseWriter) {
-	SetVar(req.Context(), "start_time", time.Now())
-	SetVar(req.Context(), "uuid", new(requestID))
+type httpVarsProvider struct {
+	req       *http.Request
+	w         http.ResponseWriter
+	startTime time.Time
+	done      atomic.Bool
+}
 
-	httpVars := func(key string) (any, bool) {
-		if req != nil {
+var httpVarsPool = sync.Pool{
+	New: func() any {
+		return new(httpVarsProvider)
+	},
+}
+
+func (p *httpVarsProvider) reset() {
+	p.req = nil
+	p.w = nil
+	p.startTime = time.Time{}
+	p.done.Store(false)
+}
+
+func (p *httpVarsProvider) Recycle() {
+	if p.done.CompareAndSwap(false, true) {
+		p.reset()
+		httpVarsPool.Put(p)
+	}
+}
+
+func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.ResponseWriter) {
+	p := httpVarsPool.Get().(*httpVarsProvider)
+	p.reset()
+	p.req = req
+	p.w = w
+	if req != nil {
+		p.startTime = time.Now()
+	}
+
+	repl.MapProvider(p)
+}
+
+func (p *httpVarsProvider) replace(key string) (any, bool) {
+	return p.Replace(key)
+}
+
+func (p *httpVarsProvider) Replace(key string) (any, bool) {
+	req := p.req
+	w := p.w
+
+	if req != nil {
 			// query string parameters
 			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
 				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
@@ -206,19 +250,36 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				}
 				return "?" + req.URL.RawQuery, true
 			case "http.request.duration":
-				start := GetVar(req.Context(), "start_time").(time.Time)
+				start := p.startTime
+				if start.IsZero() && req != nil {
+					if v, ok := GetVar(req.Context(), "start_time").(time.Time); ok {
+						start = v
+					}
+				}
 				return time.Since(start), true
 			case "http.request.duration_ms":
-				start := GetVar(req.Context(), "start_time").(time.Time)
+				start := p.startTime
+				if start.IsZero() && req != nil {
+					if v, ok := GetVar(req.Context(), "start_time").(time.Time); ok {
+						start = v
+					}
+				}
 				return time.Since(start).Seconds() * 1e3, true // multiply seconds to preserve decimal (see #4666)
 
 			case "http.request.uuid":
-				// fetch the UUID for this request
-				id := GetVar(req.Context(), "uuid").(*requestID)
+				// fetch or lazily create the UUID for this request
+				var id *requestID
+				if v := GetVar(req.Context(), "uuid"); v != nil {
+					id = v.(*requestID)
+				} else {
+					id = new(requestID)
+					SetVar(req.Context(), "uuid", id)
+				}
 
 				// set it to this request's access log
-				extra := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields)
-				extra.Set(zap.String("uuid", id.String()))
+				if extra, ok := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields); ok && extra != nil {
+					extra.Set(zap.String("uuid", id.String()))
+				}
 
 				return id.String(), true
 
@@ -374,6 +435,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			// middleware variables
 			if strings.HasPrefix(key, varsReplPrefix) {
 				varName := key[len(varsReplPrefix):]
+				if varName == "start_time" {
+					return p.startTime, true
+				}
 				raw := GetVar(req.Context(), varName)
 				// variables can be dynamic, so always return true
 				// even when it may not be set; treat as empty then
@@ -406,9 +470,6 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 		}
 
 		return nil, false
-	}
-
-	repl.Map(httpVars)
 }
 
 func getReqTLSReplacement(req *http.Request, key string) (any, bool) {

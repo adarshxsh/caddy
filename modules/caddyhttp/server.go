@@ -343,6 +343,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// prepare internals of the request for the handler pipeline
 	repl := caddy.NewReplacer()
+	defer repl.Recycle()
 	r = PrepareRequest(r, repl, w, s)
 
 	// clone the request for logging purposes before it enters any handler chain;
