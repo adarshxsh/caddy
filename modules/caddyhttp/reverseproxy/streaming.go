@@ -191,6 +191,9 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	// We need to make sure the client connection messages (i.e. to upstream)
 	// are masked, so we need to know whether the connection is considered the
 	// server or the client side of the proxy.
+	conn = newSyncReadWriteCloser(conn)
+	backConn = newSyncReadWriteCloser(backConn)
+
 	gracefulClose := func(conn io.ReadWriteCloser, isClient bool) func() error {
 		if isWebsocket(req) {
 			return func() error {
@@ -381,6 +384,7 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *za
 // The caller should call the returned delete() function when the
 // connection is done to remove it from memory.
 func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error) (del func()) {
+	conn = newSyncReadWriteCloser(conn)
 	h.connectionsMu.Lock()
 	h.connections[conn] = openConnection{conn, gracefulClose}
 	h.connectionsMu.Unlock()
@@ -397,6 +401,30 @@ func (h *Handler) registerConnection(conn io.ReadWriteCloser, gracefulClose func
 		}
 		h.connectionsMu.Unlock()
 	}
+}
+
+// syncReadWriteCloser wraps an io.ReadWriteCloser with a mutex lock on Write
+// operations to make sure concurrent writes (such as WebSocket close control frames
+// and proxy payload copies) do not interleave or race.
+type syncReadWriteCloser struct {
+	io.ReadWriteCloser
+	writeMu sync.Mutex
+}
+
+func (s *syncReadWriteCloser) Write(p []byte) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.ReadWriteCloser.Write(p)
+}
+
+func newSyncReadWriteCloser(rwc io.ReadWriteCloser) io.ReadWriteCloser {
+	if rwc == nil {
+		return nil
+	}
+	if _, ok := rwc.(*syncReadWriteCloser); ok {
+		return rwc
+	}
+	return &syncReadWriteCloser{ReadWriteCloser: rwc}
 }
 
 // closeConnections immediately closes all hijacked connections (both to client and backend).
