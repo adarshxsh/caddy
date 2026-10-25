@@ -28,6 +28,7 @@ import (
 	"mime"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -199,16 +200,97 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 		}
 		return nil
 	}
-	deleteFrontConn := h.registerConnection(conn, gracefulClose(conn, false))
-	deleteBackConn := h.registerConnection(backConn, gracefulClose(backConn, true))
+
+	lockedConn := newLockedReadWriteCloser(conn)
+	lockedBackConn := newLockedReadWriteCloser(backConn)
+
+	var (
+		lastUserActivity atomic.Int64
+		lastBackActivity atomic.Int64
+	)
+	nowNano := time.Now().UnixNano()
+	lastUserActivity.Store(nowNano)
+	lastBackActivity.Store(nowNano)
+
+	userRWC := &activityRWC{
+		ReadWriteCloser: lockedConn,
+		onRead: func() {
+			lastUserActivity.Store(time.Now().UnixNano())
+		},
+	}
+	backRWC := &activityRWC{
+		ReadWriteCloser: lockedBackConn,
+		onRead: func() {
+			lastBackActivity.Store(time.Now().UnixNano())
+		},
+	}
+
+	deleteFrontConn := h.registerConnection(lockedConn, gracefulClose(lockedConn, false))
+	deleteBackConn := h.registerConnection(lockedBackConn, gracefulClose(lockedBackConn, true))
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
+		user:       userRWC,
+		backend:    backRWC,
 		wg:         wg,
 		bufferSize: h.StreamBufferSize,
+	}
+
+	if isWebsocket(req) && h.WebSocketPingInterval > 0 {
+		pingInterval := time.Duration(h.WebSocketPingInterval)
+		pingDone := make(chan struct{})
+		defer close(pingDone)
+
+		go func() {
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-pingDone:
+					return
+				case <-ticker.C:
+					// Send Ping control frame to client (unmasked, isClient = false)
+					if err := writePingControl(lockedConn, false, nil); err != nil {
+						if c := logger.Check(zapcore.DebugLevel, "websocket ping client error"); c != nil {
+							c.Write(zap.Error(err))
+						}
+						lockedConn.Close()
+						lockedBackConn.Close()
+						return
+					}
+
+					// Send Ping control frame to backend (masked, isClient = true)
+					if err := writePingControl(lockedBackConn, true, nil); err != nil {
+						if c := logger.Check(zapcore.DebugLevel, "websocket ping backend error"); c != nil {
+							c.Write(zap.Error(err))
+						}
+						lockedConn.Close()
+						lockedBackConn.Close()
+						return
+					}
+
+					deadline := pingInterval + pingInterval/2
+					now := time.Now()
+					lastUser := time.Unix(0, lastUserActivity.Load())
+					lastBack := time.Unix(0, lastBackActivity.Load())
+
+					if now.Sub(lastUser) >= deadline || now.Sub(lastBack) >= deadline {
+						if c := logger.Check(zapcore.DebugLevel, "websocket connection idle deadline exceeded"); c != nil {
+							c.Write(
+								zap.Duration("user_idle", now.Sub(lastUser)),
+								zap.Duration("backend_idle", now.Sub(lastBack)),
+								zap.Duration("deadline", deadline),
+							)
+						}
+						lockedConn.Close()
+						lockedBackConn.Close()
+						return
+					}
+				}
+			}
+		}()
 	}
 
 	// setup the timeout if requested
@@ -508,6 +590,84 @@ func writeCloseControl(conn io.Writer, isClient bool) error {
 	// TODO: we might need to ensure we are the exclusive writer by this point (io.Copy is stopped)?
 	_, err := conn.Write(buf[:msgLength])
 	return err
+}
+
+// writePingControl sends a best-effort Ping control message to the given WebSocket connection.
+func writePingControl(conn io.Writer, isClient bool, payload []byte) error {
+	if len(payload) > 125 {
+		payload = payload[:125]
+	}
+
+	const pingMessage = 9
+	const finalBit = 1 << 7
+	const maskBit = 1 << 7
+
+	b0 := byte(pingMessage) | finalBit
+	b1 := byte(len(payload))
+	if isClient {
+		b1 |= maskBit
+	}
+
+	buf := make([]byte, 0, 127)
+	buf = append(buf, b0, b1)
+
+	if isClient {
+		key := newMaskKey()
+		buf = append(buf, key[:]...)
+		pStart := len(buf)
+		buf = append(buf, payload...)
+		maskBytes(key, 0, buf[pStart:])
+	} else {
+		buf = append(buf, payload...)
+	}
+
+	_, err := conn.Write(buf)
+	return err
+}
+
+type lockedReadWriteCloser struct {
+	io.ReadWriteCloser
+	writeMu sync.Mutex
+}
+
+func newLockedReadWriteCloser(rwc io.ReadWriteCloser) *lockedReadWriteCloser {
+	if l, ok := rwc.(*lockedReadWriteCloser); ok {
+		return l
+	}
+	return &lockedReadWriteCloser{ReadWriteCloser: rwc}
+}
+
+func (l *lockedReadWriteCloser) Write(p []byte) (int, error) {
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
+	return l.ReadWriteCloser.Write(p)
+}
+
+func (l *lockedReadWriteCloser) CloseWrite() error {
+	if cw, ok := l.ReadWriteCloser.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	onRead func()
+}
+
+func (a *activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 && a.onRead != nil {
+		a.onRead()
+	}
+	return n, err
+}
+
+func (a *activityRWC) CloseWrite() error {
+	if cw, ok := a.ReadWriteCloser.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 // Copied from https://github.com/gorilla/websocket/blob/v1.5.0/mask.go

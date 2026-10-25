@@ -186,6 +186,11 @@ type Handler struct {
 	// by the previous config closing. Default: no delay.
 	StreamCloseDelay caddy.Duration `json:"stream_close_delay,omitempty"`
 
+	// If nonzero, periodic WebSocket ping control frames will be sent at this
+	// interval to keep upgraded WebSocket connections active and detect
+	// dead peers.
+	WebSocketPingInterval caddy.Duration `json:"websocket_ping_interval,omitempty"`
+
 	// If configured, rewrites the copy of the upstream request.
 	// Allows changing the request method and URI (path and query).
 	// Since the rewrite is applied to the copy, it does not persist
@@ -273,6 +278,10 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	// warn about unsafe buffering config
 	if h.RequestBuffers == -1 || h.ResponseBuffers == -1 {
 		h.logger.Warn("UNLIMITED BUFFERING: buffering is enabled without any cap on buffer size, which can result in OOM crashes")
+	}
+
+	if h.WebSocketPingInterval < 0 {
+		return fmt.Errorf("websocket_ping_interval cannot be negative")
 	}
 
 	// start by loading modules
