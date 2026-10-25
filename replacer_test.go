@@ -484,7 +484,38 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	// Assert zero allocations for no-placeholder replacement path
+	allocsNoPlaceholder := testing.AllocsPerRun(100, func() {
+		_ = rep.ReplaceAll("simple string without placeholders", "")
+	})
+	if allocsNoPlaceholder != 0 {
+		t.Errorf("expected 0 allocations for no-placeholder replacement, got %f", allocsNoPlaceholder)
+	}
+
+	// Assert zero allocations for static variable lookups
+	allocsStaticGet := testing.AllocsPerRun(100, func() {
+		_, _ = rep.Get("str")
+	})
+	if allocsStaticGet != 0 {
+		t.Errorf("expected 0 allocations for static Get, got %f", allocsStaticGet)
+	}
+
+	allocsStaticGetString := testing.AllocsPerRun(100, func() {
+		_, _ = rep.GetString("str")
+	})
+	if allocsStaticGetString != 0 {
+		t.Errorf("expected 0 allocations for static GetString, got %f", allocsStaticGetString)
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
+	b.ReportAllocs()
+
 	type testCase struct {
 		name, input, empty string
 	}
@@ -514,13 +545,41 @@ func BenchmarkReplacer(b *testing.B) {
 			name:  "escaped placeholder",
 			input: `\{"json": \{"nested": "{bar}"\}\}`,
 		},
+		{
+			name:  "multi-placeholder",
+			input: `str={str} int={int} str2={str}`,
+		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
 	}
+
+	b.Run("concurrent access", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				rep.ReplaceAll(`str={str} int={int}`, "")
+			}
+		})
+	})
+
+	b.Run("instantiation NewReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = NewReplacer()
+		}
+	})
+
+	b.Run("instantiation NewEmptyReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = NewEmptyReplacer()
+		}
+	})
 }
 
 func testReplacer() Replacer {

@@ -296,3 +296,85 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPReplacerAllocations(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	// Assert 0 allocations for no-placeholder string replacement
+	allocsNoPlaceholder := testing.AllocsPerRun(100, func() {
+		_ = repl.ReplaceAll("no placeholder string", "")
+	})
+	if allocsNoPlaceholder != 0 {
+		t.Errorf("expected 0 allocations for no-placeholder string, got %f", allocsNoPlaceholder)
+	}
+
+	// Assert 0 allocations for static variable lookups
+	repl.Set("static_key", "static_val")
+	allocsStaticGet := testing.AllocsPerRun(100, func() {
+		_, _ = repl.Get("static_key")
+	})
+	if allocsStaticGet != 0 {
+		t.Errorf("expected 0 allocations for static Get, got %f", allocsStaticGet)
+	}
+
+	allocsStaticGetString := testing.AllocsPerRun(100, func() {
+		_, _ = repl.GetString("static_key")
+	})
+	if allocsStaticGetString != 0 {
+		t.Errorf("expected 0 allocations for static GetString, got %f", allocsStaticGetString)
+	}
+}
+
+func BenchmarkHTTPReplacer(b *testing.B) {
+	b.ReportAllocs()
+
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+
+	b.Run("setup addHTTPVarsToReplacer", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			repl := caddy.NewReplacer()
+			addHTTPVarsToReplacer(repl, req, nil)
+		}
+	})
+
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	placeholders := []struct {
+		name  string
+		input string
+	}{
+		{name: "http.request.method", input: "{http.request.method}"},
+		{name: "http.request.host", input: "{http.request.host}"},
+		{name: "http.request.uri.path", input: "{http.request.uri.path}"},
+		{name: "http.request.remote.host", input: "{http.request.remote.host}"},
+		{name: "http.request.uri", input: "{http.request.uri}"},
+		{name: "multi-placeholder", input: "{http.request.method} {http.request.host}{http.request.uri.path}"},
+	}
+
+	for _, ph := range placeholders {
+		b.Run(ph.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				repl.ReplaceAll(ph.input, "")
+			}
+		})
+	}
+
+	b.Run("concurrent access", func(b *testing.B) {
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				repl.ReplaceAll("{http.request.method} {http.request.host}{http.request.uri.path}", "")
+			}
+		})
+	})
+}
