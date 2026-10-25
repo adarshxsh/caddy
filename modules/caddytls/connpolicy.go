@@ -170,9 +170,11 @@ func (cp ConnectionPolicies) TLSConfig(ctx caddy.Context) *tls.Config {
 			}
 
 			tlsCfg.GetEncryptedClientHelloKeys = func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
-				tlsApp.EncryptedClientHello.configsMu.RLock()
-				defer tlsApp.EncryptedClientHello.configsMu.RUnlock()
-				return tlsApp.EncryptedClientHello.stdlibReady, nil
+				keysPtr := tlsApp.EncryptedClientHello.stdlibReady.Load()
+				if keysPtr == nil {
+					return nil, nil
+				}
+				return *keysPtr, nil
 			}
 		}
 	}
