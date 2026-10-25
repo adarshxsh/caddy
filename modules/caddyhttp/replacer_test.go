@@ -15,13 +15,17 @@
 package caddyhttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -294,5 +298,137 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 		if !okName || gotName != tc.expectName {
 			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
 		}
+	}
+}
+
+func TestPooledBodyReader(t *testing.T) {
+	t.Run("basic body replacement and pool return", func(t *testing.T) {
+		bodyContent := "hello world request body"
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(bodyContent))
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		val, ok := repl.GetString("http.request.body")
+		if !ok || val != bodyContent {
+			t.Fatalf("expected body %q, got %q (ok=%t)", bodyContent, val, ok)
+		}
+
+		pbr, ok := req.Body.(*pooledBodyReader)
+		if !ok {
+			t.Fatalf("expected req.Body to be *pooledBodyReader, got %T", req.Body)
+		}
+
+		buf, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("failed to read req.Body downstream: %v", err)
+		}
+		if string(buf) != bodyContent {
+			t.Fatalf("expected downstream read %q, got %q", bodyContent, string(buf))
+		}
+
+		err = req.Body.Close()
+		if err != nil {
+			t.Fatalf("failed to close req.Body: %v", err)
+		}
+		if pbr.buf != nil {
+			t.Fatalf("expected pbr.buf to be nil after Close")
+		}
+
+		err = req.Body.Close()
+		if err != nil {
+			t.Fatalf("failed second close: %v", err)
+		}
+	})
+
+	t.Run("base64 body replacement", func(t *testing.T) {
+		bodyContent := "hello world"
+		expectedBase64 := base64.StdEncoding.EncodeToString([]byte(bodyContent))
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(bodyContent))
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		val, ok := repl.GetString("http.request.body_base64")
+		if !ok || val != expectedBase64 {
+			t.Fatalf("expected body_base64 %q, got %q (ok=%t)", expectedBase64, val, ok)
+		}
+
+		_ = req.Body.Close()
+	})
+
+	t.Run("sequential evaluations reuse buffer without re-copying", func(t *testing.T) {
+		bodyContent := "sequential body payload"
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(bodyContent))
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		val1, ok1 := repl.GetString("http.request.body")
+		if !ok1 || val1 != bodyContent {
+			t.Fatalf("first call failed: got %q", val1)
+		}
+		pbr1 := req.Body.(*pooledBodyReader)
+
+		val2, ok2 := repl.GetString("http.request.body")
+		if !ok2 || val2 != bodyContent {
+			t.Fatalf("second call failed: got %q", val2)
+		}
+		pbr2 := req.Body.(*pooledBodyReader)
+
+		if pbr1 != pbr2 {
+			t.Fatalf("expected req.Body to be reused across placeholder calls")
+		}
+
+		val3, ok3 := repl.GetString("http.request.body_base64")
+		expectedBase64 := base64.StdEncoding.EncodeToString([]byte(bodyContent))
+		if !ok3 || val3 != expectedBase64 {
+			t.Fatalf("third call failed: got %q", val3)
+		}
+
+		_ = req.Body.Close()
+	})
+
+	t.Run("oversized buffer not returned to pool", func(t *testing.T) {
+		largeData := make([]byte, 600*1024)
+		for i := range largeData {
+			largeData[i] = 'A'
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(largeData))
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		_, _ = repl.GetString("http.request.body")
+		pbr := req.Body.(*pooledBodyReader)
+
+		if pbr.buf.Cap() <= maxPooledBufferCapacity {
+			t.Fatalf("expected buffer capacity > %d, got %d", maxPooledBufferCapacity, pbr.buf.Cap())
+		}
+
+		_ = req.Body.Close()
+
+		if pbr.buf != nil {
+			t.Fatalf("expected pbr.buf to be nil after Close")
+		}
+	})
+}
+
+func TestPooledBodyReaderAllocations(t *testing.T) {
+	bodyContent := "payload for allocation testing"
+
+	// Warm up pool
+	reqWarm := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(bodyContent))
+	replWarm := caddy.NewReplacer()
+	addHTTPVarsToReplacer(replWarm, reqWarm, nil)
+	_, _ = replWarm.GetString("http.request.body")
+	_ = reqWarm.Body.Close()
+
+	// Perform multiple runs and close bodies to ensure pool recycling
+	for i := 0; i < 100; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(bodyContent))
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		_, _ = repl.GetString("http.request.body")
+		_, _ = repl.GetString("http.request.body_base64")
+		_ = req.Body.Close()
 	}
 }
