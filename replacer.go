@@ -88,10 +88,52 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 	r.providers = append(r.providers, mapFunc)
 }
 
+// SetString sets a custom variable to a string static value.
+func (r *Replacer) SetString(variable, value string) {
+	r.mapMutex.Lock()
+	if r.static == nil {
+		r.static = make(map[string]any)
+	}
+	r.static[variable] = value
+	r.mapMutex.Unlock()
+}
+
+// SetInt sets a custom variable to an integer static value.
+func (r *Replacer) SetInt(variable string, value int) {
+	r.SetString(variable, strconv.Itoa(value))
+}
+
+// SetInt64 sets a custom variable to an int64 static value.
+func (r *Replacer) SetInt64(variable string, value int64) {
+	r.SetString(variable, strconv.FormatInt(value, 10))
+}
+
+// SetFloat64 sets a custom variable to a float64 static value.
+func (r *Replacer) SetFloat64(variable string, value float64) {
+	r.SetString(variable, strconv.FormatFloat(value, 'f', -1, 64))
+}
+
+// SetBool sets a custom variable to a boolean static value.
+func (r *Replacer) SetBool(variable string, value bool) {
+	if value {
+		r.SetString(variable, "true")
+	} else {
+		r.SetString(variable, "false")
+	}
+}
+
 // Set sets a custom variable to a static value.
 func (r *Replacer) Set(variable string, value any) {
 	r.mapMutex.Lock()
-	r.static[variable] = value
+	if r.static == nil {
+		r.static = make(map[string]any)
+	}
+	switch v := value.(type) {
+	case string:
+		r.static[variable] = v
+	default:
+		r.static[variable] = value
+	}
 	r.mapMutex.Unlock()
 }
 
@@ -110,7 +152,13 @@ func (r *Replacer) Get(variable string) (any, bool) {
 // string representation as efficiently as possible.
 func (r *Replacer) GetString(variable string) (string, bool) {
 	s, found := r.Get(variable)
-	return ToString(s), found
+	if !found {
+		return "", false
+	}
+	if str, ok := s.(string); ok {
+		return str, true
+	}
+	return ToString(s), true
 }
 
 // Delete removes a variable with a static value
@@ -180,11 +228,16 @@ func (r *Replacer) replace(input, empty string,
 		return input, nil
 	}
 
-	var sb strings.Builder
-
-	// it is reasonable to assume that the output
-	// will be approximately as long as the input
-	sb.Grow(len(input))
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	buf.Grow(len(input))
+	defer func() {
+		const maxBufSize = 64 * 1024
+		if buf.Cap() <= maxBufSize {
+			buf.Reset()
+			bufPool.Put(buf)
+		}
+	}()
 
 	// iterate the input to find each placeholder
 	var lastWriteCursor int
@@ -196,7 +249,7 @@ scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
-			sb.WriteString(input[lastWriteCursor : i-1])
+			buf.WriteString(input[lastWriteCursor : i-1])
 			lastWriteCursor = i
 			continue
 		}
@@ -230,7 +283,7 @@ scan:
 		}
 
 		// write the substring from the last cursor to this point
-		sb.WriteString(input[lastWriteCursor:i])
+		buf.WriteString(input[lastWriteCursor:i])
 
 		// trim opening bracket
 		key := input[i+1 : end]
@@ -269,10 +322,10 @@ scan:
 				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
 					string(phOpen), key, string(phClose))
 			} else if empty != "" {
-				sb.WriteString(empty)
+				buf.WriteString(empty)
 			}
 		} else {
-			sb.WriteString(valStr)
+			buf.WriteString(valStr)
 		}
 
 		// advance cursor to end of placeholder
@@ -281,9 +334,9 @@ scan:
 	}
 
 	// flush any unwritten remainder
-	sb.WriteString(input[lastWriteCursor:])
+	buf.WriteString(input[lastWriteCursor:])
 
-	return sb.String(), nil
+	return buf.String(), nil
 }
 
 // ToString returns val as a string, as efficiently as possible.
@@ -294,21 +347,26 @@ func ToString(val any) string {
 		return ""
 	case string:
 		return v
+	case []byte:
+		return string(v)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
 	case fmt.Stringer:
 		return v.String()
 	case error:
 		return v.Error()
 	case byte:
 		return string(v)
-	case []byte:
-		return string(v)
 	case []rune:
 		return string(v)
-	case int:
-		return strconv.Itoa(v)
 	case int32:
-		return strconv.Itoa(int(v))
-	case int64:
 		return strconv.Itoa(int(v))
 	case uint:
 		return strconv.FormatUint(uint64(v), 10)
@@ -320,11 +378,6 @@ func ToString(val any) string {
 		return strconv.FormatFloat(float64(v), 'f', -1, 32)
 	case float64:
 		return strconv.FormatFloat(v, 'f', -1, 64)
-	case bool:
-		if v {
-			return "true"
-		}
-		return "false"
 	default:
 		return fmt.Sprintf("%+v", v)
 	}
