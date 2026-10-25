@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -69,9 +70,9 @@ type ECH struct {
 	// DNS RRs. (This also typically requires that they use DoH or DoT.)
 	Publication []*ECHPublication `json:"publication,omitempty"`
 
-	configsMu   *sync.RWMutex                 // protects both configs and the list of configs/keys the standard library uses
-	configs     map[string][]echConfig        // map of public_name to list of configs
-	stdlibReady []tls.EncryptedClientHelloKey // ECH configs+keys in a format the standard library can use
+	configsMu   *sync.RWMutex                                 // protects configs map and key rotation state
+	configs     map[string][]echConfig                        // map of public_name to list of configs
+	stdlibReady atomic.Pointer[[]tls.EncryptedClientHelloKey] // ECH configs+keys in a format the standard library can use
 }
 
 // Provision loads or creates ECH configs and returns outer names (for certificate
@@ -79,6 +80,8 @@ type ECH struct {
 // a default for later publishing if needed.
 func (ech *ECH) Provision(ctx caddy.Context) ([]string, error) {
 	ech.configsMu = new(sync.RWMutex)
+	empty := []tls.EncryptedClientHelloKey{}
+	ech.stdlibReady.Store(&empty)
 
 	logger := ctx.Logger().Named("ech")
 
@@ -298,16 +301,17 @@ func (ech *ECH) rotationNeeded(rotationInterval, deleteAfter time.Duration) bool
 // updateKeyList updates the list of ECH keys the std lib uses to serve ECH.
 // It must be called inside a write lock on ech.configsMu.
 func (ech *ECH) updateKeyList() {
-	ech.stdlibReady = []tls.EncryptedClientHelloKey{}
+	ready := []tls.EncryptedClientHelloKey{}
 	for _, cfgs := range ech.configs {
 		for _, cfg := range cfgs {
-			ech.stdlibReady = append(ech.stdlibReady, tls.EncryptedClientHelloKey{
+			ready = append(ready, tls.EncryptedClientHelloKey{
 				Config:      cfg.configBin,
 				PrivateKey:  cfg.privKeyBin,
 				SendAsRetry: cfg.meta.Replaced.IsZero(), // only send during retries if key has not been rotated out
 			})
 		}
 	}
+	ech.stdlibReady.Store(&ready)
 }
 
 // publishECHConfigs publishes any configs that are configured for publication and which haven't been published already.
