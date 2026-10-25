@@ -93,12 +93,13 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    unhealthy_request_count <num>
 //
 //	    # streaming
-//	    flush_interval     <duration>
-//	    request_buffers    <size>
-//	    response_buffers   <size>
-//	    stream_buffer_size <size>
-//	    stream_timeout     <duration>
-//	    stream_close_delay <duration>
+//	    flush_interval          <duration>
+//	    request_buffers         <size>
+//	    response_buffers        <size>
+//	    stream_buffer_size      <size>
+//	    stream_timeout          <duration>
+//	    stream_close_delay      <duration>
+//	    websocket_ping_interval <duration>
 //	    verbose_logs
 //
 //	    # request manipulation
@@ -701,6 +702,20 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("bad duration value '%s': %v", d.Val(), err)
 				}
 				h.StreamCloseDelay = caddy.Duration(dur)
+			}
+
+		case "websocket_ping_interval":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if fi, err := strconv.Atoi(d.Val()); err == nil {
+				h.WebSocketPingInterval = caddy.Duration(fi)
+			} else {
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad duration value '%s': %v", d.Val(), err)
+				}
+				h.WebSocketPingInterval = caddy.Duration(dur)
 			}
 
 		case "trusted_proxies":
