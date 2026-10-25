@@ -28,6 +28,7 @@ import (
 	"mime"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -204,19 +205,42 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	defer deleteFrontConn()
 	defer deleteBackConn()
 
-	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         wg,
-		bufferSize: h.StreamBufferSize,
-	}
+	userConn := conn
+	backendConn := backConn
 
-	// setup the timeout if requested
 	var timeoutc <-chan time.Time
+	var activityChan chan struct{}
+	var lastActivity *atomic.Int64
+	var timer *time.Timer
+	var timeout time.Duration
+
 	if h.StreamTimeout > 0 {
-		timer := time.NewTimer(time.Duration(h.StreamTimeout))
+		timeout = time.Duration(h.StreamTimeout)
+		activityChan = make(chan struct{}, 1)
+		lastActivity = new(atomic.Int64)
+		lastActivity.Store(time.Now().UnixNano())
+
+		userConn = &activityRWC{
+			ReadWriteCloser: conn,
+			activityChan:    activityChan,
+			lastActivity:    lastActivity,
+		}
+		backendConn = &activityRWC{
+			ReadWriteCloser: backConn,
+			activityChan:    activityChan,
+			lastActivity:    lastActivity,
+		}
+
+		timer = time.NewTimer(timeout)
 		defer timer.Stop()
 		timeoutc = timer.C
+	}
+
+	spc := switchProtocolCopier{
+		user:       userConn,
+		backend:    backendConn,
+		wg:         wg,
+		bufferSize: h.StreamBufferSize,
 	}
 
 	// when a stream timeout is encountered, no error will be read from errc
@@ -226,14 +250,47 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, wg *sync.WaitGroup, 
 	wg.Add(2)
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	select {
-	case err := <-errc:
-		if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
-			c.Write(zap.Error(err))
+
+	if timeoutc != nil {
+		for {
+			select {
+			case err := <-errc:
+				if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+					c.Write(zap.Error(err))
+				}
+				return
+			case <-activityChan:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				last := time.Unix(0, lastActivity.Load())
+				elapsed := time.Since(last)
+				remaining := timeout - elapsed
+				if remaining <= 0 {
+					remaining = timeout
+				}
+				timer.Reset(remaining)
+			case t := <-timeoutc:
+				last := time.Unix(0, lastActivity.Load())
+				elapsed := time.Since(last)
+				if elapsed >= timeout {
+					if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
+						c.Write(zap.Time("timeout", t))
+					}
+					return
+				}
+				timer.Reset(timeout - elapsed)
+			}
 		}
-	case time := <-timeoutc:
-		if c := logger.Check(zapcore.DebugLevel, "stream timed out"); c != nil {
-			c.Write(zap.Time("timeout", time))
+	} else {
+		select {
+		case err := <-errc:
+			if c := logger.Check(zapcore.DebugLevel, "streaming error"); c != nil {
+				c.Write(zap.Error(err))
+			}
 		}
 	}
 }
@@ -679,3 +736,41 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	activityChan chan struct{}
+	lastActivity *atomic.Int64
+}
+
+func (a *activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 {
+		a.recordActivity()
+	}
+	return n, err
+}
+
+func (a *activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 {
+		a.recordActivity()
+	}
+	return n, err
+}
+
+func (a *activityRWC) recordActivity() {
+	if a.lastActivity != nil {
+		a.lastActivity.Store(time.Now().UnixNano())
+	}
+	if a.activityChan != nil {
+		select {
+		case a.activityChan <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (a *activityRWC) Unwrap() io.ReadWriteCloser {
+	return a.ReadWriteCloser
+}
