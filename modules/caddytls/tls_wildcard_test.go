@@ -75,6 +75,8 @@ func TestAvoidDuplicateAutomation(t *testing.T) {
 			if err := tlsApp.Provision(ctx); err != nil {
 				t.Fatal(err)
 			}
+			defer tlsApp.Cleanup()
+			defer tlsApp.Stop()
 
 			// simulate a case wherein the HTTP app starts first and
 			// tells the TLS app about the following auto-HTTPS domains
