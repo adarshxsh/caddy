@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReplacer(t *testing.T) {
@@ -519,6 +520,104 @@ func BenchmarkReplacer(b *testing.B) {
 			for b.Loop() {
 				rep.ReplaceAll(bm.input, bm.empty)
 			}
+		})
+	}
+}
+
+func TestTimePlaceholders(t *testing.T) {
+	oldNowFunc := nowFunc
+	defer func() { nowFunc = oldNowFunc }()
+
+	fixedTime := time.Date(2026, time.October, 24, 15, 30, 45, 123000000, time.UTC)
+	nowFunc = func() time.Time { return fixedTime }
+
+	repl := NewReplacer()
+
+	tests := []struct {
+		placeholder string
+		expected    string
+	}{
+		{"time.now.http", fixedTime.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")},
+		{"time.now.common_log", "24/Oct/2026:15:30:45 +0000"},
+		{"time.now.year", "2026"},
+		{"time.now.unix", "1792855845"},
+		{"time.now.unix_ms", "1792855845123"},
+	}
+
+	for _, tt := range tests {
+		val, ok := repl.Get(tt.placeholder)
+		if !ok {
+			t.Errorf("expected placeholder %s to be recognized", tt.placeholder)
+		}
+		if strVal, isStr := val.(string); !isStr || strVal != tt.expected {
+			t.Errorf("placeholder %s: expected %q, got %v", tt.placeholder, tt.expected, val)
+		}
+	}
+
+	// Test cache invalidation when second changes
+	fixedTime2 := time.Date(2027, time.January, 1, 0, 0, 0, 456000000, time.UTC)
+	nowFunc = func() time.Time { return fixedTime2 }
+
+	tests2 := []struct {
+		placeholder string
+		expected    string
+	}{
+		{"time.now.http", fixedTime2.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")},
+		{"time.now.common_log", "01/Jan/2027:00:00:00 +0000"},
+		{"time.now.year", "2027"},
+		{"time.now.unix", "1798761600"},
+		{"time.now.unix_ms", "1798761600456"},
+	}
+
+	for _, tt := range tests2 {
+		val, ok := repl.Get(tt.placeholder)
+		if !ok {
+			t.Errorf("expected placeholder %s to be recognized after time update", tt.placeholder)
+		}
+		if strVal, isStr := val.(string); !isStr || strVal != tt.expected {
+			t.Errorf("after update, placeholder %s: expected %q, got %v", tt.placeholder, tt.expected, val)
+		}
+	}
+}
+
+func BenchmarkTimePlaceholders(b *testing.B) {
+	repl := NewReplacer()
+	placeholders := []string{
+		"time.now.http",
+		"time.now.common_log",
+		"time.now.year",
+		"time.now.unix",
+		"time.now.unix_ms",
+	}
+
+	for _, ph := range placeholders {
+		b.Run(ph, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_, _ = repl.Get(ph)
+			}
+		})
+	}
+}
+
+func BenchmarkTimePlaceholdersParallel(b *testing.B) {
+	repl := NewReplacer()
+	placeholders := []string{
+		"time.now.http",
+		"time.now.common_log",
+		"time.now.year",
+		"time.now.unix",
+		"time.now.unix_ms",
+	}
+
+	for _, ph := range placeholders {
+		b.Run(ph, func(b *testing.B) {
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					_, _ = repl.Get(ph)
+				}
+			})
 		})
 	}
 }
