@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -277,5 +278,71 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 				t.Fatalf("conn.RemoteAddr() = %s, want %s", got, ln.Addr().String())
 			}
 		})
+	}
+}
+
+func TestTCPRWTimeoutConn_DisableTimeoutsAndUnwrap(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverConn, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer serverConn.Close()
+
+	tcpConn, ok := serverConn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("expected *net.TCPConn, got %T", serverConn)
+	}
+
+	tConn := &tcpRWTimeoutConn{
+		TCPConn: tcpConn,
+	}
+	tConn.readTimeout.Store(int64(50 * time.Millisecond))
+	tConn.writeTimeout.Store(int64(50 * time.Millisecond))
+
+	if got := tConn.Unwrap(); got != tcpConn {
+		t.Fatalf("Unwrap() = %v, want %v", got, tcpConn)
+	}
+
+	// Read before DisableTimeouts should time out
+	buf := make([]byte, 10)
+	_, err = tConn.Read(buf)
+	if err == nil {
+		t.Fatal("expected timeout error on read before DisableTimeouts, got nil")
+	}
+
+	// Disable timeouts and clear deadlines
+	tConn.DisableTimeouts()
+
+	if readTimeout := time.Duration(tConn.readTimeout.Load()); readTimeout != 0 {
+		t.Fatalf("readTimeout = %v, want 0", readTimeout)
+	}
+	if writeTimeout := time.Duration(tConn.writeTimeout.Load()); writeTimeout != 0 {
+		t.Fatalf("writeTimeout = %v, want 0", writeTimeout)
+	}
+
+	// Write data after delay (longer than initial timeout) and ensure read succeeds
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		clientConn.Write([]byte("ping"))
+	}()
+
+	n, err := tConn.Read(buf)
+	if err != nil {
+		t.Fatalf("unexpected error after DisableTimeouts: %v", err)
+	}
+	if got := string(buf[:n]); got != "ping" {
+		t.Fatalf("got %q, want %q", got, "ping")
 	}
 }

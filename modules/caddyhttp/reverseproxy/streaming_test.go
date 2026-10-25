@@ -3,10 +3,12 @@ package reverseproxy
 import (
 	"bytes"
 	"io"
+	"net"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -80,3 +82,61 @@ type nopReadWriteCloser struct {
 }
 
 func (nopReadWriteCloser) Close() error { return nil }
+
+func TestDisableTransportTimeoutsAndDeadlines(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverConn, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer serverConn.Close()
+
+	tcpConn := serverConn.(*net.TCPConn)
+	tConn := &tcpRWTimeoutConn{
+		TCPConn: tcpConn,
+	}
+	tConn.readTimeout.Store(int64(50 * time.Millisecond))
+	tConn.writeTimeout.Store(int64(50 * time.Millisecond))
+
+	// Disable transport timeouts and deadlines via helper function
+	disableTransportTimeoutsAndDeadlines(tConn)
+
+	if readTimeout := time.Duration(tConn.readTimeout.Load()); readTimeout != 0 {
+		t.Fatalf("readTimeout = %v, want 0", readTimeout)
+	}
+
+	// Read after idle period longer than 50ms
+	done := make(chan struct{})
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		clientConn.Write([]byte("upgraded"))
+	}()
+
+	buf := make([]byte, 20)
+	go func() {
+		n, err := tConn.Read(buf)
+		if err != nil {
+			t.Errorf("Read error after disableTransportTimeoutsAndDeadlines: %v", err)
+		} else if got := string(buf[:n]); got != "upgraded" {
+			t.Errorf("got %q, want %q", got, "upgraded")
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("test timed out waiting for read")
+	}
+}
