@@ -293,15 +293,18 @@ func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInter
 		mlw := &maxLatencyWriter{
 			dst: dst,
 			//nolint:bodyclose
-			flush:   http.NewResponseController(dst).Flush,
-			latency: flushInterval,
-			logger:  mlwLogger,
+			flush:      http.NewResponseController(dst).Flush,
+			latency:    flushInterval,
+			logger:     mlwLogger,
+			firstWrite: true,
 		}
 		defer mlw.stop()
 
 		// set up initial timer so headers get flushed even if body writes are delayed
 		mlw.flushPending = true
-		mlw.t = time.AfterFunc(flushInterval, mlw.delayedFlush)
+		mlw.seq++
+		seq := mlw.seq
+		mlw.t = time.AfterFunc(flushInterval, func() { mlw.delayedFlush(seq) })
 
 		w = mlw
 	}
@@ -579,9 +582,11 @@ type maxLatencyWriter struct {
 	flush   func() error
 	latency time.Duration // non-zero; negative means to flush immediately
 
-	mu           sync.Mutex // protects t, flushPending, and dst.Flush
+	mu           sync.Mutex // protects t, flushPending, firstWrite, seq, and dst.Flush
 	t            *time.Timer
 	flushPending bool
+	firstWrite   bool
+	seq          uint64
 	logger       *zap.Logger
 }
 
@@ -598,15 +603,28 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 		m.flush()
 		return n, err
 	}
+	if m.firstWrite {
+		m.firstWrite = false
+		m.seq++
+		if m.t != nil {
+			m.t.Stop()
+		}
+		m.flushPending = false
+	}
 	if m.flushPending {
 		m.logger.Debug("delayed flush already pending")
 		return n, err
 	}
-	if m.t == nil {
-		m.t = time.AfterFunc(m.latency, m.delayedFlush)
-	} else {
-		m.t.Reset(m.latency)
+	m.logger.Debug("flushing immediately on write")
+	//nolint:errcheck
+	m.flush()
+
+	m.seq++
+	seq := m.seq
+	if m.t != nil {
+		m.t.Stop()
 	}
+	m.t = time.AfterFunc(m.latency, func() { m.delayedFlush(seq) })
 	if c := m.logger.Check(zapcore.DebugLevel, "timer set for delayed flush"); c != nil {
 		c.Write(zap.Duration("duration", m.latency))
 	}
@@ -614,10 +632,10 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-func (m *maxLatencyWriter) delayedFlush() {
+func (m *maxLatencyWriter) delayedFlush(seq uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.flushPending { // if stop was called but AfterFunc already started this goroutine
+	if !m.flushPending || m.seq != seq { // if stop was called or stale callback
 		m.logger.Debug("delayed flush is not pending")
 		return
 	}
@@ -631,6 +649,7 @@ func (m *maxLatencyWriter) stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.flushPending = false
+	m.seq++
 	if m.t != nil {
 		m.t.Stop()
 	}
