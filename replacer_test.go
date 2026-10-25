@@ -222,8 +222,8 @@ func TestReplacerSet(t *testing.T) {
 
 		// test if key is added
 		if val, ok := rep.static[tc.variable]; ok {
-			if val != tc.value {
-				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
+			if ToString(val) != ToString(tc.value) {
+				t.Errorf("Expected value '%v' for key '%s' got '%v'", tc.value, tc.variable, val)
 			}
 		} else {
 			t.Errorf("Expected existing key '%s' found nothing", tc.variable)
@@ -233,7 +233,48 @@ func TestReplacerSet(t *testing.T) {
 	// test if all keys are still there (by length)
 	length := len(rep.static)
 	if len(rep.static) != 8 {
-		t.Errorf("Expected length '%v' got '%v'", 7, length)
+		t.Errorf("Expected length '%v' got '%v'", 8, length)
+	}
+}
+
+func TestReplacerTypedSetters(t *testing.T) {
+	rep := NewReplacer()
+
+	rep.SetString("str_key", "hello")
+	rep.SetInt("int_key", 42)
+	rep.SetInt64("int64_key", int64(9876543210))
+	rep.SetFloat64("float_key", 3.14159)
+	rep.SetBool("bool_true_key", true)
+	rep.SetBool("bool_false_key", false)
+
+	tests := []struct {
+		key      string
+		expected string
+	}{
+		{"str_key", "hello"},
+		{"int_key", "42"},
+		{"int64_key", "9876543210"},
+		{"float_key", "3.14159"},
+		{"bool_true_key", "true"},
+		{"bool_false_key", "false"},
+	}
+
+	for _, tc := range tests {
+		val, ok := rep.GetString(tc.key)
+		if !ok {
+			t.Errorf("Expected key '%s' to be found", tc.key)
+		}
+		if val != tc.expected {
+			t.Errorf("Expected key '%s' to be '%s', got '%s'", tc.key, tc.expected, val)
+		}
+
+		rawVal, ok := rep.Get(tc.key)
+		if !ok {
+			t.Errorf("Expected Get('%s') to be found", tc.key)
+		}
+		if strVal, isStr := rawVal.(string); !isStr || strVal != tc.expected {
+			t.Errorf("Expected raw static value for key '%s' to be string '%s', got '%v'", tc.key, tc.expected, rawVal)
+		}
 	}
 }
 
@@ -516,10 +557,50 @@ func BenchmarkReplacer(b *testing.B) {
 		},
 	} {
 		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
 			for b.Loop() {
-				rep.ReplaceAll(bm.input, bm.empty)
+				_ = rep.ReplaceAll(bm.input, bm.empty)
 			}
 		})
+	}
+}
+
+func BenchmarkReplacerTypedSetters(b *testing.B) {
+	rep := testReplacer()
+	b.ReportAllocs()
+	for b.Loop() {
+		rep.SetString("str", "a string")
+		rep.SetInt("int", 12345)
+		rep.SetBool("bool", true)
+		_, _ = rep.GetString("str")
+		_, _ = rep.GetString("int")
+		_, _ = rep.GetString("bool")
+	}
+}
+
+func TestReplacerAllocations(t *testing.T) {
+	rep := testReplacer()
+	rep.SetString("key", "val")
+
+	var strSink string
+	var boolSink bool
+
+	allocsGetString := testing.AllocsPerRun(100, func() {
+		strSink, boolSink = rep.GetString("key")
+	})
+	if allocsGetString > 0 {
+		t.Errorf("GetString allocation count = %f; expected 0", allocsGetString)
+	}
+	_ = strSink
+	_ = boolSink
+
+	rep.SetString("same", "same")
+	allocsReplaceAll := testing.AllocsPerRun(100, func() {
+		strSink = rep.ReplaceAll("{same}", "")
+	})
+	// Buffer pooling prevents allocations for placeholder loop byte buffer
+	if allocsReplaceAll > 1 {
+		t.Errorf("ReplaceAll allocation count = %f; expected <= 1", allocsReplaceAll)
 	}
 }
 
