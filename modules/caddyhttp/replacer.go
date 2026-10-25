@@ -204,7 +204,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if req.URL.RawQuery == "" {
 					return "", true
 				}
-				return "?" + req.URL.RawQuery, true
+				val := "?" + req.URL.RawQuery
+				repl.Set(key, val)
+				return val, true
 			case "http.request.duration":
 				start := GetVar(req.Context(), "start_time").(time.Time)
 				return time.Since(start), true
@@ -278,23 +280,29 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if or.URL.RawQuery == "" {
 					return "", true
 				}
-				return "?" + or.URL.RawQuery, true
+				val := "?" + or.URL.RawQuery
+				repl.Set(key, val)
+				return val, true
 			}
 
 			// remote IP range/prefix (e.g. keep top 24 bits of 1.2.3.4  => "1.2.3.0/24")
 			// syntax: "/V4,V6" where V4 = IPv4 bits, and V6 = IPv6 bits; if no comma, then same bit length used for both
 			// (EXPERIMENTAL)
 			if strings.HasPrefix(key, "http.request.remote.host/") {
-				host, _, err := net.SplitHostPort(req.RemoteAddr)
-				if err != nil {
-					host = req.RemoteAddr // assume no port, I guess?
-				}
-				addr, err := netip.ParseAddr(host)
-				if err != nil {
-					return host, true // not an IP address
+				var addr netip.Addr
+				if addrPort, err := netip.ParseAddrPort(req.RemoteAddr); err == nil {
+					addr = addrPort.Addr()
+				} else if a, err := netip.ParseAddr(req.RemoteAddr); err == nil {
+					addr = a
+				} else {
+					host, _, err := net.SplitHostPort(req.RemoteAddr)
+					if err != nil {
+						host = req.RemoteAddr
+					}
+					return host, true
 				}
 				// extract the bits from the end of the placeholder (start after "/") then split on ","
-				bitsBoth := key[strings.Index(key, "/")+1:]
+				bitsBoth := key[len("http.request.remote.host/"):]
 				ipv4BitsStr, ipv6BitsStr, cutOK := strings.Cut(bitsBoth, ",")
 				bitsStr := ipv4BitsStr
 				if addr.Is6() && cutOK {
@@ -309,7 +317,9 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				if err != nil {
 					return "", true
 				}
-				return prefix.String(), true
+				val := prefix.String()
+				repl.Set(key, val)
+				return val, true
 			}
 
 			// hostname labels (case insensitive, so normalize to lowercase)
