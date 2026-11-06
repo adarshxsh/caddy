@@ -15,27 +15,28 @@
 package caddytls
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestTLSStopSequential(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
 	tlsApp := &TLS{
-		storageCleanStop:   make(chan struct{}),
+		bgCtx:              ctx,
+		bgCancel:           cancel,
+		bgWg:               new(sync.WaitGroup),
 		storageCleanTicker: time.NewTicker(time.Hour),
 	}
 
-	// First Stop call should close the channel and stop ticker
+	// First Stop call should cancel the context and stop ticker
 	if err := tlsApp.Stop(); err != nil {
 		t.Fatalf("unexpected error on first Stop: %v", err)
 	}
 
-	if tlsApp.storageCleanStop != nil {
-		t.Errorf("expected storageCleanStop to be nil after Stop, got non-nil")
-	}
-	if tlsApp.storageCleanTicker != nil {
-		t.Errorf("expected storageCleanTicker to be nil after Stop, got non-nil")
+	if ctx.Err() == nil {
+		t.Errorf("expected bgCtx to be canceled after Stop")
 	}
 
 	// Subsequent Stop calls must be idempotent and not panic
@@ -47,31 +48,38 @@ func TestTLSStopSequential(t *testing.T) {
 }
 
 func TestTLSStopConcurrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+	}()
+
 	tlsApp := &TLS{
-		storageCleanStop:   make(chan struct{}),
+		bgCtx:              ctx,
+		bgCancel:           cancel,
+		bgWg:               wg,
 		storageCleanTicker: time.NewTicker(time.Hour),
 	}
 
 	const goroutines = 20
-	var wg sync.WaitGroup
-	wg.Add(goroutines)
+	var testWg sync.WaitGroup
+	testWg.Add(goroutines)
 
 	for i := 0; i < goroutines; i++ {
 		go func() {
-			defer wg.Done()
+			defer testWg.Done()
 			if err := tlsApp.Stop(); err != nil {
 				t.Errorf("unexpected error on concurrent Stop: %v", err)
 			}
 		}()
 	}
 
-	wg.Wait()
+	testWg.Wait()
 
-	if tlsApp.storageCleanStop != nil {
-		t.Errorf("expected storageCleanStop to be nil after concurrent Stop, got non-nil")
-	}
-	if tlsApp.storageCleanTicker != nil {
-		t.Errorf("expected storageCleanTicker to be nil after concurrent Stop, got non-nil")
+	if ctx.Err() == nil {
+		t.Errorf("expected bgCtx to be canceled after Stop")
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -137,8 +138,11 @@ type TLS struct {
 	automateNames      map[string]struct{}
 	ctx                caddy.Context
 	stopOnce           sync.Once
+	bgCtx              context.Context
+	bgCancel           context.CancelFunc
+	bgWg               *sync.WaitGroup
 	storageCleanTicker *time.Ticker
-	storageCleanStop   chan struct{}
+	echRotateInterval  time.Duration
 	logger             *zap.Logger
 	events             *caddyevents.App
 
@@ -252,9 +256,10 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 	// commands like validate can be a better test
 	certCacheMu.RLock()
 	magic := certmagic.New(certCache, certmagic.Config{
-		Storage: ctx.Storage(),
-		Logger:  t.logger,
-		OnEvent: t.onEvent,
+		Storage:        ctx.Storage(),
+		Logger:         t.logger,
+		OnEvent:        t.onEvent,
+		ShouldEmitFunc: t.events.ShouldEmit,
 		OCSP: certmagic.OCSPConfig{
 			DisableStapling: t.DisableOCSPStapling,
 		},
@@ -412,6 +417,17 @@ func (t *TLS) Start() error {
 		}
 	}
 
+	if t.bgCtx == nil {
+		parentCtx := t.ctx.Context
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		t.bgCtx, t.bgCancel = context.WithCancel(parentCtx)
+	}
+	if t.bgWg == nil {
+		t.bgWg = new(sync.WaitGroup)
+	}
+
 	// now that we are running, and all manual certificates have
 	// been loaded, time to load the automated/managed certificates
 	err := t.Manage(t.automateNames)
@@ -424,34 +440,57 @@ func (t *TLS) Start() error {
 
 		// publish ECH configs in the background; does not need to block
 		// server startup, as it could take a while; then keep keys rotated
-		go func() {
+		t.bgWg.Add(1)
+		go func(ctx context.Context) {
+			defer t.bgWg.Done()
+			defer func() {
+				if err := recover(); err != nil {
+					log.Printf("[PANIC] tls ech publisher: %v\n%s", err, debug.Stack())
+				}
+			}()
+
 			// publish immediately first
-			if err := t.publishECHConfigs(echLogger); err != nil {
-				echLogger.Error("publication(s) failed", zap.Error(err))
+			if err := t.publishECHConfigs(ctx, echLogger); err != nil {
+				if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+					echLogger.Error("publication(s) failed", zap.Error(err))
+				}
 			}
+
+			ticker := time.NewTicker(t.echRotationInterval())
+			defer ticker.Stop()
 
 			// then every so often, rotate and publish if needed
 			// (both of these functions only do something if needed)
 			for {
 				select {
-				case <-time.After(1 * time.Hour):
+				case <-ticker.C:
 					// ensure old keys are rotated out
 					t.EncryptedClientHello.configsMu.Lock()
-					err = t.EncryptedClientHello.rotateECHKeys(t.ctx, echLogger, false)
+					err := t.EncryptedClientHello.rotateECHKeys(t.caddyContext(ctx), echLogger, false)
 					t.EncryptedClientHello.configsMu.Unlock()
 					if err != nil {
-						echLogger.Error("rotating ECH configs failed", zap.Error(err))
+						if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+							echLogger.Error("rotating ECH configs failed", zap.Error(err))
+						}
+						if ctx.Err() != nil {
+							return
+						}
 						continue
 					}
-					err := t.publishECHConfigs(echLogger)
-					if err != nil {
-						echLogger.Error("publication(s) failed", zap.Error(err))
+					if ctx.Err() != nil {
+						return
 					}
-				case <-t.ctx.Done():
+					err = t.publishECHConfigs(ctx, echLogger)
+					if err != nil {
+						if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+							echLogger.Error("publication(s) failed", zap.Error(err))
+						}
+					}
+				case <-ctx.Done():
 					return
 				}
 			}
-		}()
+		}(t.bgCtx)
 	}
 
 	if !t.DisableStorageClean {
@@ -466,14 +505,17 @@ func (t *TLS) Start() error {
 // Stop stops the TLS module and cleans up any allocations.
 func (t *TLS) Stop() error {
 	t.stopOnce.Do(func() {
-		// stop the storage cleaner goroutine and ticker
-		if t.storageCleanStop != nil {
-			close(t.storageCleanStop)
-			t.storageCleanStop = nil
+		// cancel all background goroutines (storage cleaner, ECH rotation/publication, etc.)
+		if t.bgCancel != nil {
+			t.bgCancel()
 		}
 		if t.storageCleanTicker != nil {
 			t.storageCleanTicker.Stop()
-			t.storageCleanTicker = nil
+		}
+		// wait for all background goroutines to finish before returning,
+		// ensuring no background storage users are active when module Cleanup() runs
+		if t.bgWg != nil {
+			t.bgWg.Wait()
 		}
 	})
 	return nil
@@ -912,29 +954,44 @@ func (t *TLS) HasCertificateForSubject(subject string) bool {
 // known storage units if it was not recently done, and then runs the
 // operation at every tick from t.storageCleanTicker.
 func (t *TLS) keepStorageClean() {
+	if t.bgCtx == nil {
+		parentCtx := t.ctx.Context
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		t.bgCtx, t.bgCancel = context.WithCancel(parentCtx)
+	}
+	if t.bgWg == nil {
+		t.bgWg = new(sync.WaitGroup)
+	}
 	t.storageCleanTicker = time.NewTicker(t.storageCleanInterval())
-	t.storageCleanStop = make(chan struct{})
-	go func() {
+	t.bgWg.Add(1)
+	go func(ctx context.Context) {
+		defer t.bgWg.Done()
 		defer func() {
 			if err := recover(); err != nil {
 				log.Printf("[PANIC] storage cleaner: %v\n%s", err, debug.Stack())
 			}
 		}()
-		t.cleanStorageUnits()
+		t.cleanStorageUnits(ctx)
 		for {
 			select {
-			case <-t.storageCleanStop:
+			case <-ctx.Done():
 				return
 			case <-t.storageCleanTicker.C:
-				t.cleanStorageUnits()
+				t.cleanStorageUnits(ctx)
 			}
 		}
-	}()
+	}(t.bgCtx)
 }
 
-func (t *TLS) cleanStorageUnits() {
+func (t *TLS) cleanStorageUnits(ctx context.Context) {
 	storageCleanMu.Lock()
 	defer storageCleanMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return
+	}
 
 	// TODO: This check might not be needed anymore now that CertMagic syncs
 	// and throttles storage cleaning globally across the cluster.
@@ -968,12 +1025,17 @@ func (t *TLS) cleanStorageUnits() {
 	}
 
 	// start with the default/global storage
-	err = certmagic.CleanStorage(t.ctx, t.ctx.Storage(), options)
-	if err != nil {
-		// probably don't want to return early, since we should still
-		// see if any other storages can get cleaned up
-		if c := t.logger.Check(zapcore.ErrorLevel, "could not clean default/global storage"); c != nil {
-			c.Write(zap.Error(err))
+	if storage := t.ctx.Storage(); storage != nil {
+		err = certmagic.CleanStorage(ctx, storage, options)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return
+			}
+			// probably don't want to return early, since we should still
+			// see if any other storages can get cleaned up
+			if c := t.logger.Check(zapcore.ErrorLevel, "could not clean default/global storage"); c != nil {
+				c.Write(zap.Error(err))
+			}
 		}
 	}
 
@@ -983,12 +1045,19 @@ func (t *TLS) cleanStorageUnits() {
 			if ap.storage == nil {
 				continue
 			}
-			if err := certmagic.CleanStorage(t.ctx, ap.storage, options); err != nil {
+			if err := certmagic.CleanStorage(ctx, ap.storage, options); err != nil {
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return
+				}
 				if c := t.logger.Check(zapcore.ErrorLevel, "could not clean storage configured in automation policy"); c != nil {
 					c.Write(zap.Error(err))
 				}
 			}
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return
 	}
 
 	// remember last time storage was finished cleaning
@@ -1002,6 +1071,19 @@ func (t *TLS) storageCleanInterval() time.Duration {
 		return time.Duration(t.Automation.StorageCleanInterval)
 	}
 	return defaultStorageCleanInterval
+}
+
+func (t *TLS) echRotationInterval() time.Duration {
+	if t.echRotateInterval > 0 {
+		return t.echRotateInterval
+	}
+	return 1 * time.Hour
+}
+
+func (t *TLS) caddyContext(ctx context.Context) caddy.Context {
+	caddyCtx := t.ctx
+	caddyCtx.Context = ctx
+	return caddyCtx
 }
 
 // onEvent translates CertMagic events into Caddy events then dispatches them.
