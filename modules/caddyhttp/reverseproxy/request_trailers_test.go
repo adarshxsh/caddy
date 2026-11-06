@@ -367,10 +367,10 @@ func TestRequestTrailersRetry(t *testing.T) {
 			req = req.WithContext(ctx)
 			rec := httptest.NewRecorder()
 			err := h.ServeHTTP(rec, req, nil)
-			if attempts != 2 {
-				t.Fatalf("attempts=%d, want 2", attempts)
-			}
 			if tc.partial {
+				if attempts != 1 {
+					t.Fatalf("attempts=%d, want 1", attempts)
+				}
 				if err == nil {
 					t.Fatal("partially consumed body was accepted for replay")
 				}
@@ -380,6 +380,9 @@ func TestRequestTrailersRetry(t *testing.T) {
 				default:
 				}
 				return
+			}
+			if attempts != 2 {
+				t.Fatalf("attempts=%d, want 2", attempts)
 			}
 			if err != nil {
 				t.Fatal(err)
