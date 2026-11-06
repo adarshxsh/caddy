@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -287,14 +288,17 @@ func handleUpgradeTunnel(
 		result      string
 	)
 
+	var activity atomic.Int64
+	activity.Store(time.Now().UnixNano())
+
 	// when a stream timeout is encountered, no error will be read from errc
 	// a buffer size of 2 will allow both the read and write goroutines to
 	// send the error and exit
 	// see: https://github.com/caddyserver/caddy/issues/7418
 	errc := make(chan error, 2)
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
+		user:       wrapActivity(conn, &activity),
+		backend:    wrapActivity(backConn, &activity),
 		wg:         &wg,
 		bufferSize: bufferSize,
 		sent:       &toBackend,
@@ -303,14 +307,16 @@ func handleUpgradeTunnel(
 	wg.Add(2)
 
 	var timeoutc <-chan time.Time
+	var timer *time.Timer
 	if streamTimeout > 0 {
-		timer := time.NewTimer(streamTimeout)
+		timer = time.NewTimer(streamTimeout)
 		defer timer.Stop()
 		timeoutc = timer.C
 	}
 
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
+
 	// Wait for both directions to finish. A clean EOF in one direction is a
 	// half-close of that direction only, not the end of the tunnel: the copier
 	// propagates it to the destination with CloseWrite and reports nil, so the
@@ -335,21 +341,28 @@ func handleUpgradeTunnel(
 	result = "closed"
 copyLoop:
 	for range 2 {
-		select {
-		case err := <-errc:
-			if err != nil {
-				result = classifyStreamResult(err)
-				if c := streamLogger.Check(streamLevel, "streaming error"); c != nil && !errors.Is(err, errCopyDone) {
-					c.Write(zap.Error(err))
+		for {
+			select {
+			case err := <-errc:
+				if err != nil {
+					result = classifyStreamResult(err)
+					if c := streamLogger.Check(streamLevel, "streaming error"); c != nil && !errors.Is(err, errCopyDone) {
+						c.Write(zap.Error(err))
+					}
+					break copyLoop
 				}
-				break copyLoop
+				continue copyLoop
+			case t := <-timeoutc:
+				idle := time.Since(time.Unix(0, activity.Load()))
+				if idle >= streamTimeout {
+					result = "timeout"
+					if c := streamLogger.Check(streamLevel, "stream timed out"); c != nil {
+						c.Write(zap.Time("timeout", t))
+					}
+					break copyLoop
+				}
+				timer.Reset(streamTimeout - idle)
 			}
-		case t := <-timeoutc:
-			result = "timeout"
-			if c := streamLogger.Check(streamLevel, "stream timed out"); c != nil {
-				c.Write(zap.Time("timeout", t))
-			}
-			break copyLoop
 		}
 	}
 
@@ -388,6 +401,44 @@ func makeStreamLogFields(streamUUID string) []zap.Field {
 		fields = append(fields, zap.String("uuid", streamUUID))
 	}
 	return fields
+}
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	activity *atomic.Int64
+}
+
+func (a activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 {
+		a.activity.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (a activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 {
+		a.activity.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+type activityCloseWriter struct {
+	activityRWC
+	cw interface{ CloseWrite() error }
+}
+
+func (a activityCloseWriter) CloseWrite() error {
+	return a.cw.CloseWrite()
+}
+
+func wrapActivity(rwc io.ReadWriteCloser, activity *atomic.Int64) io.ReadWriteCloser {
+	base := activityRWC{ReadWriteCloser: rwc, activity: activity}
+	if cw, ok := rwc.(interface{ CloseWrite() error }); ok {
+		return activityCloseWriter{activityRWC: base, cw: cw}
+	}
+	return base
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally

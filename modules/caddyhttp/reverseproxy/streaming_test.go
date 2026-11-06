@@ -180,6 +180,148 @@ type nopReadWriteCloser struct {
 
 func (nopReadWriteCloser) Close() error { return nil }
 
+type mockHijacker struct {
+	http.ResponseWriter
+	conn net.Conn
+	rw   *bufio.ReadWriter
+}
+
+func (m mockHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return m.conn, m.rw, nil
+}
+
+func TestStreamTimeoutIdleClose(t *testing.T) {
+	clientConnServer, clientConnClient := net.Pipe()
+	backendConnServer, backendConnClient := net.Pipe()
+	defer clientConnClient.Close()
+	defer backendConnClient.Close()
+
+	logger := zap.NewNop()
+	h := &Handler{
+		StreamTimeout: caddy.Duration(100 * time.Millisecond),
+		logger:        logger,
+		tunnelTracker: newTunnelTracker(logger, 0),
+	}
+	initReverseProxyMetrics(h, prometheus.NewRegistry())
+
+	req := prepareTestRequest(httptest.NewRequest("GET", "http://example.com", nil))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	res := &http.Response{
+		StatusCode: http.StatusSwitchingProtocols,
+		Header: http.Header{
+			"Connection": []string{"Upgrade"},
+			"Upgrade":    []string{"websocket"},
+		},
+		Body: backendConnServer,
+	}
+
+	rw := mockHijacker{
+		ResponseWriter: httptest.NewRecorder(),
+		conn:           clientConnServer,
+		rw:             bufio.NewReadWriter(bufio.NewReader(clientConnServer), bufio.NewWriter(clientConnServer)),
+	}
+
+	start := time.Now()
+	h.handleUpgradeResponse(logger, rw, req, res, "127.0.0.1:8080")
+	elapsed := time.Since(start)
+
+	if elapsed < 90*time.Millisecond || elapsed > 300*time.Millisecond {
+		t.Fatalf("expected stream to close around 100ms, but took %v", elapsed)
+	}
+}
+
+func TestStreamTimeoutActivityReset(t *testing.T) {
+	clientConnServer, clientConnClient := net.Pipe()
+	backendConnServer, backendConnClient := net.Pipe()
+	defer clientConnClient.Close()
+	defer backendConnClient.Close()
+
+	logger := zap.NewNop()
+	h := &Handler{
+		StreamTimeout: caddy.Duration(150 * time.Millisecond),
+		logger:        logger,
+		tunnelTracker: newTunnelTracker(logger, 0),
+	}
+	initReverseProxyMetrics(h, prometheus.NewRegistry())
+
+	req := prepareTestRequest(httptest.NewRequest("GET", "http://example.com", nil))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	res := &http.Response{
+		StatusCode: http.StatusSwitchingProtocols,
+		Header: http.Header{
+			"Connection": []string{"Upgrade"},
+			"Upgrade":    []string{"websocket"},
+		},
+		Body: backendConnServer,
+	}
+
+	rw := mockHijacker{
+		ResponseWriter: httptest.NewRecorder(),
+		conn:           clientConnServer,
+		rw:             bufio.NewReadWriter(bufio.NewReader(clientConnServer), bufio.NewWriter(clientConnServer)),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		h.handleUpgradeResponse(logger, rw, req, res, "127.0.0.1:8080")
+		close(done)
+	}()
+
+	start := time.Now()
+
+	// Drain backend in background
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			_, err := backendConnClient.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Keep connection active by sending data every 50ms for 350ms (total time > 2x timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	stopPings := time.After(350 * time.Millisecond)
+activeLoop:
+	for {
+		select {
+		case <-ticker.C:
+			_, err := clientConnClient.Write([]byte("ping"))
+			if err != nil {
+				t.Fatalf("write failed: %v", err)
+			}
+		case <-stopPings:
+			break activeLoop
+		case <-done:
+			t.Fatalf("connection closed prematurely while active after %v", time.Since(start))
+		}
+	}
+
+	activeDuration := time.Since(start)
+	if activeDuration < 300*time.Millisecond {
+		t.Fatalf("active phase ended too early: %v", activeDuration)
+	}
+
+	// Now stop sending data and wait for idle timeout (150ms)
+	select {
+	case <-done:
+		totalElapsed := time.Since(start)
+		// Should take around 350ms + 150ms = 500ms
+		if totalElapsed < 450*time.Millisecond {
+			t.Fatalf("stream closed too quickly after activity stopped: total elapsed %v", totalElapsed)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("stream failed to close after activity stopped")
+	}
+}
+
 type trackingReadWriteCloser struct {
 	closed chan struct{}
 	one    sync.Once
