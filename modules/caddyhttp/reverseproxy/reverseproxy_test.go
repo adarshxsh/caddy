@@ -155,10 +155,7 @@ func TestResponseNonCanonicalHopByHopHeaderStripping(t *testing.T) {
 	res.Header["upgrade"] = []string{"h2c"}
 	res.Header["x-valid-res-header"] = []string{"ok"}
 
-	removeConnectionHeaders(res.Header)
-	for _, h := range hopHeaders {
-		deleteHeaderCaseInsensitive(res.Header, h)
-	}
+	stripHopByHopHeaders(res.Header)
 
 	for _, h := range []string{"connection", "x-res-custom", "transfer-encoding", "upgrade"} {
 		if vals := getHeaderValuesCaseInsensitive(res.Header, h); len(vals) > 0 {
