@@ -18,6 +18,7 @@ import (
 	"log"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -29,8 +30,9 @@ func init() {
 }
 
 type standardSTEKProvider struct {
-	stekConfig *caddytls.SessionTicketService
-	timer      *time.Timer
+	stekConfig  *caddytls.SessionTicketService
+	timer       *time.Timer
+	numFailures int32
 }
 
 // CaddyModule returns the Caddy module information.
@@ -99,10 +101,14 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			var err error
 			keysCopy, err = s.stekConfig.RotateSTEKs(keysCopy)
 			if err != nil {
-				// TODO: improve this handling
-				log.Printf("[ERROR] Generating STEK: %v", err)
+				failures := atomic.AddInt32(&s.numFailures, 1)
+				backoff := caddytls.CalculateSTEKBackoff(int(failures), time.Duration(s.stekConfig.RotationInterval))
+				log.Printf("[ERROR] Generating STEK (attempt %d, retrying in %v): %v", failures, backoff, err)
+				s.timer.Reset(backoff)
 				continue
 			}
+
+			atomic.StoreInt32(&s.numFailures, 0)
 
 			// replace keys slice with updated value and
 			// record the timestamp of rotation
@@ -112,7 +118,17 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			mutex.Unlock()
 
 			// send the updated keys to the service
-			keysChan <- keysCopy
+			select {
+			case keysChan <- keysCopy:
+			case <-doneChan:
+				if !s.timer.Stop() {
+					select {
+					case <-s.timer.C:
+					default:
+					}
+				}
+				return
+			}
 
 			// timer channel is already drained, so reset directly (see godoc)
 			s.timer.Reset(time.Duration(s.stekConfig.RotationInterval))
@@ -120,7 +136,10 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 		case <-doneChan:
 			// again, see godocs for why timer is stopped this way
 			if !s.timer.Stop() {
-				<-s.timer.C
+				select {
+				case <-s.timer.C:
+				default:
+				}
 			}
 			return
 		}

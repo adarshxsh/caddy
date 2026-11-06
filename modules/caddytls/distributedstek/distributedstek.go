@@ -31,6 +31,7 @@ import (
 	"io/fs"
 	"log"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -53,10 +54,11 @@ type Provider struct {
 	// storage module will be used.
 	Storage json.RawMessage `json:"storage,omitempty" caddy:"namespace=caddy.storage inline_key=module"`
 
-	storage    certmagic.Storage
-	stekConfig *caddytls.SessionTicketService
-	timer      *time.Timer
-	ctx        caddy.Context
+	storage     certmagic.Storage
+	stekConfig  *caddytls.SessionTicketService
+	timer       *time.Timer
+	ctx         caddy.Context
+	numFailures int32
 }
 
 // CaddyModule returns the Caddy module information.
@@ -215,21 +217,42 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 		case <-s.timer.C:
 			dstek, err := s.getSTEK()
 			if err != nil {
-				// TODO: improve this handling
-				log.Printf("[ERROR] Loading STEK: %v", err)
+				failures := atomic.AddInt32(&s.numFailures, 1)
+				backoff := caddytls.CalculateSTEKBackoff(int(failures), time.Duration(s.stekConfig.RotationInterval))
+				log.Printf("[ERROR] Loading STEK (attempt %d, retrying in %v): %v", failures, backoff, err)
+				s.timer.Reset(backoff)
 				continue
 			}
 
+			atomic.StoreInt32(&s.numFailures, 0)
+
 			// send the updated keys to the service
-			keysChan <- dstek.Keys
+			select {
+			case keysChan <- dstek.Keys:
+			case <-doneChan:
+				if !s.timer.Stop() {
+					select {
+					case <-s.timer.C:
+					default:
+					}
+				}
+				return
+			}
 
 			// timer channel is already drained, so reset directly (see godoc)
-			s.timer.Reset(time.Until(dstek.NextRotation))
+			interval := time.Until(dstek.NextRotation)
+			if interval <= 0 {
+				interval = time.Duration(s.stekConfig.RotationInterval)
+			}
+			s.timer.Reset(interval)
 
 		case <-doneChan:
 			// again, see godocs for why timer is stopped this way
 			if !s.timer.Stop() {
-				<-s.timer.C
+				select {
+				case <-s.timer.C:
+				default:
+				}
 			}
 			return
 		}
