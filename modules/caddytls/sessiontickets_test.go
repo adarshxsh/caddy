@@ -20,20 +20,18 @@ import (
 	"testing"
 )
 
-type dummySTEKProvider struct {
-	keysChan chan [][32]byte
-}
+type dummySTEKProvider struct{}
 
 func (d *dummySTEKProvider) Initialize(config *SessionTicketService) ([][32]byte, error) {
 	return [][32]byte{{1, 2, 3}}, nil
 }
 
 func (d *dummySTEKProvider) Next(doneChan <-chan struct{}) <-chan [][32]byte {
-	d.keysChan = make(chan [][32]byte)
+	keysChan := make(chan [][32]byte)
 	go func() {
 		<-doneChan
 	}()
-	return d.keysChan
+	return keysChan
 }
 
 func TestSessionTicketService_StopSequential(t *testing.T) {
