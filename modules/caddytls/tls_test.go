@@ -18,11 +18,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
 )
 
 func TestTLSStopRepeated(t *testing.T) {
 	tlsApp := &TLS{
-		storageCleanStop:   make(chan struct{}),
 		storageCleanTicker: time.NewTicker(time.Hour),
 	}
 
@@ -32,15 +34,10 @@ func TestTLSStopRepeated(t *testing.T) {
 			t.Fatalf("unexpected error on Stop call %d: %v", i+1, err)
 		}
 	}
-
-	if tlsApp.storageCleanStop != nil {
-		t.Errorf("expected storageCleanStop to be nil after Stop(), got %v", tlsApp.storageCleanStop)
-	}
 }
 
 func TestTLSStopConcurrent(t *testing.T) {
 	tlsApp := &TLS{
-		storageCleanStop:   make(chan struct{}),
 		storageCleanTicker: time.NewTicker(time.Hour),
 	}
 
@@ -55,17 +52,39 @@ func TestTLSStopConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-
-	if tlsApp.storageCleanStop != nil {
-		t.Errorf("expected storageCleanStop to be nil after Stop(), got %v", tlsApp.storageCleanStop)
-	}
 }
 
 func TestTLSStopNil(t *testing.T) {
 	tlsApp := &TLS{}
 
-	// Stop() when storageCleanStop is nil should complete cleanly.
+	// Stop() when fields are nil should complete cleanly.
 	if err := tlsApp.Stop(); err != nil {
-		t.Fatalf("unexpected error on Stop with nil channels: %v", err)
+		t.Fatalf("unexpected error on Stop with nil fields: %v", err)
 	}
 }
+
+func TestTLSStopRepeatedWithStorageClean(t *testing.T) {
+	ctx, err := caddy.ProvisionContext(new(caddy.Config))
+	if err != nil {
+		t.Fatalf("ProvisionContext failed: %v", err)
+	}
+
+	tlsApp := &TLS{
+		ctx:    ctx,
+		logger: zap.NewNop(),
+		Automation: &AutomationConfig{
+			StorageCleanInterval: caddy.Duration(1 * time.Hour),
+		},
+	}
+
+	// Start storage cleaner
+	tlsApp.keepStorageClean()
+
+	// Repeated sequential and concurrent calls to Stop() should complete without panicking
+	for i := 0; i < 5; i++ {
+		if err := tlsApp.Stop(); err != nil {
+			t.Fatalf("unexpected error on Stop call %d: %v", i+1, err)
+		}
+	}
+}
+
