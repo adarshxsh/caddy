@@ -97,19 +97,36 @@ func TestSRVUpstreamsGetUpstreams(t *testing.T) {
 		return req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
 	}
 
-	// 1. Initial lookup with empty cache and DNS failure -> returns error immediately
-	t.Run("empty cache failure returns error immediately", func(t *testing.T) {
+	// 1. Initial lookup with empty cache and DNS failure
+	t.Run("empty cache failure without grace returns error immediately", func(t *testing.T) {
+		suNoGrace := su
+		suNoGrace.GracePeriod = 0
+		_ = suNoGrace.ResetCache(nil)
+		mockDNS.mu.Lock()
+		mockDNS.fail = true
+		mockDNS.mu.Unlock()
+
+		upstreams, err := suNoGrace.GetUpstreams(newReq())
+		if err == nil {
+			t.Fatalf("expected error on empty cache failure without grace, got nil error with upstreams: %v", upstreams)
+		}
+		if len(upstreams) != 0 {
+			t.Fatalf("expected 0 upstreams on error, got %d", len(upstreams))
+		}
+	})
+
+	t.Run("empty cache failure with grace suppresses error", func(t *testing.T) {
 		_ = su.ResetCache(nil)
 		mockDNS.mu.Lock()
 		mockDNS.fail = true
 		mockDNS.mu.Unlock()
 
 		upstreams, err := su.GetUpstreams(newReq())
-		if err == nil {
-			t.Fatalf("expected error on empty cache failure, got nil error with upstreams: %v", upstreams)
+		if err != nil {
+			t.Fatalf("expected nil error on empty cache failure with grace, got: %v", err)
 		}
 		if len(upstreams) != 0 {
-			t.Fatalf("expected 0 upstreams on error, got %d", len(upstreams))
+			t.Fatalf("expected 0 upstreams, got %d", len(upstreams))
 		}
 	})
 
@@ -255,6 +272,43 @@ func TestResolveIpVersion(t *testing.T) {
 		ipVersion := resolveIpVersion(test.Versions)
 		if ipVersion != test.expectedIpVersion {
 			t.Errorf("resolveIpVersion(): Expected %s got %s", test.expectedIpVersion, ipVersion)
+		}
+	}
+}
+
+func TestResolverCacheKey(t *testing.T) {
+	key := func(addrs ...string) string {
+		if addrs == nil {
+			return resolverCacheKey(nil)
+		}
+		return resolverCacheKey(&UpstreamResolver{Addresses: addrs})
+	}
+
+	// The default resolver (nil or empty) yields the empty key, so default-resolver
+	// sources keep sharing the cache.
+	if got := key(); got != "" {
+		t.Errorf("nil resolver: got %q, want \"\"", got)
+	}
+	if got := resolverCacheKey(&UpstreamResolver{}); got != "" {
+		t.Errorf("empty resolver: got %q, want \"\"", got)
+	}
+
+	// Order does not matter: the same set maps to the same key.
+	if a, b := key("1.1.1.1", "8.8.8.8"), key("8.8.8.8", "1.1.1.1"); a != b {
+		t.Errorf("order should not matter: %q != %q", a, b)
+	}
+
+	// Different sets must not collide, even when an address contains the
+	// delimiter that a naive join would use. {"a,b"} and {"a","b"} are distinct
+	// resolver configurations and must get distinct keys.
+	colliding := [][2][]string{
+		{{"a,b"}, {"a", "b"}},
+		{{"unix//run/x,y.sock"}, {"unix//run/x", "y.sock"}},
+		{{"10:1"}, {"1", "0:1"}}, // guards the length-prefix encoding itself
+	}
+	for _, c := range colliding {
+		if k1, k2 := key(c[0]...), key(c[1]...); k1 == k2 {
+			t.Errorf("distinct address sets %q and %q share key %q", c[0], c[1], k1)
 		}
 	}
 }
