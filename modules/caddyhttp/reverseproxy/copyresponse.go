@@ -159,10 +159,11 @@ func (h CopyResponseHeadersHandler) ServeHTTP(rw http.ResponseWriter, req *http.
 	stripHopByHopHeaders(src)
 
 	for field, values := range src {
+		canonicalField := http.CanonicalHeaderKey(field)
 		// Check the include list first, skip
 		// the header if it's _not_ in this list.
 		if len(h.includeMap) > 0 {
-			if _, ok := h.includeMap[field]; !ok {
+			if _, ok := h.includeMap[canonicalField]; !ok {
 				continue
 			}
 		}
@@ -170,7 +171,7 @@ func (h CopyResponseHeadersHandler) ServeHTTP(rw http.ResponseWriter, req *http.
 		// Then, check the exclude list, skip
 		// the header if it _is_ in this list.
 		if len(h.excludeMap) > 0 {
-			if _, ok := h.excludeMap[field]; ok {
+			if _, ok := h.excludeMap[canonicalField]; ok {
 				continue
 			}
 		}
