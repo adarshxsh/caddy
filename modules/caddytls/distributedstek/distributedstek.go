@@ -215,8 +215,14 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 		case <-s.timer.C:
 			dstek, err := s.getSTEK()
 			if err != nil {
-				// TODO: improve this handling
 				log.Printf("[ERROR] Loading STEK: %v", err)
+				retryInterval := 1 * time.Minute
+				if s.stekConfig != nil {
+					if rotInterval := time.Duration(s.stekConfig.RotationInterval); rotInterval > 0 && rotInterval < retryInterval {
+						retryInterval = rotInterval
+					}
+				}
+				s.timer.Reset(retryInterval)
 				continue
 			}
 
@@ -227,9 +233,12 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 			s.timer.Reset(time.Until(dstek.NextRotation))
 
 		case <-doneChan:
-			// again, see godocs for why timer is stopped this way
+			// stop timer and drain channel if needed without blocking
 			if !s.timer.Stop() {
-				<-s.timer.C
+				select {
+				case <-s.timer.C:
+				default:
+				}
 			}
 			return
 		}
