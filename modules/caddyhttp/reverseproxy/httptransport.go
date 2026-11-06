@@ -162,14 +162,9 @@ type HTTPTransport struct {
 	// `HTTPS_PROXY`, and `NO_PROXY` environment variables.
 	NetworkProxyRaw json.RawMessage `json:"network_proxy,omitempty" caddy:"namespace=caddy.network_proxy inline_key=from"`
 
-	h3Transport   h3TransportRunner
-	quicTransport *quic.Transport // used by h3Transport
-}
-
-type h3TransportRunner interface {
-	RoundTrip(*http.Request) (*http.Response, error)
-	CloseIdleConnections()
-	Close() error
+	h3Transport    *http3.Transport  // TODO: EXPERIMENTAL (May 2024)
+	quicTransport  *quic.Transport   // used by h3Transport
+	h3RoundTripper http.RoundTripper // override for testing
 }
 
 type h3RetryKey struct{}
@@ -304,6 +299,12 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			// decide whether to retry a request
 			return nil, DialError{err}
 		}
+		keepConn := false
+		defer func() {
+			if !keepConn {
+				_ = conn.Close()
+			}
+		}()
 
 		if h.ProxyProtocol != "" {
 			proxyProtocolInfo, ok := caddyhttp.GetVar(ctx, proxyProtocolInfoVarKey).(ProxyProtocolInfo)
@@ -371,6 +372,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			}
 		}
 
+		keepConn = true
 		return conn, nil
 	}
 
@@ -502,20 +504,19 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 	// do (that'd add latency and complexity, besides, we expect that
 	// site owners  control the backends), so it must be exclusive
 	if len(h.Versions) == 1 && h.Versions[0] == "3" {
-		h3 := new(http3.Transport)
+		h.h3Transport = new(http3.Transport)
 		if h.TLS != nil {
-			var err error
-			h3.TLSClientConfig, err = h.TLS.MakeTLSClientConfig(caddyCtx)
-			if err != nil {
-				return nil, fmt.Errorf("making TLS client config for HTTP/3 transport: %v", err)
-			}
+			// Reuse the TLS client config built above for the HTTP/1.1+2
+			// transport rather than calling MakeTLSClientConfig again.
+			// Fixing: https://github.com/caddyserver/caddy/issues/8041
+			h.h3Transport.TLSClientConfig = rt.TLSClientConfig.Clone()
 
 			udpConn, err := net.ListenUDP("udp", nil)
 			if err != nil {
 				return nil, fmt.Errorf("making udp socket for HTTP/3 transport: %v", err)
 			}
 			h.quicTransport = &quic.Transport{Conn: udpConn}
-			h3.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			h.h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 				if strings.Contains(h.TLS.ServerName, "{") {
 					// tlsCfg is already cloned from h3Transport.TLSClientConfig
 					repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
@@ -534,13 +535,14 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				return h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
 			}
 		}
-		h.h3Transport = h3
 	} else if len(h.Versions) > 1 && slices.Contains(h.Versions, "3") {
 		return nil, fmt.Errorf("if HTTP/3 is enabled to the upstream, no other HTTP versions are supported")
 	}
 
 	// if h2/c is enabled, configure it explicitly
 	if slices.Contains(h.Versions, "2") || slices.Contains(h.Versions, "h2c") {
+		// TODO: Migrate to http.Transport.Protocols once transport behaviour is covered.
+		//nolint:staticcheck
 		if err := http2.ConfigureTransport(rt); err != nil {
 			return nil, err
 		}
@@ -652,8 +654,12 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	h.SetScheme(req)
 
 	// use HTTP/3 if enabled (TODO: This is EXPERIMENTAL)
-	if h.h3Transport != nil {
-		res, err := h.h3Transport.RoundTrip(req)
+	if h.h3Transport != nil || h.h3RoundTripper != nil {
+		h3RT := http.RoundTripper(h.h3Transport)
+		if h.h3RoundTripper != nil {
+			h3RT = h.h3RoundTripper
+		}
+		res, err := h3RT.RoundTrip(req)
 		if err != nil {
 			return nil, err
 		}
@@ -679,7 +685,7 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				retryReq.Body = newBody
 			}
 
-			return h.h3Transport.RoundTrip(retryReq)
+			return h3RT.RoundTrip(retryReq)
 		}
 		return res, nil
 	}
@@ -930,7 +936,10 @@ func (t *TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) 
 
 	curvesAdded := make(map[tls.CurveID]struct{})
 	for _, curveName := range t.Curves {
-		curveID := caddytls.SupportedCurves[curveName]
+		curveID, ok := caddytls.SupportedCurves[curveName]
+		if !ok {
+			return nil, fmt.Errorf("unsupported curve: %s", curveName)
+		}
 		if _, ok := curvesAdded[curveID]; !ok {
 			curvesAdded[curveID] = struct{}{}
 			cfg.CurvePreferences = append(cfg.CurvePreferences, curveID)
