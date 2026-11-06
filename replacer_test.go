@@ -20,7 +20,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -241,7 +240,6 @@ func TestReplacerSet(t *testing.T) {
 
 func TestReplacerReplaceKnown(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		providers: []replacementProvider{
 			// split our possible vars to two functions (to test if both functions are called)
 			ReplacerFunc(func(key string) (val any, ok bool) {
@@ -314,7 +312,6 @@ func TestReplacerReplaceKnown(t *testing.T) {
 
 func TestReplacerDelete(t *testing.T) {
 	rep := Replacer{
-		mapMutex: &sync.RWMutex{},
 		static: map[string]any{
 			"key1": "val1",
 			"key2": "val2",
@@ -483,6 +480,32 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 		} else if !tc.notFound {
 			t.Errorf("Expected key '%s' to be recognized", tc.variable)
 		}
+	}
+}
+
+var sinkReplacer *Replacer
+
+func TestReplacerAllocations(t *testing.T) {
+	allocsNew := testing.AllocsPerRun(100, func() {
+		sinkReplacer = NewReplacer()
+	})
+	if allocsNew != 1 {
+		t.Errorf("Expected 1 alloc for NewReplacer(), got %v", allocsNew)
+	}
+
+	allocsEmpty := testing.AllocsPerRun(100, func() {
+		sinkReplacer = NewEmptyReplacer()
+	})
+	if allocsEmpty != 1 {
+		t.Errorf("Expected 1 alloc for NewEmptyReplacer(), got %v", allocsEmpty)
+	}
+
+	r := NewReplacer()
+	allocsWithoutFile := testing.AllocsPerRun(100, func() {
+		sinkReplacer = r.WithoutFile()
+	})
+	if allocsWithoutFile != 1 {
+		t.Errorf("Expected 1 alloc for WithoutFile(), got %v", allocsWithoutFile)
 	}
 }
 
@@ -680,7 +703,5 @@ func BenchmarkReplacer(b *testing.B) {
 func testReplacer() Replacer {
 	return Replacer{
 		providers: make([]replacementProvider, 0),
-		static:    make(map[string]any),
-		mapMutex:  &sync.RWMutex{},
 	}
 }
