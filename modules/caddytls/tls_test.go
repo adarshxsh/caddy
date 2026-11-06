@@ -15,23 +15,28 @@
 package caddytls
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
 
 func TestTLSStop(t *testing.T) {
+	var cancelCalled bool
 	tlsApp := &TLS{
 		storageCleanTicker: time.NewTicker(time.Hour),
-		storageCleanStop:   make(chan struct{}),
+		bgCancel: func() {
+			cancelCalled = true
+		},
+		bgWg: new(sync.WaitGroup),
 	}
 
-	// First Stop call should close the channel and stop the ticker
+	// First Stop call should cancel background context, stop ticker, and reset ticker to nil
 	if err := tlsApp.Stop(); err != nil {
 		t.Fatalf("first Stop() failed: %v", err)
 	}
 
-	if tlsApp.storageCleanStop != nil {
-		t.Errorf("expected storageCleanStop to be nil after Stop()")
+	if !cancelCalled {
+		t.Errorf("expected bgCancel to be called")
 	}
 	if tlsApp.storageCleanTicker != nil {
 		t.Errorf("expected storageCleanTicker to be nil after Stop()")
