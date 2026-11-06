@@ -749,8 +749,11 @@ func TestSetImmediateCoercion(t *testing.T) {
 	if val, _ := repl.Get("bool"); val != "false" {
 		t.Errorf("expected string false, got %v", val)
 	}
-	if val, _ := repl.Get("duration"); val != "5s" {
-		t.Errorf("expected string 5s, got %v", val)
+	if val, _ := repl.Get("duration"); val != 5*time.Second {
+		t.Errorf("expected duration 5s, got %v", val)
+	}
+	if str, _ := repl.GetString("duration"); str != "5s" {
+		t.Errorf("expected GetString to return 5s, got %s", str)
 	}
 
 	// Non-primitives should NOT be converted to string on Set

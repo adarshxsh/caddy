@@ -108,8 +108,6 @@ func (r *Replacer) Set(variable string, value any) {
 		} else {
 			value = "false"
 		}
-	case time.Duration:
-		value = v.String()
 	}
 
 	r.mapMutex.Lock()
