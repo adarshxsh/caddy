@@ -170,9 +170,12 @@ func TestHostMatcher(t *testing.T) {
 }
 
 func TestPathMatcher(t *testing.T) {
+	t.Setenv("CADDY_TEST_PATH_PREFIX", "admin")
+
 	for i, tc := range []struct {
-		match        MatchPath // not URI-encoded because not parsing from a URI
-		input        string    // should be valid URI encoding (escaped) since it will become part of a request
+		match        MatchPath   // not URI-encoded because not parsing from a URI
+		input        string      // should be valid URI encoding (escaped) since it will become part of a request
+		headers      http.Header // request headers, for header placeholders in the match
 		expect       bool
 		provisionErr bool
 	}{
@@ -398,6 +401,23 @@ func TestPathMatcher(t *testing.T) {
 			expect: true,
 		},
 		{
+			// a lone trailing wildcard is a fast prefix match in normalized
+			// space, so it does match an encoded separator
+			match:  MatchPath{"/bands/*"},
+			input:  "/bands/AC%2FDC",
+			expect: true,
+		},
+		{
+			match:  MatchPath{"/bands/%*/"},
+			input:  "/bands/AC%2FDC/",
+			expect: true,
+		},
+		{
+			match:  MatchPath{"/bands/*/"},
+			input:  "/bands/AC%2FDC/",
+			expect: false, // because * operates in normalized space
+		},
+		{
 			match:  MatchPath{"/foo%2fbar/baz"},
 			input:  "/foo%2Fbar/baz",
 			expect: true,
@@ -422,6 +442,49 @@ func TestPathMatcher(t *testing.T) {
 			input:  "/ADMIN%2fPaAzZLm123NEL",
 			expect: true,
 		},
+		{
+			match:  MatchPath{"/foo%2fbar"},
+			input:  "/foo%2fbarbaz",
+			expect: false,
+		},
+		{
+			match:  MatchPath{"/foo%2f"},
+			input:  "/foo%2fx",
+			expect: false,
+		},
+		{
+			match:  MatchPath{"/admin%2fpanel"},
+			input:  "/admin%2fpanelX",
+			expect: false,
+		},
+		{
+			match:  MatchPath{"/{env.CADDY_TEST_PATH_PREFIX}/*"},
+			input:  "/admin/panel",
+			expect: true,
+		},
+		{
+			match:  MatchPath{"/{env.CADDY_TEST_PATH_PREFIX}/*"},
+			input:  "/other/panel",
+			expect: false,
+		},
+		{
+			match:   MatchPath{"/{http.request.header.X-Prefix}/*"},
+			input:   "/admin/panel",
+			headers: http.Header{"X-Prefix": []string{"Admin"}},
+			expect:  true,
+		},
+		{
+			match:   MatchPath{"/{http.request.header.X-Prefix}/*"},
+			input:   "/ADMIN/panel",
+			headers: http.Header{"X-Prefix": []string{"Admin"}},
+			expect:  true,
+		},
+		{
+			match:   MatchPath{"/{http.request.header.X-Prefix}%2f*"},
+			input:   "/admin%2fpanel",
+			headers: http.Header{"X-Prefix": []string{"Admin"}},
+			expect:  true,
+		},
 	} {
 		err := tc.match.Provision(caddy.Context{})
 		if err == nil && tc.provisionErr {
@@ -438,10 +501,11 @@ func TestPathMatcher(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Test %d (%v): Invalid request URI (should be rejected by Go's HTTP server): %v", i, tc.input, err)
 		}
-		req := &http.Request{URL: u}
+		req := &http.Request{URL: u, Header: tc.headers}
 		repl := caddy.NewReplacer()
 		ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
 		req = req.WithContext(ctx)
+		addHTTPVarsToReplacer(repl, req, httptest.NewRecorder())
 
 		actual, err := tc.match.MatchWithError(req)
 		if err != nil {
@@ -494,6 +558,34 @@ func TestPathMatcherWindows(t *testing.T) {
 			requestTarget: `/private%5csecret.txt`,
 			match:         MatchPath{"/private%5c%*"},
 		},
+		{
+			name:  "trailing dot on a middle path component",
+			path:  "/private./secret.txt",
+			match: MatchPath{"/private/*"},
+		},
+		{
+			name:  "trailing space on a middle path component",
+			path:  "/private /secret.txt",
+			match: MatchPath{"/private/*"},
+		},
+		{
+			// escaped-space matcher (pattern contains '%'): the trailing
+			// dot/space normalization must also apply on the escaped-path
+			// branch, otherwise /private.%5csecret.txt bypasses /private%2f*.
+			name:          "trailing dot before encoded backslash, escaped-space matcher",
+			requestTarget: `/private.%5csecret.txt`,
+			match:         MatchPath{"/private%2f*"},
+		},
+		{
+			name:          "encoded trailing dot before encoded backslash, escaped-space matcher",
+			requestTarget: `/private%2e%5csecret.txt`,
+			match:         MatchPath{"/private%2f*"},
+		},
+		{
+			name:          "encoded trailing space before encoded backslash, escaped-space matcher",
+			requestTarget: `/private%20%5csecret.txt`,
+			match:         MatchPath{"/private%2f*"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			u := &url.URL{Path: tc.path}
@@ -514,6 +606,78 @@ func TestPathMatcherWindows(t *testing.T) {
 			}
 			if !matched {
 				t.Errorf("Expected %q to match %v", req.URL.Path, tc.match)
+			}
+		})
+	}
+}
+
+func TestPathREMatcherWindows(t *testing.T) {
+	// Windows treats backslashes as path separators and ignores trailing
+	// dots and spaces per path component, so the path_regexp matcher must
+	// normalize them the same way the path matcher does (see #5613);
+	// otherwise a guard such as `path_regexp ^/private/` is bypassed by e.g.
+	// GET /private\secret.txt (or %5c) or GET /private./secret.txt.
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	repl := caddy.NewReplacer()
+
+	for _, tc := range []struct {
+		name          string
+		path          string
+		requestTarget string
+		match         MatchPathRE
+	}{
+		{
+			name:  "literal backslash path separator",
+			path:  `/private\secret.txt`,
+			match: MatchPathRE{MatchRegexp{Pattern: "^/private/"}},
+		},
+		{
+			name:          "encoded backslash path separator",
+			requestTarget: `/private%5csecret.txt`,
+			match:         MatchPathRE{MatchRegexp{Pattern: "^/private/"}},
+		},
+		{
+			name:          "uppercase encoded backslash path separator",
+			requestTarget: `/private%5Csecret.txt`,
+			match:         MatchPathRE{MatchRegexp{Pattern: "^/private/"}},
+		},
+		{
+			name:  "trailing dot on a middle path component",
+			path:  `/private./secret.txt`,
+			match: MatchPathRE{MatchRegexp{Pattern: "^/private/"}},
+		},
+		{
+			name:  "trailing space on a middle path component",
+			path:  `/private /secret.txt`,
+			match: MatchPathRE{MatchRegexp{Pattern: "^/private/"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.match.Provision(caddy.Context{}); err != nil {
+				t.Fatalf("Provisioning: %v", err)
+			}
+
+			u := &url.URL{Path: tc.path}
+			if tc.requestTarget != "" {
+				var err error
+				u, err = url.ParseRequestURI(tc.requestTarget)
+				if err != nil {
+					t.Fatalf("Parsing request target: %v", err)
+				}
+			}
+			req := &http.Request{URL: u}
+			ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+			req = req.WithContext(ctx)
+
+			matched, err := tc.match.MatchWithError(req)
+			if err != nil {
+				t.Errorf("Expected no error, but got: %v", err)
+			}
+			if !matched {
+				t.Errorf("Expected %q to match %v", req.URL.Path, tc.match.Pattern)
 			}
 		})
 	}
@@ -1218,6 +1382,59 @@ func TestNotMatcher(t *testing.T) {
 	}
 }
 
+func TestMethodMatcher(t *testing.T) {
+	for i, tc := range []struct {
+		scenario string
+		match    MatchMethod
+		input    string
+		expect   bool
+	}{
+		{
+			scenario: "match uppercase GET",
+			match:    MatchMethod{"GET"},
+			input:    http.MethodGet,
+			expect:   true,
+		},
+		{
+			scenario: "match lowercase get after Provision uppercases it",
+			match:    MatchMethod{"get"},
+			input:    http.MethodGet,
+			expect:   true,
+		},
+		{
+			scenario: "match mixed case Post after Provision uppercases it",
+			match:    MatchMethod{"Post"},
+			input:    http.MethodPost,
+			expect:   true,
+		},
+		{
+			scenario: "no match for wrong method",
+			match:    MatchMethod{"GET"},
+			input:    http.MethodPost,
+			expect:   false,
+		},
+		{
+			scenario: "match one of multiple methods",
+			match:    MatchMethod{"get", "post"},
+			input:    http.MethodPost,
+			expect:   true,
+		},
+	} {
+		req := &http.Request{Method: tc.input}
+		if err := tc.match.Provision(caddy.Context{}); err != nil {
+			t.Errorf("Test %d %v: provisioning failed: %v", i, tc.scenario, err)
+		}
+		actual, err := tc.match.MatchWithError(req)
+		if err != nil {
+			t.Errorf("Test %d %v: matching failed: %v", i, tc.scenario, err)
+		}
+		if actual != tc.expect {
+			t.Errorf("Test %d %v: Expected %t, got %t for method=%s", i, tc.scenario, tc.expect, actual, tc.input)
+			continue
+		}
+	}
+}
+
 func BenchmarkLargeHostMatcher(b *testing.B) {
 	// this benchmark simulates a large host matcher (thousands of entries) where each
 	// value is an exact hostname (not a placeholder or wildcard) - compare the results
@@ -1272,5 +1489,110 @@ func BenchmarkHostMatcherWithPlaceholder(b *testing.B) {
 
 	for b.Loop() {
 		match.MatchWithError(req)
+	}
+}
+
+func TestHasWindowsShortName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{
+			name: "final component",
+			path: "/DIRECT~1.TXT",
+			want: true,
+		},
+		{
+			name: "parent component with long final filename",
+			path: "/PROTEC~1/this-is-a-long-final-filename.txt",
+			want: true,
+		},
+		{
+			name: "middle component",
+			path: "/public/PROTEC~1/file.txt",
+			want: true,
+		},
+		{
+			name: "backslash separator",
+			path: `\public\PROTEC~1\file.txt`,
+			want: true,
+		},
+		{
+			name: "two digit short name suffix",
+			path: "/PROTE~12/file.txt",
+			want: true,
+		},
+		{
+			name: "trailing dots and spaces",
+			path: "/PROTEC~1.  /file.txt",
+			want: true,
+		},
+		{
+			name: "permitted punctuation",
+			path: "/$%'-_~1.!#&",
+			want: true,
+		},
+		{
+			name: "ordinary tilde name",
+			path: "/ordinary~name/file.txt",
+			want: false,
+		},
+		{
+			name: "space in short name shape",
+			path: "/my f~1.txt",
+			want: false,
+		},
+		{
+			name: "space in long tilde name",
+			path: "/my file~1.txt",
+			want: false,
+		},
+		{
+			name: "non-ASCII short name shape in parent component",
+			path: "/public/café~1/this-is-a-long-final-filename.txt",
+			want: true,
+		},
+		{
+			name: "non-ASCII ordinary tilde name",
+			path: "/café~name.txt",
+			want: false,
+		},
+		{
+			name: "forbidden punctuation",
+			path: "/MY+F~1.TXT",
+			want: false,
+		},
+		{
+			name: "tilde followed by non-digit",
+			path: "/SHORT~A/file.txt",
+			want: false,
+		},
+		{
+			name: "characters after numeric suffix",
+			path: "/SHORT~1-file.txt",
+			want: false,
+		},
+		{
+			name: "base too long for 8.3",
+			path: "/TOOLONG~1/file.txt",
+			want: false,
+		},
+		{
+			name: "extension too long for 8.3",
+			path: "/SHORT~1.LONG/file.txt",
+			want: false,
+		},
+		{
+			name: "multiple extension separators",
+			path: "/SHORT~1.T.X/file.txt",
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := HasWindowsShortName(tc.path); got != tc.want {
+				t.Fatalf("HasWindowsShortName(%q) = %t, want %t", tc.path, got, tc.want)
+			}
+		})
 	}
 }
