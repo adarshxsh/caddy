@@ -867,14 +867,16 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
 	// or a WebTransport upgrade that flushed 200 OK and hijacked the
 	// stream), don't retry against another upstream and don't ding the
 	// upstream's health status
-	if term, ok := proxyErr.(terminalError); ok {
+	var term terminalError
+	if errors.As(proxyErr, &term) {
 		return true, term.error
 	}
 
 	// remember this failure (if enabled); response-based retries
 	// are not counted as failures since the upstream did respond
 	// successfully - only the response content triggered a retry
-	if _, isRetryableResponse := proxyErr.(retryableResponseError); !isRetryableResponse {
+	var rre retryableResponseError
+	if !errors.As(proxyErr, &rre) {
 		h.countFailure(upstream)
 	}
 
@@ -1571,8 +1573,11 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
 	if proxyErr != nil {
 		var dialErr DialError
 		isDialError := errors.As(proxyErr, &dialErr)
-		_, isRetryableResponse := proxyErr.(retryableResponseError)
-		herr, isHandlerError := proxyErr.(caddyhttp.HandlerError)
+		var rre retryableResponseError
+		isRetryableResponse := errors.As(proxyErr, &rre)
+
+		var herr caddyhttp.HandlerError
+		isHandlerError := errors.As(proxyErr, &herr)
 
 		// if the error occurred after a connection was established,
 		// we have to assume the upstream received the request, and
@@ -1908,7 +1913,8 @@ func stripHopByHopHeaders(h http.Header) {
 func statusError(err error) error {
 	// if a response-based retry was exhausted, use the actual upstream
 	// status code instead of a generic 502
-	if rre, ok := err.(retryableResponseError); ok {
+	var rre retryableResponseError
+	if errors.As(err, &rre) {
 		return caddyhttp.Error(rre.statusCode, err)
 	}
 
@@ -1916,7 +1922,8 @@ func statusError(err error) error {
 	statusCode := http.StatusBadGateway
 
 	// timeout errors have a standard status code (see issue #4823)
-	if err, ok := err.(net.Error); ok && err.Timeout() {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		statusCode = http.StatusGatewayTimeout
 	}
 
@@ -2035,7 +2042,20 @@ var hopHeaders = []string{
 
 // DialError is an error that specifically occurs
 // in a call to Dial or DialContext.
-type DialError struct{ error }
+type DialError struct {
+	Err error
+}
+
+func (e DialError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return ""
+}
+
+func (e DialError) Unwrap() error {
+	return e.Err
+}
 
 // NewDialError wraps err as a DialError for transports outside this package.
 func NewDialError(err error) DialError {
@@ -2299,6 +2319,10 @@ func (e terminalError) Unwrap() error { return e.error }
 type retryableResponseError struct {
 	error
 	statusCode int
+}
+
+func (e retryableResponseError) Unwrap() error {
+	return e.error
 }
 
 // bodyReadCloser is a reader that, upon closing, will return

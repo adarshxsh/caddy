@@ -855,6 +855,61 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 	}
 }
 
+func TestDialErrorUnwrap(t *testing.T) {
+	innerErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	dialErr := DialError{innerErr}
+
+	if !errors.Is(dialErr, innerErr) {
+		t.Errorf("errors.Is failed to find inner error in DialError")
+	}
+
+	var opErr *net.OpError
+	if !errors.As(dialErr, &opErr) {
+		t.Errorf("errors.As failed to extract *net.OpError from DialError")
+	}
+	if opErr != innerErr {
+		t.Errorf("got %v, want %v", opErr, innerErr)
+	}
+
+	wrappedErr := fmt.Errorf("outer: %w", dialErr)
+	var extractedDialErr DialError
+	if !errors.As(wrappedErr, &extractedDialErr) {
+		t.Errorf("errors.As failed to extract DialError from wrapped error")
+	}
+}
+
+type fakeTimeoutError struct{}
+
+func (f fakeTimeoutError) Error() string   { return "dial timeout" }
+func (f fakeTimeoutError) Timeout() bool   { return true }
+func (f fakeTimeoutError) Temporary() bool { return true }
+
+func TestStatusErrorTimeout(t *testing.T) {
+	timeoutErr := fakeTimeoutError{}
+	dialErr := DialError{timeoutErr}
+	wrappedErr := fmt.Errorf("proxying failed: %w", dialErr)
+
+	err := statusError(wrappedErr)
+	var handlerErr caddyhttp.HandlerError
+	if !errors.As(err, &handlerErr) {
+		t.Fatalf("expected statusError to return HandlerError, got: %T", err)
+	}
+	if handlerErr.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("status code: got %d, want %d", handlerErr.StatusCode, http.StatusGatewayTimeout)
+	}
+}
+
+func TestTryAgainWrappedDialError(t *testing.T) {
+	lb := LoadBalancing{Retries: 3}
+	req := httptest.NewRequest("POST", "http://example.com/", nil)
+	innerErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	wrappedDialErr := fmt.Errorf("dial failed: %w", DialError{innerErr})
+
+	if !lb.tryAgain(caddy.Context{Context: context.Background()}, time.Now(), 0, wrappedDialErr, req, zap.NewNop()) {
+		t.Errorf("tryAgain returned false for POST request with wrapped DialError; expected true")
+	}
+}
+
 // TestTryAgainDialErrorBehindForwardProxy verifies that tryAgain recognizes
 // a DialError even when it is wrapped. When a forward proxy is configured,
 // net/http wraps dial errors in a *net.OpError with Op "proxyconnect", and
