@@ -419,6 +419,7 @@ func (t *TLS) publishECHConfigs(ctx context.Context, logger *zap.Logger) error {
 			// a specific list of names is configured
 			var serverNamesSet map[string]struct{}
 			if publication.Domains == nil {
+				t.serverNamesMu.RLock()
 				serverNamesSet = make(map[string]struct{}, len(t.serverNames))
 				for name := range t.serverNames {
 					// skip Tailscale names, a special case we also handle differently in our auto-HTTPS
@@ -427,6 +428,7 @@ func (t *TLS) publishECHConfigs(ctx context.Context, logger *zap.Logger) error {
 					}
 					serverNamesSet[name] = struct{}{}
 				}
+				t.serverNamesMu.RUnlock()
 			} else {
 				serverNamesSet = make(map[string]struct{}, len(publication.Domains))
 				for _, name := range publication.Domains {

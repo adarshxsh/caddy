@@ -2,6 +2,7 @@ package caddytls
 
 import (
 	"encoding/base64"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -12,7 +13,7 @@ import (
 func TestRegisterServerNamesWithALPN(t *testing.T) {
 	tlsApp := &TLS{
 		serverNames:   make(map[string]serverNameRegistration),
-		serverNamesMu: new(sync.Mutex),
+		serverNamesMu: new(sync.RWMutex),
 	}
 
 	tlsApp.RegisterServerNames([]string{
@@ -30,6 +31,47 @@ func TestRegisterServerNamesWithALPN(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected ALPN values: got %#v want %#v", got, want)
 	}
+}
+
+func TestConcurrentServerNamesReadWrite(t *testing.T) {
+	tlsApp := &TLS{
+		serverNames:   make(map[string]serverNameRegistration),
+		serverNamesMu: new(sync.RWMutex),
+	}
+
+	var wg sync.WaitGroup
+
+	// Writer goroutines mutating serverNames under write lock
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				name := fmt.Sprintf("sub%d-%d.example.com", id, j)
+				tlsApp.RegisterServerNames([]string{name}, []string{"h2", "h3"})
+			}
+		}(i)
+	}
+
+	// Reader goroutines iterating serverNames under read lock
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				tlsApp.serverNamesMu.RLock()
+				serverNamesSet := make(map[string]struct{}, len(tlsApp.serverNames))
+				for name := range tlsApp.serverNames {
+					serverNamesSet[name] = struct{}{}
+				}
+				tlsApp.serverNamesMu.RUnlock()
+
+				_ = tlsApp.alpnValuesForServerNames([]string{"sub0-1.example.com"})
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestECHDNSPublisherPublishedSvcParams(t *testing.T) {
