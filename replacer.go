@@ -183,11 +183,24 @@ func (r *Replacer) replace(input, empty string,
 		return input, nil
 	}
 
-	var sb strings.Builder
+	var buf *bytes.Buffer
+	defer func() {
+		if buf != nil {
+			if buf.Cap() <= 64*1024 {
+				buf.Reset()
+				bufPool.Put(buf)
+			}
+		}
+	}()
 
-	// it is reasonable to assume that the output
-	// will be approximately as long as the input
-	sb.Grow(len(input))
+	getBuf := func() *bytes.Buffer {
+		if buf == nil {
+			buf = bufPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			buf.Grow(len(input))
+		}
+		return buf
+	}
 
 	// iterate the input to find each placeholder
 	var lastWriteCursor int
@@ -202,7 +215,7 @@ scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
-			sb.WriteString(input[lastWriteCursor : i-1])
+			getBuf().WriteString(input[lastWriteCursor : i-1])
 			lastWriteCursor = i
 			continue
 		}
@@ -235,9 +248,6 @@ scan:
 			end += nextEnd + 1
 		}
 
-		// write the substring from the last cursor to this point
-		sb.WriteString(input[lastWriteCursor:i])
-
 		// trim opening bracket
 		key := input[i+1 : end]
 
@@ -261,7 +271,6 @@ scan:
 			} else if !treatUnknownAsEmpty {
 				// if treatUnknownAsEmpty is true, we'll handle an empty
 				// val later; so only continue otherwise
-				lastWriteCursor = i
 				continue
 			}
 		}
@@ -285,10 +294,17 @@ scan:
 				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
 					string(phOpen), key, string(phClose))
 			} else if empty != "" {
-				sb.WriteString(empty)
+				b := getBuf()
+				b.WriteString(input[lastWriteCursor:i])
+				b.WriteString(empty)
+			} else {
+				b := getBuf()
+				b.WriteString(input[lastWriteCursor:i])
 			}
 		} else {
-			sb.WriteString(valStr)
+			b := getBuf()
+			b.WriteString(input[lastWriteCursor:i])
+			b.WriteString(valStr)
 		}
 
 		// advance cursor to end of placeholder
@@ -296,10 +312,14 @@ scan:
 		lastWriteCursor = i + 1
 	}
 
-	// flush any unwritten remainder
-	sb.WriteString(input[lastWriteCursor:])
+	if buf == nil {
+		return input, nil
+	}
 
-	return sb.String(), nil
+	// flush any unwritten remainder
+	buf.WriteString(input[lastWriteCursor:])
+
+	return buf.String(), nil
 }
 
 // ToString returns val as a string, as efficiently as possible.
