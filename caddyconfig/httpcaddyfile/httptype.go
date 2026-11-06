@@ -1816,6 +1816,15 @@ func WasReplacedPlaceholderShorthand(token string) string {
 			return prev
 		}
 	}
+
+	replacer := NewShorthandReplacer()
+	tokenWithBraces := "{" + strings.Trim(token, "{}") + "}"
+	for _, c := range replacer.complex {
+		if c.inverse != nil && c.inverse.MatchString(tokenWithBraces) {
+			return c.inverse.ReplaceAllString(tokenWithBraces, c.inverseReplace)
+		}
+	}
+
 	return ""
 }
 

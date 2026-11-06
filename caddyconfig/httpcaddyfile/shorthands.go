@@ -8,8 +8,10 @@ import (
 )
 
 type ComplexShorthandReplacer struct {
-	search  *regexp.Regexp
-	replace string
+	search         *regexp.Regexp
+	replace        string
+	inverse        *regexp.Regexp
+	inverseReplace string
 }
 
 type ShorthandReplacer struct {
@@ -27,18 +29,78 @@ func NewShorthandReplacer() ShorthandReplacer {
 	// parameters, but we still want to provide a shorthand
 	// for those, so we use a regexp to replace
 	regexpReplacements := []ComplexShorthandReplacer{
-		{regexp.MustCompile(`{header\.([\w-]*)}`), "{http.request.header.$1}"},
-		{regexp.MustCompile(`{cookie\.([\w-]*)}`), "{http.request.cookie.$1}"},
-		{regexp.MustCompile(`{labels\.([\w-]*)}`), "{http.request.host.labels.$1}"},
-		{regexp.MustCompile(`{path\.([\w-]*)}`), "{http.request.uri.path.$1}"},
-		{regexp.MustCompile(`{file\.([\w-]*)}`), "{http.request.uri.path.file.$1}"},
-		{regexp.MustCompile(`{query\.([\w-]*)}`), "{http.request.uri.query.$1}"},
-		{regexp.MustCompile(`{re\.([\w-\.]*)}`), "{http.regexp.$1}"},
-		{regexp.MustCompile(`{vars\.([\w-]*)}`), "{http.vars.$1}"},
-		{regexp.MustCompile(`{rp\.([\w-\.]*)}`), "{http.reverse_proxy.$1}"},
-		{regexp.MustCompile(`{resp\.([\w-\.]*)}`), "{http.intercept.$1}"},
-		{regexp.MustCompile(`{err\.([\w-\.]*)}`), "{http.error.$1}"},
-		{regexp.MustCompile(`{file_match\.([\w-]*)}`), "{http.matchers.file.$1}"},
+		{
+			search:         regexp.MustCompile(`{header\.([\w-]*)}`),
+			replace:        "{http.request.header.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.request\.header\.([\w-]*)\}$`),
+			inverseReplace: "{header.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{cookie\.([\w-]*)}`),
+			replace:        "{http.request.cookie.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.request\.cookie\.([\w-]*)\}$`),
+			inverseReplace: "{cookie.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{labels\.([\w-]*)}`),
+			replace:        "{http.request.host.labels.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.request\.host\.labels\.([\w-]*)\}$`),
+			inverseReplace: "{labels.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{path\.([\w-]*)}`),
+			replace:        "{http.request.uri.path.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.request\.uri\.path\.([\w-]*)\}$`),
+			inverseReplace: "{path.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{file\.([\w-]*)}`),
+			replace:        "{http.request.uri.path.file.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.request\.uri\.path\.file\.([\w-]*)\}$`),
+			inverseReplace: "{file.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{query\.([\w-]*)}`),
+			replace:        "{http.request.uri.query.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.request\.uri\.query\.([\w-]*)\}$`),
+			inverseReplace: "{query.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{re\.([\w-\.]*)}`),
+			replace:        "{http.regexp.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.regexp\.([\w-\.]*)\}$`),
+			inverseReplace: "{re.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{vars\.([\w-]*)}`),
+			replace:        "{http.vars.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.vars\.([\w-]*)\}$`),
+			inverseReplace: "{vars.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{rp\.([\w-\.]*)}`),
+			replace:        "{http.reverse_proxy.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.reverse_proxy\.([\w-\.]*)\}$`),
+			inverseReplace: "{rp.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{resp\.([\w-\.]*)}`),
+			replace:        "{http.intercept.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.intercept\.([\w-\.]*)\}$`),
+			inverseReplace: "{resp.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{err\.([\w-\.]*)}`),
+			replace:        "{http.error.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.error\.([\w-\.]*)\}$`),
+			inverseReplace: "{err.$1}",
+		},
+		{
+			search:         regexp.MustCompile(`{file_match\.([\w-]*)}`),
+			replace:        "{http.matchers.file.$1}",
+			inverse:        regexp.MustCompile(`^\{http\.matchers\.file\.([\w-]*)\}$`),
+			inverseReplace: "{file_match.$1}",
+		},
 	}
 
 	return ShorthandReplacer{
