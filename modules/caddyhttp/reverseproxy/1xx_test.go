@@ -26,6 +26,19 @@ func (w *trackingResponseWriter) WriteHeader(code int) {
 	w.writtenHeader = append(w.writtenHeader, w.ResponseWriter.Header().Clone())
 	w.mu.Unlock()
 	w.ResponseWriter.WriteHeader(code)
+	if rec, ok := w.ResponseWriter.(*httptest.ResponseRecorder); ok && code >= 200 {
+		rec.Code = code
+	}
+}
+
+func (w *trackingResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *trackingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func Test1xxPreservesDownstreamHeaders(t *testing.T) {
