@@ -1085,9 +1085,9 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 		// for security. If trusted, there is no peer IP to append to
 		// X-Forwarded-For, so clientIP stays empty.
 		if !trusted {
-			delete(req.Header, "X-Forwarded-For")
-			delete(req.Header, "X-Forwarded-Proto")
-			delete(req.Header, "X-Forwarded-Host")
+			delHeaderFold(req.Header, "X-Forwarded-For")
+			delHeaderFold(req.Header, "X-Forwarded-Proto")
+			delHeaderFold(req.Header, "X-Forwarded-Host")
 			return nil
 		}
 	} else {
@@ -1101,9 +1101,9 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 		if err != nil {
 			// Remove the `X-Forwarded-*` headers to avoid upstreams
 			// potentially trusting a header that came from the client
-			delete(req.Header, "X-Forwarded-For")
-			delete(req.Header, "X-Forwarded-Proto")
-			delete(req.Header, "X-Forwarded-Host")
+			delHeaderFold(req.Header, "X-Forwarded-For")
+			delHeaderFold(req.Header, "X-Forwarded-Proto")
+			delHeaderFold(req.Header, "X-Forwarded-Host")
 			return nil
 		}
 
@@ -1129,6 +1129,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 	// retain prior X-Forwarded-For information as a comma+space
 	// separated list and fold multiple headers into one.
 	prior, ok, omit := allHeaderValues(req.Header, "X-Forwarded-For")
+	delHeaderFold(req.Header, "X-Forwarded-For")
 	if !omit {
 		if trusted && ok && prior != "" {
 			if clientIP != "" {
@@ -1149,6 +1150,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 		proto = "http"
 	}
 	prior, ok, omit = lastHeaderValue(req.Header, "X-Forwarded-Proto")
+	delHeaderFold(req.Header, "X-Forwarded-Proto")
 	if trusted && ok && prior != "" {
 		proto = prior
 	}
@@ -1162,6 +1164,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
 	// Host themselves, so it's helpful to send the original too.
 	host := req.Host
 	prior, ok, omit = lastHeaderValue(req.Header, "X-Forwarded-Host")
+	delHeaderFold(req.Header, "X-Forwarded-Host")
 	if trusted && ok && prior != "" {
 		host = prior
 	}
@@ -1811,6 +1814,14 @@ func copyHeader(dst, src http.Header) {
 	}
 }
 
+func delHeaderFold(h http.Header, field string) {
+	for k := range h {
+		if strings.EqualFold(k, field) {
+			delete(h, k)
+		}
+	}
+}
+
 // recordUpstreamRoundTrip publishes latency placeholders, records circuit
 // breaker metrics, and applies passive health-check strikes for one
 // completed upstream attempt. Used by both the HTTP round-trip path and
@@ -1844,9 +1855,23 @@ func (h *Handler) recordUpstreamRoundTrip(di DialInfo, repl *caddy.Replacer, sta
 // false. Callers should still check that the value is not empty
 // (the header field may be set but have an empty value).
 func allHeaderValues(h http.Header, field string) (value string, ok bool, omit bool) {
-	values, ok := h[http.CanonicalHeaderKey(field)]
-	if ok && values == nil {
-		return "", true, true
+	var keys []string
+	for k := range h {
+		if strings.EqualFold(k, field) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return "", false, false
+	}
+	slices.Sort(keys)
+	var values []string
+	for _, k := range keys {
+		v := h[k]
+		if v == nil {
+			return "", true, true
+		}
+		values = append(values, v...)
 	}
 	if len(values) == 0 {
 		return "", false, false
@@ -1862,9 +1887,23 @@ func allHeaderValues(h http.Header, field string) (value string, ok bool, omit b
 // still check that the value is not empty (the header field
 // may be set but have an empty value).
 func lastHeaderValue(h http.Header, field string) (value string, ok bool, omit bool) {
-	values, ok := h[http.CanonicalHeaderKey(field)]
-	if ok && values == nil {
-		return "", true, true
+	var keys []string
+	for k := range h {
+		if strings.EqualFold(k, field) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return "", false, false
+	}
+	slices.Sort(keys)
+	var values []string
+	for _, k := range keys {
+		v := h[k]
+		if v == nil {
+			return "", true, true
+		}
+		values = append(values, v...)
 	}
 	if len(values) == 0 {
 		return "", false, false
