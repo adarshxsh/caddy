@@ -27,13 +27,13 @@ import (
 // parseVariadic determines if the token is a variadic placeholder,
 // and if so, determines the index range (start/end) of args to use.
 // Returns a boolean signaling whether a variadic placeholder was found,
-// and the start and end indices.
-func parseVariadic(token Token, argCount int) (bool, int, int) {
+// whether its bounds are valid, and the start and end indices.
+func parseVariadic(token Token, argCount int) (bool, bool, int, int) {
 	if !strings.HasPrefix(token.Text, "{args[") {
-		return false, 0, 0
+		return false, false, 0, 0
 	}
 	if !strings.HasSuffix(token.Text, "]}") {
-		return false, 0, 0
+		return false, false, 0, 0
 	}
 
 	argRange := strings.TrimSuffix(strings.TrimPrefix(token.Text, "{args["), "]}")
@@ -41,7 +41,7 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 		caddy.Log().Named("caddyfile").Warn(
 			"Placeholder "+token.Text+" cannot have an empty index",
 			zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-		return false, 0, 0
+		return false, false, 0, 0
 	}
 
 	start, end, found := strings.Cut(argRange, ":")
@@ -49,14 +49,14 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 	// If no ":" delimiter is found, this is not a variadic.
 	// The replacer will pick this up.
 	if !found {
-		return false, 0, 0
+		return false, false, 0, 0
 	}
 
 	// A valid token may contain several placeholders, and
 	// they may be separated by ":". It's not variadic.
 	// https://github.com/caddyserver/caddy/issues/5716
 	if strings.Contains(start, "}") || strings.Contains(end, "{") {
-		return false, 0, 0
+		return false, false, 0, 0
 	}
 
 	var (
@@ -70,7 +70,7 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 			caddy.Log().Named("caddyfile").Warn(
 				"Variadic placeholder "+token.Text+" has an invalid start index",
 				zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-			return false, 0, 0
+			return true, false, 0, 0
 		}
 	}
 	if end != "" {
@@ -79,7 +79,7 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 			caddy.Log().Named("caddyfile").Warn(
 				"Variadic placeholder "+token.Text+" has an invalid end index",
 				zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-			return false, 0, 0
+			return true, false, 0, 0
 		}
 	}
 
@@ -88,9 +88,17 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 		caddy.Log().Named("caddyfile").Warn(
 			"Variadic placeholder "+token.Text+" indices are out of bounds, only "+strconv.Itoa(argCount)+" argument(s) exist",
 			zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
-		return false, 0, 0
+		return true, false, 0, 0
 	}
-	return true, startIndex, endIndex
+
+	if startIndex == endIndex {
+		caddy.Log().Named("caddyfile").Warn(
+			"Variadic placeholder "+token.Text+" evaluated to 0 arguments",
+			zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
+		return true, false, 0, 0
+	}
+
+	return true, true, startIndex, endIndex
 }
 
 // makeArgsReplacer prepares a Replacer which can replace
