@@ -205,6 +205,10 @@ type Handler struct {
 	// by the previous config closing. Default: no delay.
 	StreamCloseDelay caddy.Duration `json:"stream_close_delay,omitempty"`
 
+	// If nonzero, write operations on upgraded streaming connections (such as WebSockets)
+	// will enforce this write timeout per write buffer. Default: 30s.
+	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
+
 	// If true, upgraded connections such as WebSockets are detached from
 	// the handler and retained across config reloads when their upstream
 	// still exists in the new config. Connections using upstreams that are

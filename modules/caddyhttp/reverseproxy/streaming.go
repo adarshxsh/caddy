@@ -59,6 +59,10 @@ func (rwc extendedConnectReadWriteCloser) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+func (rwc extendedConnectReadWriteCloser) SetWriteDeadline(t time.Time) error {
+	return http.NewResponseController(rwc.ResponseWriter).SetWriteDeadline(t)
+}
+
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWriter, req *http.Request, res *http.Response, upstreamAddr string) {
 	// Until the tunnel takes ownership, every setup failure must close the
 	// backend body and any hijacked client connection. net/http no longer
@@ -108,6 +112,9 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	// is not referenced after this function returns (for HTTP/1.1 hijacked
 	// connections the tunnel runs in a detached goroutine).
 	tunnel := h.tunnelTracker
+	if tunnel == nil {
+		tunnel = newTunnelTracker(logger, 0)
+	}
 	bufferSize := h.StreamBufferSize
 	streamTimeout := time.Duration(h.StreamTimeout)
 
@@ -182,6 +189,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 		}
 	}
 
+
 	if err := brw.Flush(); err != nil {
 		if c := logger.Check(zapcore.DebugLevel, "response flush"); c != nil {
 			c.Write(zap.Error(err))
@@ -229,11 +237,17 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	streamLevel := h.streamLogLevel
 	finishMetrics := trackActiveStream(upstreamAddr)
 
+	writeTimeout := time.Duration(h.WriteTimeout)
+	if writeTimeout == 0 {
+		writeTimeout = 30 * time.Second
+	}
+
 	start := time.Now()
 
 	tunnelOwnsConnections = true
 	if !detached {
 		handleUpgradeTunnel(
+			req.Context(),
 			streamLogger,
 			streamLevel,
 			conn,
@@ -242,6 +256,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 			deleteBackConn,
 			bufferSize,
 			streamTimeout,
+			writeTimeout,
 			start,
 			finishMetrics,
 			streamFields,
@@ -249,6 +264,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	} else {
 		// start a new goroutine
 		go handleUpgradeTunnel(
+			context.Background(),
 			streamLogger,
 			streamLevel,
 			conn,
@@ -257,6 +273,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 			deleteBackConn,
 			bufferSize,
 			streamTimeout,
+			writeTimeout,
 			start,
 			finishMetrics,
 			streamFields,
@@ -266,6 +283,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 
 // handleUpgradeTunnel returns when transfer is done.
 func handleUpgradeTunnel(
+	ctx context.Context,
 	streamLogger *zap.Logger,
 	streamLevel zapcore.Level,
 	conn io.ReadWriteCloser,
@@ -274,6 +292,7 @@ func handleUpgradeTunnel(
 	deleteBackConn func(),
 	bufferSize int,
 	streamTimeout time.Duration,
+	writeTimeout time.Duration,
 	start time.Time,
 	finishMetrics func(result string, duration time.Duration, toBackend int64, fromBackend int64),
 	streamFields []zap.Field,
@@ -293,12 +312,13 @@ func handleUpgradeTunnel(
 	// see: https://github.com/caddyserver/caddy/issues/7418
 	errc := make(chan error, 2)
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
-		wg:         &wg,
-		bufferSize: bufferSize,
-		sent:       &toBackend,
-		received:   &fromBackend,
+		user:         conn,
+		backend:      backConn,
+		wg:           &wg,
+		bufferSize:   bufferSize,
+		writeTimeout: writeTimeout,
+		sent:         &toBackend,
+		received:     &fromBackend,
 	}
 	wg.Add(2)
 
@@ -350,6 +370,12 @@ copyLoop:
 				c.Write(zap.Time("timeout", t))
 			}
 			break copyLoop
+		case <-ctx.Done():
+			result = classifyStreamResult(ctx.Err())
+			if c := streamLogger.Check(streamLevel, "context canceled"); c != nil {
+				c.Write(zap.Error(ctx.Err()))
+			}
+			break copyLoop
 		}
 	}
 
@@ -389,7 +415,6 @@ func makeStreamLogFields(streamUUID string) []zap.Field {
 	}
 	return fields
 }
-
 // flushInterval returns the p.FlushInterval value, conditionally
 // overriding its value for a specific request/response.
 func (h Handler) flushInterval(req *http.Request, res *http.Response, incremental bool) time.Duration {
@@ -851,12 +876,27 @@ func (m *maxLatencyWriter) stop() {
 	}
 }
 
+type deadlinedWriter struct {
+	w       io.Writer
+	timeout time.Duration
+}
+
+func (dw deadlinedWriter) Write(p []byte) (int, error) {
+	if dw.timeout > 0 {
+		if conn, ok := dw.w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = conn.SetWriteDeadline(time.Now().Add(dw.timeout))
+		}
+	}
+	return dw.w.Write(p)
+}
+
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
 	user, backend io.ReadWriteCloser
 	wg            *sync.WaitGroup
 	bufferSize    int
+	writeTimeout  time.Duration
 	// sent and received accumulate byte counts for each direction.
 	// They are written before wg.Done() and read after wg.Wait(), so no
 	// additional synchronization is needed beyond the WaitGroup barrier.
@@ -871,7 +911,8 @@ var errCopyDone = errors.New("hijacked connection copy complete")
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 	defer c.wg.Done()
-	n, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	w := deadlinedWriter{w: c.user, timeout: c.writeTimeout}
+	n, err := io.CopyBuffer(w, c.backend, c.buffer())
 	*c.received = n
 	if err != nil {
 		errc <- err
@@ -889,7 +930,8 @@ func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	defer c.wg.Done()
-	n, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	w := deadlinedWriter{w: c.backend, timeout: c.writeTimeout}
+	n, err := io.CopyBuffer(w, c.user, c.buffer())
 	*c.sent = n
 	if err != nil {
 		errc <- err

@@ -106,6 +106,9 @@ func initReverseProxyMetrics(handler *Handler, registry *prometheus.Registry) {
 }
 
 func trackActiveStream(upstream string) func(result string, duration time.Duration, toBackend, fromBackend int64) {
+	if reverseProxyMetrics.streamsActive == nil {
+		return func(result string, duration time.Duration, toBackend, fromBackend int64) {}
+	}
 	labels := prometheus.Labels{"upstream": upstream}
 	reverseProxyMetrics.streamsActive.With(labels).Inc()
 
