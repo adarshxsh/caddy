@@ -187,6 +187,9 @@ func (s *SessionTicketService) unregister(cfg *tls.Config) {
 // RotateSTEKs rotates the keys in keys by producing a new key and eliding
 // the oldest one. The new slice of keys is returned.
 func (s SessionTicketService) RotateSTEKs(keys [][32]byte) ([][32]byte, error) {
+	if s.MaxKeys <= 0 {
+		s.MaxKeys = defaultMaxSTEKs
+	}
 	// produce a new key
 	newKey, err := s.generateSTEK()
 	if err != nil {
