@@ -60,6 +60,8 @@ func (rwc extendedConnectReadWriteCloser) Write(p []byte) (n int, err error) {
 }
 
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWriter, req *http.Request, res *http.Response, upstreamAddr string) {
+	canonicalizeHeaders(req.Header)
+	canonicalizeHeaders(res.Header)
 	// Until the tunnel takes ownership, every setup failure must close the
 	// backend body and any hijacked client connection. net/http no longer
 	// owns the client socket after a successful hijack.
@@ -760,6 +762,10 @@ func newMaskKey() [4]byte {
 // isWebsocket returns true if r looks to be an upgrade request for WebSockets.
 // It is a fairly naive check.
 func isWebsocket(r *http.Request) bool {
+	if r == nil || r.Header == nil {
+		return false
+	}
+	canonicalizeHeaders(r.Header)
 	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
 }
