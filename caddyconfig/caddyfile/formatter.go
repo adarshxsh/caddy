@@ -106,6 +106,26 @@ func FormatWithOptions(input []byte, opts FormatOptions) []byte {
 	return out
 }
 
+// updateQuoteState scans s for unescaped double-quote characters and toggles inQuote.
+func updateQuoteState(s string, inQuote bool) bool {
+	escaped := false
+	for i := range len(s) {
+		ch := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inQuote = !inQuote
+		}
+	}
+	return inQuote
+}
+
 // lexFormat captures comments and raw source while only normalizing braces the
 // parser already recognized as standalone structural tokens. Public Lex options
 // intentionally do not change ordinary token boundaries.
@@ -114,7 +134,16 @@ func lexFormat(input []byte) ([]Token, error) {
 	if err != nil {
 		return nil, err
 	}
+	inQuote := false
 	for i := range tokens {
+		raw := tokens[i].Raw()
+		if tokens[i].wasQuoted == 0 {
+			if inQuote {
+				tokens[i].wasQuoted = '"'
+				tokens[i].isComment = false
+			}
+			inQuote = updateQuoteState(raw, inQuote)
+		}
 		if isOpenCurlyBrace(tokens[i]) || isCloseCurlyBrace(tokens[i]) {
 			tokens[i].raw = tokens[i].Text
 			tokens[i].continuation = false
