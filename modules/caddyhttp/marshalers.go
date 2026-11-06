@@ -73,6 +73,8 @@ type LoggableTLSConnState tls.ConnectionState
 // MarshalLogObject satisfies the zapcore.ObjectMarshaler interface.
 func (t LoggableTLSConnState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	enc.AddBool("resumed", t.DidResume)
+	enc.AddBool("handshake_complete", t.HandshakeComplete)
+	enc.AddBool("early_data", !t.HandshakeComplete)
 	enc.AddUint16("version", t.Version)
 	enc.AddUint16("cipher_suite", t.CipherSuite)
 	enc.AddString("proto", t.NegotiatedProtocol)

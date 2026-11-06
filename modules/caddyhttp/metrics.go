@@ -97,6 +97,7 @@ type httpMetrics struct {
 	requestSize      *prometheus.HistogramVec
 	responseSize     *prometheus.HistogramVec
 	responseDuration *prometheus.HistogramVec
+	requestEarlyData *prometheus.CounterVec
 }
 
 func initHTTPMetrics(ctx caddy.Context, metrics *Metrics) {
@@ -124,6 +125,14 @@ func initHTTPMetrics(ctx caddy.Context, metrics *Metrics) {
 		Name:      "requests_total",
 		Help:      "Counter of HTTP(S) requests made.",
 	}, basicLabels)
+
+	earlyDataLabels := append(append([]string{}, basicLabels...), "status")
+	metrics.httpMetrics.requestEarlyData = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns,
+		Subsystem: sub,
+		Name:      "early_data_requests_total",
+		Help:      "Counter of HTTP(S) requests by 0-RTT early data state.",
+	}, earlyDataLabels)
 
 	// TODO: allow these to be customized in the config
 	durationBuckets := prometheus.DefBuckets
@@ -311,6 +320,20 @@ func newMetricsInstrumentedRoute(ctx caddy.Context, handler string, next Handler
 	return &metricsInstrumentedRoute{handler: handler, next: next, metrics: m}
 }
 
+func classifyEarlyData(r *http.Request) string {
+	if r.TLS == nil {
+		return "none"
+	}
+	if r.TLS.DidResume && !r.TLS.HandshakeComplete {
+		return "accepted"
+	}
+	isHTTP3 := r.ProtoMajor == 3 || strings.HasPrefix(r.Proto, "HTTP/3") || strings.HasPrefix(r.TLS.NegotiatedProtocol, "h3")
+	if r.TLS.DidResume && r.TLS.HandshakeComplete && isHTTP3 {
+		return "rejected_fallback"
+	}
+	return "none"
+}
+
 func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 	server := serverNameFromContext(r.Context())
 	labels := prometheus.Labels{"server": server, "handler": h.handler}
@@ -334,6 +357,16 @@ func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	earlyDataStatus := classifyEarlyData(r)
+	earlyDataLabels := prometheus.Labels{
+		"server":  server,
+		"handler": h.handler,
+		"status":  earlyDataStatus,
+	}
+	if h.metrics.PerHost {
+		earlyDataLabels["host"] = labels["host"]
+	}
+
 	inFlight := h.metrics.httpMetrics.requestInFlight.With(labels)
 	inFlight.Inc()
 	defer inFlight.Dec()
@@ -353,6 +386,7 @@ func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Requ
 	err := h.next.ServeHTTP(wrec, r)
 	dur := time.Since(start).Seconds()
 	h.metrics.httpMetrics.requestCount.With(labels).Inc()
+	h.metrics.httpMetrics.requestEarlyData.With(earlyDataLabels).Inc()
 
 	observeRequest := func(status int) {
 		// If the code hasn't been set yet, and we didn't encounter an error, we're

@@ -573,6 +573,65 @@ func TestMetricsShutdownNilReceiver(t *testing.T) {
 	}
 }
 
+func TestMetricsEarlyDataCounter(t *testing.T) {
+	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
+	metrics := &Metrics{
+		init:        sync.Once{},
+		httpMetrics: &httpMetrics{},
+	}
+
+	h := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	ih := newMetricsInstrumentedRoute(ctx, "test", h, metrics)
+
+	// 1. Accepted early data request (DidResume=true, HandshakeComplete=false)
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.TLS = &tls.ConnectionState{
+		DidResume:         true,
+		HandshakeComplete: false,
+	}
+	ih.ServeHTTP(httptest.NewRecorder(), r1)
+
+	// 2. Rejected fallback request on HTTP/3 (DidResume=true, HandshakeComplete=true, HTTP/3)
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.ProtoMajor = 3
+	r2.Proto = "HTTP/3.0"
+	r2.TLS = &tls.ConnectionState{
+		DidResume:         true,
+		HandshakeComplete: true,
+	}
+	ih.ServeHTTP(httptest.NewRecorder(), r2)
+
+	// 3. Standard TLS handshake (DidResume=false, HandshakeComplete=true)
+	r3 := httptest.NewRequest("GET", "/", nil)
+	r3.TLS = &tls.ConnectionState{
+		DidResume:         false,
+		HandshakeComplete: true,
+	}
+	ih.ServeHTTP(httptest.NewRecorder(), r3)
+
+	// 4. Unencrypted HTTP request (r.TLS = nil)
+	r4 := httptest.NewRequest("GET", "/", nil)
+	ih.ServeHTTP(httptest.NewRecorder(), r4)
+
+	expected := `
+	# HELP caddy_http_early_data_requests_total Counter of HTTP(S) requests by 0-RTT early data state.
+	# TYPE caddy_http_early_data_requests_total counter
+	caddy_http_early_data_requests_total{handler="test",server="UNKNOWN",status="accepted"} 1
+	caddy_http_early_data_requests_total{handler="test",server="UNKNOWN",status="none"} 2
+	caddy_http_early_data_requests_total{handler="test",server="UNKNOWN",status="rejected_fallback"} 1
+	`
+
+	if err := testutil.GatherAndCompare(ctx.GetMetricsRegistry(), strings.NewReader(expected),
+		"caddy_http_early_data_requests_total",
+	); err != nil {
+		t.Errorf("Early data metrics test failed: %s", err)
+	}
+}
+
 func BenchmarkMetricsInstrumentedRoute(b *testing.B) {
 	ctx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
 	m := &Metrics{
