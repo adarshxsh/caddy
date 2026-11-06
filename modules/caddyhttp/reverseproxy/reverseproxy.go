@@ -205,6 +205,11 @@ type Handler struct {
 	// by the previous config closing. Default: no delay.
 	StreamCloseDelay caddy.Duration `json:"stream_close_delay,omitempty"`
 
+	// If nonzero, periodic RFC 6455 Ping frames will be sent at this
+	// interval on upgraded WebSocket streams to keep connections active and
+	// detect dead peers. Default: no keepalive.
+	StreamKeepAlive caddy.Duration `json:"stream_keepalive,omitempty"`
+
 	// If true, upgraded connections such as WebSockets are detached from
 	// the handler and retained across config reloads when their upstream
 	// still exists in the new config. Connections using upstreams that are

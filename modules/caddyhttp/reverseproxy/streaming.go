@@ -110,6 +110,8 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	tunnel := h.tunnelTracker
 	bufferSize := h.StreamBufferSize
 	streamTimeout := time.Duration(h.StreamTimeout)
+	streamKeepAlive := time.Duration(h.StreamKeepAlive)
+	isWs := isWebsocket(req)
 
 	var (
 		brw      *bufio.ReadWriter
@@ -182,6 +184,9 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 		}
 	}
 
+	conn = &syncWriterConn{ReadWriteCloser: conn}
+	backConn = &syncWriterConn{ReadWriteCloser: backConn}
+
 	if err := brw.Flush(); err != nil {
 		if c := logger.Check(zapcore.DebugLevel, "response flush"); c != nil {
 			c.Write(zap.Error(err))
@@ -209,7 +214,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	// client side of the proxy. Note that gracefulClose must not capture h,
 	// since the tunnel may outlive the handler instance.
 	gracefulClose := func(conn io.ReadWriteCloser, isClient bool) func() error {
-		if isWebsocket(req) {
+		if isWs {
 			return func() error {
 				return writeCloseControl(conn, isClient)
 			}
@@ -242,6 +247,8 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 			deleteBackConn,
 			bufferSize,
 			streamTimeout,
+			streamKeepAlive,
+			isWs,
 			start,
 			finishMetrics,
 			streamFields,
@@ -257,6 +264,8 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 			deleteBackConn,
 			bufferSize,
 			streamTimeout,
+			streamKeepAlive,
+			isWs,
 			start,
 			finishMetrics,
 			streamFields,
@@ -274,6 +283,8 @@ func handleUpgradeTunnel(
 	deleteBackConn func(),
 	bufferSize int,
 	streamTimeout time.Duration,
+	streamKeepAlive time.Duration,
+	isWebsocket bool,
 	start time.Time,
 	finishMetrics func(result string, duration time.Duration, toBackend int64, fromBackend int64),
 	streamFields []zap.Field,
@@ -302,6 +313,45 @@ func handleUpgradeTunnel(
 	}
 	wg.Add(2)
 
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			conn.Close()
+			backConn.Close()
+		})
+	}
+
+	keepaliveStop := make(chan struct{})
+	defer close(keepaliveStop)
+
+	if isWebsocket && streamKeepAlive > 0 {
+		go func() {
+			ticker := time.NewTicker(streamKeepAlive)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-keepaliveStop:
+					return
+				case <-ticker.C:
+					if err := writePingControl(conn, false); err != nil {
+						if c := streamLogger.Check(zapcore.DebugLevel, "keepalive ping to user failed"); c != nil {
+							c.Write(zap.Error(err))
+						}
+						closeBoth()
+						return
+					}
+					if err := writePingControl(backConn, true); err != nil {
+						if c := streamLogger.Check(zapcore.DebugLevel, "keepalive ping to backend failed"); c != nil {
+							c.Write(zap.Error(err))
+						}
+						closeBoth()
+						return
+					}
+				}
+			}
+		}()
+	}
 	var timeoutc <-chan time.Time
 	if streamTimeout > 0 {
 		timer := time.NewTimer(streamTimeout)
@@ -355,8 +405,7 @@ copyLoop:
 
 	// Close both ends to unblock the still-running copy goroutine,
 	// then wait for it so byte counts are final before metrics/logging.
-	conn.Close()
-	backConn.Close()
+	closeBoth()
 	wg.Wait()
 
 	finishMetrics(result, time.Since(start), toBackend, fromBackend)
@@ -705,6 +754,58 @@ func writeCloseControl(conn io.Writer, isClient bool) error {
 	// TODO: we might need to ensure we are the exclusive writer by this point (io.Copy is stopped)?
 	_, err := conn.Write(buf[:msgLength])
 	return err
+}
+
+// writePingControl sends an RFC 6455 Ping control message (opcode 0x9) to the connection.
+// If isClient is true, the frame header sets the mask bit and includes a 4-byte mask key per Section 5.3.
+func writePingControl(conn io.Writer, isClient bool) error {
+	const pingMessage = 9
+	const finalBit = 1 << 7
+	const maskBit = 1 << 7
+
+	b0 := byte(pingMessage) | finalBit
+	var buf []byte
+	if isClient {
+		b1 := byte(maskBit)
+		key := newMaskKey()
+		buf = []byte{b0, b1, key[0], key[1], key[2], key[3]}
+	} else {
+		b1 := byte(0)
+		buf = []byte{b0, b1}
+	}
+	_, err := conn.Write(buf)
+	return err
+}
+
+// syncWriterConn wraps a ReadWriteCloser with a Mutex to ensure
+// thread-safe concurrent writes (e.g. data frames and control frames).
+type syncWriterConn struct {
+	io.ReadWriteCloser
+	mu sync.Mutex
+}
+
+func (s *syncWriterConn) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ReadWriteCloser.Write(p)
+}
+
+func (s *syncWriterConn) CloseWrite() error {
+	if cw, ok := s.ReadWriteCloser.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errCopyDone
+}
+
+func (s *syncWriterConn) CloseRead() error {
+	if cr, ok := s.ReadWriteCloser.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
+func (s *syncWriterConn) Unwrap() io.ReadWriteCloser {
+	return s.ReadWriteCloser
 }
 
 // Copied from https://github.com/gorilla/websocket/blob/v1.5.0/mask.go

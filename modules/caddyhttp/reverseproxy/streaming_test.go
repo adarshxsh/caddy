@@ -180,6 +180,188 @@ type nopReadWriteCloser struct {
 
 func (nopReadWriteCloser) Close() error { return nil }
 
+type pipeUpgradeWriter struct {
+	*httptest.ResponseRecorder
+	conn net.Conn
+}
+
+func (w pipeUpgradeWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.conn, bufio.NewReadWriter(bufio.NewReader(w.conn), bufio.NewWriter(w.conn)), nil
+}
+
+func TestWritePingControl(t *testing.T) {
+	// Server side (isClient = false): expect 2 bytes (0x89 0x00)
+	var serverBuf bytes.Buffer
+	if err := writePingControl(&serverBuf, false); err != nil {
+		t.Fatalf("writePingControl(server) failed: %v", err)
+	}
+	serverBytes := serverBuf.Bytes()
+	if len(serverBytes) != 2 {
+		t.Fatalf("expected 2 bytes for server ping, got %d", len(serverBytes))
+	}
+	if serverBytes[0] != 0x89 {
+		t.Errorf("expected opcode 0x89, got 0x%x", serverBytes[0])
+	}
+	if serverBytes[1] != 0x00 {
+		t.Errorf("expected header byte 1 to be 0x00, got 0x%x", serverBytes[1])
+	}
+
+	// Client side (isClient = true): expect 6 bytes (0x89 0x80 + 4 mask bytes)
+	var clientBuf bytes.Buffer
+	if err := writePingControl(&clientBuf, true); err != nil {
+		t.Fatalf("writePingControl(client) failed: %v", err)
+	}
+	clientBytes := clientBuf.Bytes()
+	if len(clientBytes) != 6 {
+		t.Fatalf("expected 6 bytes for client ping, got %d", len(clientBytes))
+	}
+	if clientBytes[0] != 0x89 {
+		t.Errorf("expected opcode 0x89, got 0x%x", clientBytes[0])
+	}
+	if clientBytes[1] != 0x80 {
+		t.Errorf("expected header byte 1 mask bit 0x80, got 0x%x", clientBytes[1])
+	}
+}
+
+func TestSyncWriterConnConcurrentWrites(t *testing.T) {
+	var dst bytes.Buffer
+	conn := &syncWriterConn{ReadWriteCloser: nopReadWriteCloser{Writer: &dst}}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_, _ = conn.Write([]byte("test"))
+			}
+		}()
+	}
+	wg.Wait()
+
+	if dst.Len() != 10*100*4 {
+		t.Fatalf("expected dst length %d, got %d", 10*100*4, dst.Len())
+	}
+}
+
+func TestWebSocketKeepalivePingAndDeadSocket(t *testing.T) {
+	userClient, userServer := net.Pipe()
+	backClient, backServer := net.Pipe()
+
+	defer userClient.Close()
+	defer backClient.Close()
+
+	rec := httptest.NewRecorder()
+	rw := pipeUpgradeWriter{ResponseRecorder: rec, conn: userServer}
+	recorder := caddyhttp.NewResponseRecorder(rw, nil, nil)
+	req := caddyhttp.PrepareRequest(httptest.NewRequest(http.MethodGet, "http://example.com", nil), caddy.NewReplacer(), recorder, &caddyhttp.Server{})
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	res := &http.Response{
+		StatusCode: http.StatusSwitchingProtocols,
+		Header:     make(http.Header),
+		Body:       backServer,
+	}
+	res.Header.Set("Connection", "Upgrade")
+	res.Header.Set("Upgrade", "websocket")
+
+	logger := zap.NewNop()
+	h := &Handler{
+		StreamKeepAlive: caddy.Duration(20 * time.Millisecond),
+		tunnelTracker:   newTunnelTracker(logger, 0),
+		logger:          logger,
+	}
+	initReverseProxyMetrics(h, prometheus.NewRegistry())
+
+	upgraded := make(chan struct{})
+	go func() {
+		h.handleUpgradeResponse(logger, recorder, req, res, "127.0.0.1:8080")
+		close(upgraded)
+	}()
+
+	// Read ping from user side
+	buf := make([]byte, 10)
+	_ = userClient.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	n, err := userClient.Read(buf)
+	if err != nil {
+		t.Fatalf("failed to read ping from user client: %v", err)
+	}
+	if n < 2 || buf[0] != 0x89 {
+		t.Fatalf("expected ping opcode 0x89, got frame bytes: %v", buf[:n])
+	}
+
+	// Read ping from backend side
+	_ = backClient.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	n, err = backClient.Read(buf)
+	if err != nil {
+		t.Fatalf("failed to read ping from back client: %v", err)
+	}
+	if n < 6 || buf[0] != 0x89 || buf[1] != 0x80 {
+		t.Fatalf("expected client masked ping opcode 0x89 0x80, got frame bytes: %v", buf[:n])
+	}
+
+	// Close backend connection to simulate connection drop / dead socket
+	_ = backClient.Close()
+
+	// Verify that copier goroutines stop within keepalive period
+	select {
+	case <-upgraded:
+		// Copiers exited promptly
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("copier goroutines failed to stop after dead connection drop")
+	}
+}
+
+func TestNonWebSocketBypassesKeepalive(t *testing.T) {
+	userClient, userServer := net.Pipe()
+	backClient, backServer := net.Pipe()
+
+	defer userClient.Close()
+	defer backClient.Close()
+
+	rec := httptest.NewRecorder()
+	rw := pipeUpgradeWriter{ResponseRecorder: rec, conn: userServer}
+	recorder := caddyhttp.NewResponseRecorder(rw, nil, nil)
+	req := caddyhttp.PrepareRequest(httptest.NewRequest(http.MethodGet, "http://example.com", nil), caddy.NewReplacer(), recorder, &caddyhttp.Server{})
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "custom-proto")
+
+	res := &http.Response{
+		StatusCode: http.StatusSwitchingProtocols,
+		Header:     make(http.Header),
+		Body:       backServer,
+	}
+	res.Header.Set("Connection", "Upgrade")
+	res.Header.Set("Upgrade", "custom-proto")
+
+	logger := zap.NewNop()
+	h := &Handler{
+		StreamKeepAlive: caddy.Duration(20 * time.Millisecond),
+		tunnelTracker:   newTunnelTracker(logger, 0),
+		logger:          logger,
+	}
+	initReverseProxyMetrics(h, prometheus.NewRegistry())
+
+	upgraded := make(chan struct{})
+	go func() {
+		h.handleUpgradeResponse(logger, recorder, req, res, "127.0.0.1:8080")
+		close(upgraded)
+	}()
+
+	// Verify no ping frames are received on non-websocket upgrade
+	buf := make([]byte, 10)
+	_ = userClient.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_, err := userClient.Read(buf)
+	if err == nil {
+		t.Fatalf("expected read timeout for non-websocket upgrade, but received data")
+	}
+
+	_ = userClient.Close()
+	_ = backClient.Close()
+
+	<-upgraded
+}
 type trackingReadWriteCloser struct {
 	closed chan struct{}
 	one    sync.Once
@@ -662,13 +844,20 @@ func (rejectingUpgradeWriter) DetachAfterHijack(detached bool) bool {
 	return !detached
 }
 
-type pipeUpgradeWriter struct {
-	*httptest.ResponseRecorder
-	conn net.Conn
-}
-
-func (w pipeUpgradeWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return w.conn, bufio.NewReadWriter(bufio.NewReader(w.conn), bufio.NewWriter(w.conn)), nil
+func TestCaddyfileStreamKeepalive(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+		reverse_proxy {
+			stream_keepalive 15s
+		}
+	`)
+	h := new(Handler)
+	err := h.UnmarshalCaddyfile(d)
+	if err != nil {
+		t.Fatalf("UnmarshalCaddyfile failed: %v", err)
+	}
+	if h.StreamKeepAlive != caddy.Duration(15*time.Second) {
+		t.Fatalf("expected StreamKeepAlive 15s, got %v", h.StreamKeepAlive)
+	}
 }
 
 func TestUpgradeDetachmentRequiresWriterSupport(t *testing.T) {

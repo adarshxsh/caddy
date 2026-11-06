@@ -99,6 +99,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //	    stream_buffer_size <size>
 //	    stream_timeout     <duration>
 //	    stream_close_delay <duration>
+//	    stream_keepalive   <duration>
 //	    stream_detached
 //	    stream_logs {
 //	        level <debug|info|warn|error>
@@ -719,6 +720,20 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("bad duration value '%s': %v", d.Val(), err)
 				}
 				h.StreamCloseDelay = caddy.Duration(dur)
+			}
+
+		case "stream_keepalive":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			if fi, err := strconv.Atoi(d.Val()); err == nil {
+				h.StreamKeepAlive = caddy.Duration(fi)
+			} else {
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad duration value '%s': %v", d.Val(), err)
+				}
+				h.StreamKeepAlive = caddy.Duration(dur)
 			}
 
 		case "stream_detached":
