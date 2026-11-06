@@ -37,6 +37,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -438,6 +439,44 @@ func (e RequestBodyLimitError) StatusCode() int {
 // Unwrap returns the underlying error value. See the `errors` package for info.
 func (e RequestBodyLimitError) Unwrap() error { return e.Err }
 
+const bodyBytesVarKey = "http.request.body_bytes"
+
+var reqBodyBufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+type bodyBufferReader struct {
+	reader io.Reader
+	buf    *bytes.Buffer
+	mu     sync.Mutex
+	closed bool
+}
+
+func (b *bodyBufferReader) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, io.EOF
+	}
+	return b.reader.Read(p)
+}
+
+func (b *bodyBufferReader) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.closed {
+		b.closed = true
+		if b.buf != nil {
+			b.buf.Reset()
+			reqBodyBufPool.Put(b.buf)
+			b.buf = nil
+		}
+	}
+	return nil
+}
+
 // readRequestBodyForPlaceholder reads the request body into a buffer for the
 // {http.request.body} and {http.request.body_base64} placeholders. Usually the
 // body is copied verbatim and the buffered replacement is installed on req. If
@@ -450,32 +489,60 @@ func (e RequestBodyLimitError) Unwrap() error { return e.Err }
 // before, because the request is probably not going to be served normally
 // anyway and we want to keep the placeholder's behavior unchanged in that case.
 func readRequestBodyForPlaceholder(req *http.Request) ([]byte, error) {
+	if req == nil || req.Body == nil || req.Body == http.NoBody {
+		return []byte{}, nil
+	}
+
+	varMap, ok := req.Context().Value(VarsCtxKey).(map[string]any)
+	if !ok || varMap == nil {
+		varMap = make(map[string]any)
+		*req = *req.WithContext(context.WithValue(req.Context(), VarsCtxKey, varMap))
+	} else {
+		if cachedBytes, ok := varMap[bodyBytesVarKey].([]byte); ok {
+			return cachedBytes, nil
+		}
+		if cachedErr, ok := varMap[bodyBytesVarKey].(error); ok {
+			return nil, cachedErr
+		}
+	}
+
+	buf := reqBodyBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
 	// normally net/http will close the body for us, but since we are replacing
 	// it with a fake one, we have to ensure we close the real body ourselves
 	defer req.Body.Close()
 
-	// read the request body into a buffer (can't pool because we don't know its
-	// lifetime and would have to make a copy anyway)
-	buf := new(bytes.Buffer)
 	_, err := io.Copy(buf, req.Body)
 	if err != nil {
 		var handlerErr HandlerError
 		var maxBytes *http.MaxBytesError
 		if errors.As(err, &handlerErr) && errors.As(handlerErr.Err, &maxBytes) {
-			// return the dedicated body-limit marker carrying only the
-			// MaxBytesError; the generated ID and stack trace of the handler
-			// error are intentionally dropped so a placeholder stringified
-			// into a response body (e.g. respond {http.request.body}) cannot
-			// leak the call stack to the client. consumers recognize this
-			// marker and no other error, so unrelated HandlerError values
-			// keep their existing behavior.
-			return nil, RequestBodyLimitError{Err: maxBytes}
+			buf.Reset()
+			reqBodyBufPool.Put(buf)
+			limitErr := RequestBodyLimitError{Err: maxBytes}
+			varMap[bodyBytesVarKey] = limitErr
+			return nil, limitErr
 		}
 	}
 
-	// replace the real body with the buffered data
-	req.Body = io.NopCloser(buf)
-	return buf.Bytes(), nil
+	if buf.Len() == 0 {
+		buf.Reset()
+		reqBodyBufPool.Put(buf)
+		varMap[bodyBytesVarKey] = []byte{}
+		req.Body = http.NoBody
+		return []byte{}, nil
+	}
+
+	cachedBytes := bytes.Clone(buf.Bytes())
+	varMap[bodyBytesVarKey] = cachedBytes
+
+	req.Body = &bodyBufferReader{
+		reader: bytes.NewReader(buf.Bytes()),
+		buf:    buf,
+	}
+
+	return cachedBytes, nil
 }
 
 func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
