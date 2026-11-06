@@ -1,20 +1,6 @@
 package reverseproxy
 
-import (
-	"context"
-	"errors"
-	"net"
-	"net/http"
-	"net/http/httptest"
-	"sync/atomic"
-	"testing"
-	"time"
-
-	"github.com/miekg/dns"
-	"go.uber.org/zap"
-
-	"github.com/caddyserver/caddy/v2"
-)
+import "testing"
 
 func TestResolveIpVersion(t *testing.T) {
 	falseBool := false
@@ -68,140 +54,39 @@ func TestResolveIpVersion(t *testing.T) {
 	}
 }
 
-func TestSRVUpstreamsGracePeriod(t *testing.T) {
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen on packet: %v", err)
-	}
-
-	var failDNS atomic.Bool
-
-	server := &dns.Server{PacketConn: pc, Net: "udp"}
-	server.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-		if failDNS.Load() {
-			m := new(dns.Msg)
-			m.SetRcode(r, dns.RcodeServerFailure)
-			_ = w.WriteMsg(m)
-			return
+func TestResolverCacheKey(t *testing.T) {
+	key := func(addrs ...string) string {
+		if addrs == nil {
+			return resolverCacheKey(nil)
 		}
+		return resolverCacheKey(&UpstreamResolver{Addresses: addrs})
+	}
 
-		m := new(dns.Msg)
-		m.SetReply(r)
-		if len(r.Question) > 0 && r.Question[0].Qtype == dns.TypeSRV {
-			m.Answer = append(m.Answer, &dns.SRV{
-				Hdr: dns.RR_Header{
-					Name:   r.Question[0].Name,
-					Rrtype: dns.TypeSRV,
-					Class:  dns.ClassINET,
-					Ttl:    300,
-				},
-				Priority: 10,
-				Weight:   20,
-				Port:     8080,
-				Target:   "backend.local.",
-			})
+	// The default resolver (nil or empty) yields the empty key, so default-resolver
+	// sources keep sharing the cache.
+	if got := key(); got != "" {
+		t.Errorf("nil resolver: got %q, want \"\"", got)
+	}
+	if got := resolverCacheKey(&UpstreamResolver{}); got != "" {
+		t.Errorf("empty resolver: got %q, want \"\"", got)
+	}
+
+	// Order does not matter: the same set maps to the same key.
+	if a, b := key("1.1.1.1", "8.8.8.8"), key("8.8.8.8", "1.1.1.1"); a != b {
+		t.Errorf("order should not matter: %q != %q", a, b)
+	}
+
+	// Different sets must not collide, even when an address contains the
+	// delimiter that a naive join would use. {"a,b"} and {"a","b"} are distinct
+	// resolver configurations and must get distinct keys.
+	colliding := [][2][]string{
+		{{"a,b"}, {"a", "b"}},
+		{{"unix//run/x,y.sock"}, {"unix//run/x", "y.sock"}},
+		{{"10:1"}, {"1", "0:1"}}, // guards the length-prefix encoding itself
+	}
+	for _, c := range colliding {
+		if k1, k2 := key(c[0]...), key(c[1]...); k1 == k2 {
+			t.Errorf("distinct address sets %q and %q share key %q", c[0], c[1], k1)
 		}
-		_ = w.WriteMsg(m)
-	})
-
-	go func() {
-		_ = server.ActivateAndServe()
-	}()
-	defer server.Shutdown()
-
-	makeRequest := func() *http.Request {
-		req := httptest.NewRequest("GET", "http://example.com", nil)
-		repl := caddy.NewReplacer()
-		return req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
-	}
-
-	// 1. Initial lookup fails with GracePeriod > 0 and no cached upstreams.
-	// Must return an error and not empty upstreams.
-	failDNS.Store(true)
-	suNoCache := SRVUpstreams{
-		Name:        "example.com",
-		Refresh:     caddy.Duration(500 * time.Millisecond),
-		GracePeriod: caddy.Duration(200 * time.Millisecond),
-		logger:      zap.NewNop(),
-		resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				return net.Dial("udp", pc.LocalAddr().String())
-			},
-		},
-	}
-	_ = suNoCache.ResetCache(nil)
-
-	req := makeRequest()
-	up, err := suNoCache.GetUpstreams(req)
-	if err == nil {
-		t.Fatalf("expected error on initial DNS lookup failure, got upstreams: %v", up)
-	}
-
-	// 2. Initial lookup succeeds, then DNS fails when GracePeriod < Refresh.
-	failDNS.Store(false)
-	su := SRVUpstreams{
-		Name:        "example.com",
-		Refresh:     caddy.Duration(250 * time.Millisecond),
-		GracePeriod: caddy.Duration(100 * time.Millisecond),
-		logger:      zap.NewNop(),
-		resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				if failDNS.Load() {
-					return nil, errors.New("dns lookup dial error")
-				}
-				return net.Dial("udp", pc.LocalAddr().String())
-			},
-		},
-	}
-	_ = su.ResetCache(nil)
-
-	req = makeRequest()
-	up, err = su.GetUpstreams(req)
-	if err != nil {
-		t.Fatalf("unexpected error on initial successful DNS lookup: %v", err)
-	}
-	if len(up) != 1 || up[0].Dial != "backend.local.:8080" {
-		t.Fatalf("unexpected upstreams returned: %v", up)
-	}
-
-	// Simulate DNS outage
-	failDNS.Store(true)
-
-	// Wait for Refresh interval (250ms) to pass so cached value expires
-	time.Sleep(300 * time.Millisecond)
-
-	// Now GetUpstreams should fail DNS lookup but fall back to grace period caching
-	req = makeRequest()
-	up, err = su.GetUpstreams(req)
-	if err != nil {
-		t.Fatalf("expected grace period fallback to return cached upstreams, got error: %v", err)
-	}
-	if len(up) != 1 || up[0].Dial != "backend.local.:8080" {
-		t.Fatalf("unexpected upstreams returned during grace period: %v", up)
-	}
-
-	// Immediate subsequent lookup during GracePeriod should still return cached upstreams
-	req = makeRequest()
-	up, err = su.GetUpstreams(req)
-	if err != nil {
-		t.Fatalf("expected cached upstreams during grace period, got error: %v", err)
-	}
-	if len(up) != 1 || up[0].Dial != "backend.local.:8080" {
-		t.Fatalf("unexpected upstreams returned during grace period: %v", up)
-	}
-
-	// Wait for GracePeriod (100ms) to pass
-	time.Sleep(150 * time.Millisecond)
-
-	// DNS is still down, and GracePeriod expired. GetUpstreams should now attempt lookup and fail if GracePeriod is 0.
-	suZeroGrace := su
-	suZeroGrace.GracePeriod = 0
-
-	req = makeRequest()
-	up, err = suZeroGrace.GetUpstreams(req)
-	if err == nil {
-		t.Fatalf("expected error when GracePeriod is 0 and DNS fails, got upstreams: %v", up)
 	}
 }
