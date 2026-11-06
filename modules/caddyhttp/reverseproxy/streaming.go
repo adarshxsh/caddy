@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -287,27 +288,68 @@ func handleUpgradeTunnel(
 		result      string
 	)
 
+	userConn := conn
+	backConnConn := backConn
+
+	var timeoutc <-chan time.Time
+	donec := make(chan struct{})
+	defer close(donec)
+
+	if streamTimeout > 0 {
+		var lastActivity atomic.Int64
+		lastActivity.Store(time.Now().UnixNano())
+
+		recordActivity := func() {
+			lastActivity.Store(time.Now().UnixNano())
+		}
+		userConn = wrapActivity(conn, recordActivity)
+		backConnConn = wrapActivity(backConn, recordActivity)
+
+		toCh := make(chan time.Time, 1)
+		timeoutc = toCh
+
+		go func() {
+			timer := time.NewTimer(streamTimeout)
+			defer timer.Stop()
+
+			for {
+				select {
+				case t := <-timer.C:
+					last := time.Unix(0, lastActivity.Load())
+					elapsed := t.Sub(last)
+					if elapsed >= streamTimeout {
+						select {
+						case toCh <- t:
+						default:
+						}
+						return
+					}
+					remaining := streamTimeout - elapsed
+					if remaining > streamTimeout || remaining <= 0 {
+						remaining = streamTimeout
+					}
+					timer.Reset(remaining)
+				case <-donec:
+					return
+				}
+			}
+		}()
+	}
+
 	// when a stream timeout is encountered, no error will be read from errc
 	// a buffer size of 2 will allow both the read and write goroutines to
 	// send the error and exit
 	// see: https://github.com/caddyserver/caddy/issues/7418
 	errc := make(chan error, 2)
 	spc := switchProtocolCopier{
-		user:       conn,
-		backend:    backConn,
+		user:       userConn,
+		backend:    backConnConn,
 		wg:         &wg,
 		bufferSize: bufferSize,
 		sent:       &toBackend,
 		received:   &fromBackend,
 	}
 	wg.Add(2)
-
-	var timeoutc <-chan time.Time
-	if streamTimeout > 0 {
-		timer := time.NewTimer(streamTimeout)
-		defer timer.Stop()
-		timeoutc = timer.C
-	}
 
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
@@ -762,6 +804,48 @@ func newMaskKey() [4]byte {
 func isWebsocket(r *http.Request) bool {
 	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	onActivity func()
+}
+
+func (a *activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
+}
+
+func (a *activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 && a.onActivity != nil {
+		a.onActivity()
+	}
+	return n, err
+}
+
+type activityCloseWriter struct {
+	activityRWC
+	cw closeWriter
+}
+
+func (a *activityCloseWriter) CloseWrite() error {
+	return a.cw.CloseWrite()
+}
+
+func wrapActivity(rwc io.ReadWriteCloser, onActivity func()) io.ReadWriteCloser {
+	base := activityRWC{ReadWriteCloser: rwc, onActivity: onActivity}
+	if cw, ok := rwc.(closeWriter); ok {
+		return &activityCloseWriter{activityRWC: base, cw: cw}
+	}
+	return &base
 }
 
 // closeConnectionsForUpstream closes detached connections to the given
