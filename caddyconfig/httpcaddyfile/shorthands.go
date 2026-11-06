@@ -7,13 +7,90 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
-type ComplexShorthandReplacer struct {
-	search  *regexp.Regexp
-	replace string
+type complexShorthand struct {
+	search       *regexp.Regexp
+	replace      string
+	inverse      *regexp.Regexp
+	inverseTempl string
+}
+
+var complexShorthands = []complexShorthand{
+	{
+		search:       regexp.MustCompile(`{header\.([\w-]*)}`),
+		replace:      "{http.request.header.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.request\.header\.([\w-]*)\}?$`),
+		inverseTempl: "{header.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{cookie\.([\w-]*)}`),
+		replace:      "{http.request.cookie.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.request\.cookie\.([\w-]*)\}?$`),
+		inverseTempl: "{cookie.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{labels\.([\w-]*)}`),
+		replace:      "{http.request.host.labels.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.request\.host\.labels\.([\w-]*)\}?$`),
+		inverseTempl: "{labels.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{file\.([\w-]*)}`),
+		replace:      "{http.request.uri.path.file.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.request\.uri\.path\.file\.([\w-]*)\}?$`),
+		inverseTempl: "{file.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{path\.([\w-]*)}`),
+		replace:      "{http.request.uri.path.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.request\.uri\.path\.([\w-]*)\}?$`),
+		inverseTempl: "{path.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{query\.([\w-]*)}`),
+		replace:      "{http.request.uri.query.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.request\.uri\.query\.([\w-]*)\}?$`),
+		inverseTempl: "{query.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{re\.([\w-\.]*)}`),
+		replace:      "{http.regexp.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.regexp\.([\w-\.]*)\}?$`),
+		inverseTempl: "{re.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{vars\.([\w-]*)}`),
+		replace:      "{http.vars.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.vars\.([\w-]*)\}?$`),
+		inverseTempl: "{vars.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{rp\.([\w-\.]*)}`),
+		replace:      "{http.reverse_proxy.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.reverse_proxy\.([\w-\.]*)\}?$`),
+		inverseTempl: "{rp.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{resp\.([\w-\.]*)}`),
+		replace:      "{http.intercept.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.intercept\.([\w-\.]*)\}?$`),
+		inverseTempl: "{resp.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{err\.([\w-\.]*)}`),
+		replace:      "{http.error.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.error\.([\w-\.]*)\}?$`),
+		inverseTempl: "{err.$1}",
+	},
+	{
+		search:       regexp.MustCompile(`{file_match\.([\w-]*)}`),
+		replace:      "{http.matchers.file.$1}",
+		inverse:      regexp.MustCompile(`^\{?http\.matchers\.file\.([\w-]*)\}?$`),
+		inverseTempl: "{file_match.$1}",
+	},
 }
 
 type ShorthandReplacer struct {
-	complex []ComplexShorthandReplacer
+	complex []complexShorthand
 	simple  *strings.Replacer
 }
 
@@ -23,26 +100,8 @@ func NewShorthandReplacer() ShorthandReplacer {
 	// identifiers or variable names
 	replacer := strings.NewReplacer(placeholderShorthands()...)
 
-	// these are placeholders that allow a user-defined final
-	// parameters, but we still want to provide a shorthand
-	// for those, so we use a regexp to replace
-	regexpReplacements := []ComplexShorthandReplacer{
-		{regexp.MustCompile(`{header\.([\w-]*)}`), "{http.request.header.$1}"},
-		{regexp.MustCompile(`{cookie\.([\w-]*)}`), "{http.request.cookie.$1}"},
-		{regexp.MustCompile(`{labels\.([\w-]*)}`), "{http.request.host.labels.$1}"},
-		{regexp.MustCompile(`{path\.([\w-]*)}`), "{http.request.uri.path.$1}"},
-		{regexp.MustCompile(`{file\.([\w-]*)}`), "{http.request.uri.path.file.$1}"},
-		{regexp.MustCompile(`{query\.([\w-]*)}`), "{http.request.uri.query.$1}"},
-		{regexp.MustCompile(`{re\.([\w-\.]*)}`), "{http.regexp.$1}"},
-		{regexp.MustCompile(`{vars\.([\w-]*)}`), "{http.vars.$1}"},
-		{regexp.MustCompile(`{rp\.([\w-\.]*)}`), "{http.reverse_proxy.$1}"},
-		{regexp.MustCompile(`{resp\.([\w-\.]*)}`), "{http.intercept.$1}"},
-		{regexp.MustCompile(`{err\.([\w-\.]*)}`), "{http.error.$1}"},
-		{regexp.MustCompile(`{file_match\.([\w-]*)}`), "{http.matchers.file.$1}"},
-	}
-
 	return ShorthandReplacer{
-		complex: regexpReplacements,
+		complex: complexShorthands,
 		simple:  replacer,
 	}
 }
