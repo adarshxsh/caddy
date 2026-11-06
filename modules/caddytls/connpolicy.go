@@ -169,12 +169,22 @@ func (cp ConnectionPolicies) TLSConfig(ctx caddy.Context) *tls.Config {
 				}
 			}
 
-			tlsCfg.GetEncryptedClientHelloKeys = func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
+			getECHKeys := func(chi *tls.ClientHelloInfo) ([]tls.EncryptedClientHelloKey, error) {
 				keys := tlsApp.EncryptedClientHello.stdlibReady.Load()
 				if keys == nil {
 					return []tls.EncryptedClientHelloKey{}, nil
 				}
 				return *keys, nil
+			}
+
+			// crypto/tls decrypts the ClientHello with the keys from this config,
+			// but builds the retry configs it sends when ECH is rejected from the
+			// config returned by GetConfigForClient, so both need the keys.
+			tlsCfg.GetEncryptedClientHelloKeys = getECHKeys
+			for _, p := range cp {
+				if p.TLSConfig != nil && p.TLSConfig.GetEncryptedClientHelloKeys == nil {
+					p.TLSConfig.GetEncryptedClientHelloKeys = getECHKeys
+				}
 			}
 		}
 	}
@@ -355,7 +365,10 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 	// add all the curve preferences in order, without duplicates
 	curvesAdded := make(map[tls.CurveID]struct{})
 	for _, curveName := range p.Curves {
-		curveID := SupportedCurves[curveName]
+		curveID, ok := SupportedCurves[curveName]
+		if !ok {
+			return fmt.Errorf("unsupported curve: %s", curveName)
+		}
 		if _, ok := curvesAdded[curveID]; !ok {
 			curvesAdded[curveID] = struct{}{}
 			cfg.CurvePreferences = append(cfg.CurvePreferences, curveID)
@@ -369,14 +382,23 @@ func (p *ConnectionPolicy) buildStandardTLSConfig(ctx caddy.Context) error {
 	}
 
 	// min and max protocol versions
-	if (p.ProtocolMin != "" && p.ProtocolMax != "") && p.ProtocolMin > p.ProtocolMax {
-		return fmt.Errorf("protocol min (%x) cannot be greater than protocol max (%x)", p.ProtocolMin, p.ProtocolMax)
-	}
 	if p.ProtocolMin != "" {
-		cfg.MinVersion = SupportedProtocols[p.ProtocolMin]
+		minVersion, ok := SupportedProtocols[p.ProtocolMin]
+		if !ok {
+			return fmt.Errorf("unsupported protocol_min: %s", p.ProtocolMin)
+		}
+		cfg.MinVersion = minVersion
 	}
 	if p.ProtocolMax != "" {
-		cfg.MaxVersion = SupportedProtocols[p.ProtocolMax]
+		maxVersion, ok := SupportedProtocols[p.ProtocolMax]
+		if !ok {
+			return fmt.Errorf("unsupported protocol_max: %s", p.ProtocolMax)
+		}
+		cfg.MaxVersion = maxVersion
+	}
+	if cfg.MinVersion > cfg.MaxVersion {
+		return fmt.Errorf("protocol min (%s) cannot be greater than protocol max (%s)",
+			ProtocolName(cfg.MinVersion), ProtocolName(cfg.MaxVersion))
 	}
 
 	// client authentication
@@ -910,6 +932,12 @@ func (clientauth *ClientAuthentication) verifyConnection(cs tls.ConnectionState)
 			return err
 		}
 	}
+
+	// crypto/tls has already enforced whether the mode requires a
+	// certificate, so the verifiers only check one that was presented
+	if len(rawCerts) == 0 {
+		return nil
+	}
 	for _, verifier := range clientauth.verifiers {
 		if err := verifier.VerifyClientCertificate(rawCerts, cs.VerifiedChains); err != nil {
 			return err
@@ -1074,7 +1102,8 @@ type LeafCertificateLoader interface {
 }
 
 // ClientCertificateVerifier is a type which verifies client certificates.
-// It is called during verifyPeerCertificate in the TLS handshake.
+// It is called during verifyConnection in the TLS handshake, only when
+// the client presented a certificate.
 type ClientCertificateVerifier interface {
 	VerifyClientCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 }
@@ -1099,6 +1128,10 @@ var (
 func ParseCaddyfileNestedMatcherSet(d *caddyfile.Dispenser) (caddy.ModuleMap, error) {
 	matcherMap := make(map[string]ConnectionMatcher)
 
+	// in case there are multiple instances of the same matcher, concatenate
+	// their tokens (we expect that UnmarshalCaddyfile should be able to
+	// handle more than one segment); otherwise, we'd overwrite other
+	// instances of the matcher in this set
 	tokensByMatcherName := make(map[string][]caddyfile.Token)
 	for nesting := d.Nesting(); d.NextArg() || d.NextBlock(nesting); {
 		matcherName := d.Val()
@@ -1106,10 +1139,15 @@ func ParseCaddyfileNestedMatcherSet(d *caddyfile.Dispenser) (caddy.ModuleMap, er
 	}
 
 	for matcherName, tokens := range tokensByMatcherName {
-		dd := caddyfile.NewDispenser(tokens)
-		dd.Next() // consume wrapper name
-
-		unm, err := caddyfile.UnmarshalModule(dd, "tls.handshake_match."+matcherName)
+		mod, err := caddy.GetModule("tls.handshake_match." + matcherName)
+		if err != nil {
+			return nil, d.Errf("getting matcher module '%s': %v", matcherName, err)
+		}
+		unm, ok := mod.New().(caddyfile.Unmarshaler)
+		if !ok {
+			return nil, d.Errf("matcher module '%s' is not a Caddyfile unmarshaler", matcherName)
+		}
+		err = unm.UnmarshalCaddyfile(caddyfile.NewDispenser(tokens))
 		if err != nil {
 			return nil, err
 		}
