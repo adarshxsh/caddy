@@ -132,7 +132,7 @@ func TestECHPublicationConcurrency(t *testing.T) {
 				case <-stopCh:
 					return
 				default:
-					_ = tlsApp.publishECHConfigs(zap.NewNop())
+					_ = tlsApp.publishECHConfigs(caddyCtx.Context, zap.NewNop())
 				}
 			}
 		}()
