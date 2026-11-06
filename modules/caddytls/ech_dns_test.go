@@ -2,6 +2,7 @@ package caddytls
 
 import (
 	"encoding/base64"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -62,4 +63,38 @@ func TestECHDNSPublisherPublishedSvcParams(t *testing.T) {
 	if !reflect.DeepEqual(got["ech"], []string{wantECH}) {
 		t.Fatalf("unexpected ECH params: got %v want %v", got["ech"], wantECH)
 	}
+}
+
+func TestServerNamesSnapshotConcurrent(t *testing.T) {
+	tlsApp := &TLS{
+		serverNames:   make(map[string]serverNameRegistration),
+		serverNamesMu: new(sync.Mutex),
+	}
+
+	var wg sync.WaitGroup
+	const numGoroutines = 10
+	const numOps = 100
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				domain := fmt.Sprintf("sub%d-%d.example.com", id, j)
+				tlsApp.RegisterServerNames([]string{domain}, []string{"h2", "h3"})
+			}
+		}(i)
+	}
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				_ = tlsApp.serverNamesSnapshot()
+			}
+		}()
+	}
+
+	wg.Wait()
 }
