@@ -110,7 +110,7 @@ func TestConcurrentRegisterServerNamesAndPublishECHConfigs(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			_ = tlsApp.publishECHConfigs(zap.NewNop())
+			_ = tlsApp.publishECHConfigs(context.Background(), zap.NewNop())
 		}
 	}()
 
