@@ -652,7 +652,6 @@ func (fsrv *FileServer) mapDirOpenError(fileSystem fs.FS, originalErr error, nam
 	if errors.Is(originalErr, syscall.ENOTDIR) {
 		return fs.ErrNotExist
 	}
-
 	if _, ok := errors.AsType[*fs.PathError](originalErr); ok {
 		return fs.ErrInvalid
 	}

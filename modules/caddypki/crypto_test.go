@@ -97,7 +97,7 @@ func TestKeyPair_Load(t *testing.T) {
 		t.Fatalf("Failed serializing intermediate key: %v", err)
 	}
 	chainFile := filepath.Join(dir, "chain.pem")
-	if err := os.WriteFile(chainFile, chainContents, 0644); err != nil {
+	if err := os.WriteFile(chainFile, chainContents, 0o644); err != nil {
 		t.Fatalf("Failed writing intermediate chain: %v", err)
 	}
 
