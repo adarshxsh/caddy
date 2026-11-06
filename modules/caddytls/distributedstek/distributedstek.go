@@ -210,15 +210,20 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 			log.Printf("[PANIC] distributed STEK rotation: %v\n%s", err, debug.Stack())
 		}
 	}()
+	var errCount int
 	for {
 		select {
 		case <-s.timer.C:
 			dstek, err := s.getSTEK()
 			if err != nil {
-				// TODO: improve this handling
-				log.Printf("[ERROR] Loading STEK: %v", err)
+				errCount++
+				backoff := stekBackoffDelay(errCount)
+				log.Printf("[ERROR] Loading STEK: %v (consecutive errors: %d, backoff delay: %v)", err, errCount, backoff)
+				s.timer.Reset(backoff)
 				continue
 			}
+
+			errCount = 0
 
 			// send the updated keys to the service
 			keysChan <- dstek.Keys
@@ -234,6 +239,27 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 			return
 		}
 	}
+}
+
+const (
+	stekInitialBackoff = 5 * time.Second
+	stekMaxBackoff     = 5 * time.Minute
+)
+
+// stekBackoffDelay calculates the exponential backoff duration for the given number
+// of consecutive failures, starting at 5 seconds and doubling up to a cap of 5 minutes.
+func stekBackoffDelay(errCount int) time.Duration {
+	if errCount <= 0 {
+		return stekInitialBackoff
+	}
+	if errCount > 30 {
+		return stekMaxBackoff
+	}
+	delay := stekInitialBackoff * time.Duration(1<<(errCount-1))
+	if delay > stekMaxBackoff || delay < 0 {
+		return stekMaxBackoff
+	}
+	return delay
 }
 
 type distributedSTEK struct {
