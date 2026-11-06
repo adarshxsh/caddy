@@ -146,7 +146,7 @@ func TestConcurrentECHPublicationAndRotation(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
 				if id%2 == 0 {
-					_ = tlsApp.publishECHConfigs(zap.NewNop())
+					_ = tlsApp.publishECHConfigs(context.Background(), zap.NewNop())
 				} else {
 					ech.configsMu.Lock()
 					for name, cfgs := range ech.configs {
