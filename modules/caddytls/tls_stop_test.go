@@ -24,17 +24,13 @@ import (
 func TestTLSStopIdempotent(t *testing.T) {
 	tlsApp := &TLS{
 		storageCleanTicker: time.NewTicker(time.Hour),
-		storageCleanStop:   make(chan struct{}),
 	}
 
-	// First Stop call should close channel and stop ticker
+	// First Stop call should stop ticker
 	if err := tlsApp.Stop(); err != nil {
 		t.Fatalf("unexpected error on first Stop: %v", err)
 	}
 
-	if tlsApp.storageCleanStop != nil {
-		t.Errorf("expected storageCleanStop to be nil after Stop")
-	}
 	if tlsApp.storageCleanTicker != nil {
 		t.Errorf("expected storageCleanTicker to be nil after Stop")
 	}
@@ -67,9 +63,6 @@ func TestTLSKeepStorageCleanStopIdempotent(t *testing.T) {
 		}
 	}
 
-	if tlsApp.storageCleanStop != nil {
-		t.Errorf("expected storageCleanStop to be nil after Stop")
-	}
 	if tlsApp.storageCleanTicker != nil {
 		t.Errorf("expected storageCleanTicker to be nil after Stop")
 	}
