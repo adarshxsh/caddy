@@ -486,7 +486,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 	if state == nil {
 		state = new(tls.ConnectionState)
 	}
-	value, known := getTLSReplacement(state, key)
+	value, known := getTLSReplacement(req, state, key)
 	if req.TLS == nil {
 		// Use the same field parser to recognise valid placeholders but
 		// do not substitute values from the empty state for a plain HTTP request.
@@ -495,7 +495,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 	return value, known
 }
 
-func getTLSReplacement(state *tls.ConnectionState, key string) (any, bool) {
+func getTLSReplacement(req *http.Request, state *tls.ConnectionState, key string) (any, bool) {
 	if len(key) < len(reqTLSReplPrefix) {
 		return nil, false
 	}
@@ -622,6 +622,18 @@ func getTLSReplacement(state *tls.ConnectionState, key string) (any, bool) {
 		return state.ServerName, true
 	case "ech":
 		return state.ECHAccepted, true
+	case "used_0rtt":
+		var used0RTT bool
+		if req != nil {
+			used0RTT, _ = GetEarlyDataInfo(req.Context())
+		}
+		return used0RTT, true
+	case "early_data_status":
+		status := "none"
+		if req != nil {
+			_, status = GetEarlyDataInfo(req.Context())
+		}
+		return status, true
 	}
 	return nil, false
 }

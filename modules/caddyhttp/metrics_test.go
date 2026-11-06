@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -628,4 +629,57 @@ func BenchmarkSingleRouteMetrics(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		ih.ServeHTTP(w, r)
 	}
+}
+
+func TestMetricsEarlyData(t *testing.T) {
+	caddyCtx, _ := caddy.NewContext(caddy.Context{Context: context.Background()})
+	m := &Metrics{
+		init:        sync.Once{},
+		httpMetrics: &httpMetrics{},
+	}
+
+	h := HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(200)
+		return nil
+	})
+
+	ih := newMetricsInstrumentedRoute(caddyCtx, "test_handler", h, m)
+
+	// 1. Accepted 0-RTT request
+	reqCtx1 := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataInfo{
+		Used0RTT: true,
+		Status:   "accepted",
+	})
+	req1 := httptest.NewRequest("GET", "/", nil).WithContext(reqCtx1)
+	w1 := httptest.NewRecorder()
+	if err := ih.ServeHTTP(w1, req1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 2. Rejected fallback 1-RTT request
+	reqCtx2 := context.WithValue(context.Background(), EarlyDataCtxKey, EarlyDataInfo{
+		Used0RTT: false,
+		Status:   "rejected_fallback_1rtt",
+	})
+	req2 := httptest.NewRequest("GET", "/", nil).WithContext(reqCtx2)
+	w2 := httptest.NewRecorder()
+	if err := ih.ServeHTTP(w2, req2); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 3. Regular request (none)
+	req3 := httptest.NewRequest("GET", "/", nil)
+	w3 := httptest.NewRecorder()
+	if err := ih.ServeHTTP(w3, req3); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cAccepted := testutil.ToFloat64(m.httpMetrics.earlyDataTotal.WithLabelValues("UNKNOWN", "accepted"))
+	assert.Equal(t, float64(1), cAccepted)
+
+	cFallback := testutil.ToFloat64(m.httpMetrics.earlyDataTotal.WithLabelValues("UNKNOWN", "rejected_fallback_1rtt"))
+	assert.Equal(t, float64(1), cFallback)
+
+	cNone := testutil.ToFloat64(m.httpMetrics.earlyDataTotal.WithLabelValues("UNKNOWN", "none"))
+	assert.Equal(t, float64(1), cNone)
 }

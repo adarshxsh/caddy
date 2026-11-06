@@ -97,6 +97,7 @@ type httpMetrics struct {
 	requestSize      *prometheus.HistogramVec
 	responseSize     *prometheus.HistogramVec
 	responseDuration *prometheus.HistogramVec
+	earlyDataTotal   *prometheus.CounterVec
 }
 
 func initHTTPMetrics(ctx caddy.Context, metrics *Metrics) {
@@ -124,6 +125,12 @@ func initHTTPMetrics(ctx caddy.Context, metrics *Metrics) {
 		Name:      "requests_total",
 		Help:      "Counter of HTTP(S) requests made.",
 	}, basicLabels)
+	metrics.httpMetrics.earlyDataTotal = promauto.With(registry).NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns,
+		Subsystem: sub,
+		Name:      "early_data_total",
+		Help:      "Counter of HTTP/3 early data (0-RTT) requests by status.",
+	}, []string{"server", "status"})
 
 	// TODO: allow these to be customized in the config
 	durationBuckets := prometheus.DefBuckets
@@ -353,6 +360,10 @@ func (h *metricsInstrumentedRoute) ServeHTTP(w http.ResponseWriter, r *http.Requ
 	err := h.next.ServeHTTP(wrec, r)
 	dur := time.Since(start).Seconds()
 	h.metrics.httpMetrics.requestCount.With(labels).Inc()
+	if h.metrics.httpMetrics.earlyDataTotal != nil {
+		earlyDataStatus := GetEarlyDataStatus(r.Context())
+		h.metrics.httpMetrics.earlyDataTotal.With(prometheus.Labels{"server": server, "status": earlyDataStatus}).Inc()
+	}
 
 	observeRequest := func(status int) {
 		// If the code hasn't been set yet, and we didn't encounter an error, we're
