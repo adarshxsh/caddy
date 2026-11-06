@@ -354,6 +354,27 @@ func TestHTTPTransport_DialContext_DialInfoOverride(t *testing.T) {
 	}
 }
 
+func TestHTTPTransport_Provision_Resolver(t *testing.T) {
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+
+	// Empty resolver should fail provisioning
+	htEmpty := &HTTPTransport{
+		Resolver: &UpstreamResolver{Addresses: []string{}},
+	}
+	if err := htEmpty.Provision(ctx); err == nil {
+		t.Errorf("HTTPTransport.Provision() expected error for empty resolver addresses, got nil")
+	}
+
+	// Valid resolver should succeed provisioning
+	htValid := &HTTPTransport{
+		Resolver: &UpstreamResolver{Addresses: []string{"1.1.1.1:53"}},
+	}
+	if err := htValid.Provision(ctx); err != nil {
+		t.Errorf("HTTPTransport.Provision() unexpected error = %v", err)
+	}
+}
+
 // TestHTTPTransportH3UsesConfiguredTrustPool ensures that when the transport
 // is configured for HTTP/3, the h3 transport's TLS client config carries the
 // trust pool configured via the CA module (tls_trust_pool), not nil root CAs
