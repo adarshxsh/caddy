@@ -932,3 +932,259 @@ func (c *closeTrackingBody) Close() error {
 	c.closed = true
 	return nil
 }
+
+func TestStreamTimeout_ActiveConnection(t *testing.T) {
+	clientConn, proxyClientConn := net.Pipe()
+	proxyBackendConn, backendConn := net.Pipe()
+
+	defer clientConn.Close()
+	defer backendConn.Close()
+
+	h := &Handler{
+		StreamTimeout: caddy.Duration(150 * time.Millisecond),
+		logger:        caddy.Log(),
+		tunnelTracker: newTunnelTracker(caddy.Log(), 0),
+	}
+	initReverseProxyMetrics(h, prometheus.NewRegistry())
+
+	rw := pipeUpgradeWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		conn:             proxyClientConn,
+	}
+
+	req := prepareTestRequest(httptest.NewRequest("GET", "http://example.com", nil))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	res := &http.Response{
+		StatusCode: 101,
+		Header:     make(http.Header),
+		Body:       proxyBackendConn,
+	}
+	res.Header.Set("Connection", "Upgrade")
+	res.Header.Set("Upgrade", "websocket")
+
+	done := make(chan struct{})
+
+	go func() {
+		h.handleUpgradeResponse(zap.NewNop(), rw, req, res, "test-stream")
+		close(done)
+	}()
+
+	// Perform periodic activity for 350ms (> 150ms StreamTimeout)
+	stopActivity := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(40 * time.Millisecond)
+		defer ticker.Stop()
+		buf := make([]byte, 4)
+		for {
+			select {
+			case <-stopActivity:
+				return
+			case <-ticker.C:
+				go func() {
+					clientConn.Write([]byte("ping"))
+				}()
+				backendConn.Read(buf)
+			}
+		}
+	}()
+
+	// Verify connection remains open during activity
+	select {
+	case <-done:
+		t.Fatal("connection timed out prematurely despite active data transfer")
+	case <-time.After(350 * time.Millisecond):
+		// Connection correctly stayed open during active period
+	}
+
+	// Stop activity and verify it times out
+	close(stopActivity)
+
+	select {
+	case <-done:
+		// Connection timed out as expected after activity stopped
+	case <-time.After(400 * time.Millisecond):
+		t.Fatal("connection failed to time out after activity stopped")
+	}
+}
+
+func TestStreamTimeout_IdleConnection(t *testing.T) {
+	clientConn, proxyClientConn := net.Pipe()
+	proxyBackendConn, backendConn := net.Pipe()
+
+	defer clientConn.Close()
+	defer backendConn.Close()
+
+	h := &Handler{
+		StreamTimeout: caddy.Duration(100 * time.Millisecond),
+		logger:        caddy.Log(),
+		tunnelTracker: newTunnelTracker(caddy.Log(), 0),
+	}
+	initReverseProxyMetrics(h, prometheus.NewRegistry())
+
+	rw := pipeUpgradeWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		conn:             proxyClientConn,
+	}
+
+	req := prepareTestRequest(httptest.NewRequest("GET", "http://example.com", nil))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	res := &http.Response{
+		StatusCode: 101,
+		Header:     make(http.Header),
+		Body:       proxyBackendConn,
+	}
+	res.Header.Set("Connection", "Upgrade")
+	res.Header.Set("Upgrade", "websocket")
+
+	done := make(chan struct{})
+
+	start := time.Now()
+	go func() {
+		h.handleUpgradeResponse(zap.NewNop(), rw, req, res, "test-stream")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		elapsed := time.Since(start)
+		if elapsed < 80*time.Millisecond {
+			t.Fatalf("connection closed too early: %v", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("idle connection failed to time out")
+	}
+}
+
+func TestStreamTimeout_ZeroTimeout(t *testing.T) {
+	clientConn, proxyClientConn := net.Pipe()
+	proxyBackendConn, backendConn := net.Pipe()
+
+	h := &Handler{
+		StreamTimeout: 0,
+		logger:        caddy.Log(),
+		tunnelTracker: newTunnelTracker(caddy.Log(), 0),
+	}
+	initReverseProxyMetrics(h, prometheus.NewRegistry())
+
+	rw := pipeUpgradeWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		conn:             proxyClientConn,
+	}
+
+	req := prepareTestRequest(httptest.NewRequest("GET", "http://example.com", nil))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	res := &http.Response{
+		StatusCode: 101,
+		Header:     make(http.Header),
+		Body:       proxyBackendConn,
+	}
+	res.Header.Set("Connection", "Upgrade")
+	res.Header.Set("Upgrade", "websocket")
+
+	done := make(chan struct{})
+
+	go func() {
+		h.handleUpgradeResponse(zap.NewNop(), rw, req, res, "test-stream")
+		close(done)
+	}()
+
+	// Verify connection does not time out after 150ms
+	select {
+	case <-done:
+		t.Fatal("connection timed out when StreamTimeout was 0")
+	case <-time.After(150 * time.Millisecond):
+		// Expected: connection remains open
+	}
+
+	// Explicitly close client connection to clean up
+	clientConn.Close()
+	backendConn.Close()
+
+	select {
+	case <-done:
+		// Clean exit after explicit close
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("connection failed to close after explicit close")
+	}
+}
+
+type halfCloseTrackingConn struct {
+	net.Conn
+	closeWriteCalled chan struct{}
+	closeWriteOnce   sync.Once
+}
+
+func newHalfCloseTrackingConn(c net.Conn) *halfCloseTrackingConn {
+	return &halfCloseTrackingConn{
+		Conn:             c,
+		closeWriteCalled: make(chan struct{}),
+	}
+}
+
+func (c *halfCloseTrackingConn) CloseWrite() error {
+	c.closeWriteOnce.Do(func() {
+		close(c.closeWriteCalled)
+	})
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func TestStreamTimeout_HalfClosePropagation(t *testing.T) {
+	clientConn, proxyClientConn := net.Pipe()
+	proxyBackendConn, backendConn := net.Pipe()
+	defer clientConn.Close()
+	defer backendConn.Close()
+
+	trackingBackend := newHalfCloseTrackingConn(proxyBackendConn)
+
+	h := &Handler{
+		StreamTimeout: caddy.Duration(500 * time.Millisecond),
+		logger:        caddy.Log(),
+		tunnelTracker: newTunnelTracker(caddy.Log(), 0),
+	}
+	initReverseProxyMetrics(h, prometheus.NewRegistry())
+
+	rw := pipeUpgradeWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		conn:             proxyClientConn,
+	}
+
+	req := prepareTestRequest(httptest.NewRequest("GET", "http://example.com", nil))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	res := &http.Response{
+		StatusCode: 101,
+		Header:     make(http.Header),
+		Body:       trackingBackend,
+	}
+	res.Header.Set("Connection", "Upgrade")
+	res.Header.Set("Upgrade", "websocket")
+
+	done := make(chan struct{})
+	go func() {
+		h.handleUpgradeResponse(zap.NewNop(), rw, req, res, "test-stream")
+		close(done)
+	}()
+
+	// Closing clientConn sends EOF to proxy, which should trigger CloseWrite on backend
+	clientConn.Close()
+
+	select {
+	case <-trackingBackend.closeWriteCalled:
+		// Succeeded: CloseWrite was propagated through activity wrapper
+	case <-time.After(1 * time.Second):
+		t.Fatal("CloseWrite was not called on backend connection")
+	}
+
+	backendConn.Close()
+	<-done
+}

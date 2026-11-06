@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -292,6 +293,49 @@ func handleUpgradeTunnel(
 	// send the error and exit
 	// see: https://github.com/caddyserver/caddy/issues/7418
 	errc := make(chan error, 2)
+
+	var timeoutc <-chan time.Time
+	if streamTimeout > 0 {
+		var lastActivity atomic.Int64
+		lastActivity.Store(time.Now().UnixNano())
+
+		conn = wrapActivity(conn, &lastActivity)
+		backConn = wrapActivity(backConn, &lastActivity)
+
+		timer := time.NewTimer(streamTimeout)
+		defer timer.Stop()
+
+		done := make(chan struct{})
+		defer close(done)
+
+		timeoutCh := make(chan time.Time, 1)
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				case <-timer.C:
+					now := time.Now()
+					last := time.Unix(0, lastActivity.Load())
+					elapsed := now.Sub(last)
+					if elapsed >= streamTimeout {
+						select {
+						case timeoutCh <- now:
+						case <-done:
+						}
+						return
+					}
+					remaining := streamTimeout - elapsed
+					if remaining <= 0 {
+						remaining = time.Nanosecond
+					}
+					timer.Reset(remaining)
+				}
+			}
+		}()
+		timeoutc = timeoutCh
+	}
+
 	spc := switchProtocolCopier{
 		user:       conn,
 		backend:    backConn,
@@ -301,14 +345,6 @@ func handleUpgradeTunnel(
 		received:   &fromBackend,
 	}
 	wg.Add(2)
-
-	var timeoutc <-chan time.Time
-	if streamTimeout > 0 {
-		timer := time.NewTimer(streamTimeout)
-		defer timer.Stop()
-		timeoutc = timer.C
-	}
-
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
 	// Wait for both directions to finish. A clean EOF in one direction is a
@@ -928,3 +964,44 @@ const (
 	defaultBufferSize = 32 * 1024
 	wordSize          = int(unsafe.Sizeof(uintptr(0)))
 )
+
+type activityRWC struct {
+	io.ReadWriteCloser
+	lastActivity *atomic.Int64
+}
+
+func (a *activityRWC) Read(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Read(p)
+	if n > 0 {
+		a.lastActivity.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (a *activityRWC) Write(p []byte) (int, error) {
+	n, err := a.ReadWriteCloser.Write(p)
+	if n > 0 {
+		a.lastActivity.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+type activityCloseWriterRWC struct {
+	activityRWC
+}
+
+func (a *activityCloseWriterRWC) CloseWrite() error {
+	return a.ReadWriteCloser.(interface{ CloseWrite() error }).CloseWrite()
+}
+
+func wrapActivity(rwc io.ReadWriteCloser, lastActivity *atomic.Int64) io.ReadWriteCloser {
+	arwc := activityRWC{
+		ReadWriteCloser: rwc,
+		lastActivity:    lastActivity,
+	}
+	if _, ok := rwc.(interface{ CloseWrite() error }); ok {
+		return &activityCloseWriterRWC{activityRWC: arwc}
+	}
+	return &arwc
+}
+
