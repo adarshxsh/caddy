@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/quic-go/quic-go"
@@ -306,6 +307,30 @@ func TestSharedQUICState0RTT(t *testing.T) {
 			t.Errorf("expected Allow0RTT to be false after in-place reload")
 		}
 	})
+
+	t.Run("webtransport capabilities and initial packet size", func(t *testing.T) {
+		cfg1 := &tls.Config{}
+		sqsWT := newSharedQUICState(cfg1, nil, true)
+		qcfgWT, err := sqsWT.getQUICConfigForClient(&quic.ClientInfo{})
+		if err != nil {
+			t.Fatalf("getQUICConfigForClient error: %v", err)
+		}
+		if qcfgWT.InitialPacketSize != 1200 {
+			t.Errorf("expected InitialPacketSize 1200, got %d", qcfgWT.InitialPacketSize)
+		}
+		if !qcfgWT.EnableDatagrams || !qcfgWT.EnableStreamResetPartialDelivery {
+			t.Errorf("expected datagrams and partial delivery enabled with WebTransport")
+		}
+
+		sqsNoWT := newSharedQUICState(cfg1, nil, false)
+		qcfgNoWT, err := sqsNoWT.getQUICConfigForClient(&quic.ClientInfo{})
+		if err != nil {
+			t.Fatalf("getQUICConfigForClient error: %v", err)
+		}
+		if qcfgNoWT.EnableDatagrams || qcfgNoWT.EnableStreamResetPartialDelivery {
+			t.Errorf("expected datagrams and partial delivery disabled without WebTransport")
+		}
+	})
 }
 
 func TestListenQUICSharedSocket0RTT(t *testing.T) {
@@ -321,7 +346,7 @@ func TestListenQUICSharedSocket0RTT(t *testing.T) {
 	tlsConf1 := &tls.Config{}
 
 	// First server listens on address with 0-RTT enabled
-	l1, err := addr.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf1, nil, &allowTrue)
+	l1, err := addr.ListenQUIC(ctx, 0, net.ListenConfig{}, ListenQUICOptions{TLSConfig: tlsConf1, Allow0RTT: &allowTrue})
 	if err != nil {
 		t.Fatalf("ListenQUIC l1 failed: %v", err)
 	}
@@ -343,7 +368,7 @@ func TestListenQUICSharedSocket0RTT(t *testing.T) {
 
 	// Second server listens on same address with 0-RTT disabled
 	tlsConf2 := &tls.Config{}
-	l2, err := addr.ListenQUIC(ctx, 0, net.ListenConfig{}, tlsConf2, nil, &allowFalse)
+	l2, err := addr.ListenQUIC(ctx, 0, net.ListenConfig{}, ListenQUICOptions{TLSConfig: tlsConf2, Allow0RTT: &allowFalse})
 	if err != nil {
 		t.Fatalf("ListenQUIC l2 failed: %v", err)
 	}
@@ -478,6 +503,21 @@ func TestParseNetworkAddress(t *testing.T) {
 			defaultNetwork: "tcp",
 			expectErr:      true,
 		},
+		{
+			input:          "localhost:65535-65535",
+			defaultNetwork: "tcp",
+			expectAddr: NetworkAddress{
+				Network:   "tcp",
+				Host:      "localhost",
+				StartPort: 65535,
+				EndPort:   65535,
+			},
+		},
+		{
+			input:          "localhost:000000000080",
+			defaultNetwork: "tcp",
+			expectErr:      true,
+		},
 	} {
 		actualAddr, err := ParseNetworkAddressWithDefaults(tc.input, tc.defaultNetwork, tc.defaultPort)
 		if tc.expectErr && err == nil {
@@ -492,6 +532,26 @@ func TestParseNetworkAddress(t *testing.T) {
 		}
 		if !reflect.DeepEqual(tc.expectAddr, actualAddr) {
 			t.Errorf("Test %d: Expected addresses %v but got %v", i, tc.expectAddr, actualAddr)
+		}
+	}
+}
+
+// A very long port should fail with a short error (issue #8229).
+func TestParseNetworkAddressLongPort(t *testing.T) {
+	junk := strings.Repeat("\x7f", 1<<20)
+	for i, input := range []string{
+		":" + junk,
+		":80-" + junk,
+		":" + junk + "-80",
+		"localhost:" + strings.Repeat("9", 1<<20),
+	} {
+		_, err := ParseNetworkAddress(input)
+		if err == nil {
+			t.Errorf("Test %d: expected error but got none", i)
+			continue
+		}
+		if len(err.Error()) > 100 {
+			t.Errorf("Test %d: error message is %d bytes, expected at most 100", i, len(err.Error()))
 		}
 	}
 }
@@ -845,5 +905,95 @@ func TestSplitUnixSocketPermissionsBits(t *testing.T) {
 		if !tc.expectErr && actualFileMode.Perm().String() != tc.expectFileMode {
 			t.Errorf("Test %d: Expected perms '%s' but got '%s'", i, tc.expectFileMode, actualFileMode.Perm().String())
 		}
+	}
+}
+
+// TestListenQUICOptions_ZeroValueAllows0RTT checks that ListenQUIC accepts a
+// zero-value options struct (historical default: 0-RTT allowed) and that the
+// returned listener is released by closing it twice, per ListenQUIC's contract.
+func TestListenQUICOptions_ZeroValueAllows0RTT(t *testing.T) {
+	na, err := ParseNetworkAddress("udp/127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ParseNetworkAddress: %v", err)
+	}
+
+	ln, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, ListenQUICOptions{
+		TLSConfig: &tls.Config{}, //nolint:gosec // test listener; no client handshake
+	})
+	if err != nil {
+		t.Fatalf("ListenQUIC: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Errorf("first Close: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+}
+
+// TestListenQUICWebTransportCapability verifies that WebTransport QUIC
+// capabilities are fixed by the first creator of a pooled QUIC listener.
+func TestListenQUICWebTransportCapability(t *testing.T) {
+	closeTwice := func(t *testing.T, ln interface{ Close() error }) {
+		t.Helper()
+		if err := ln.Close(); err != nil {
+			t.Errorf("first Close: %v", err)
+		}
+		if err := ln.Close(); err != nil {
+			t.Errorf("second Close: %v", err)
+		}
+	}
+	supportsWT := func(t *testing.T, ln any) bool {
+		t.Helper()
+		wt, ok := ln.(interface{ SupportsWebTransport() bool })
+		if !ok {
+			t.Fatal("listener does not implement SupportsWebTransport()")
+		}
+		return wt.SupportsWebTransport()
+	}
+
+	for _, tc := range []struct {
+		name        string
+		first, want bool
+	}{
+		{name: "off-then-on", first: false, want: false},
+		{name: "on-then-off", first: true, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("ListenPacket probe: %v", err)
+			}
+			port := uint(probe.LocalAddr().(*net.UDPAddr).Port)
+			_ = probe.Close()
+
+			na := NetworkAddress{Network: "udp", Host: "127.0.0.1", StartPort: port, EndPort: port}
+			tlsConf := &tls.Config{}
+			listen := func(enable bool) (interface{ Close() error }, error) {
+				return na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, ListenQUICOptions{
+					TLSConfig:          tlsConf,
+					EnableWebTransport: enable,
+				})
+			}
+
+			ln1, err := listen(tc.first)
+			if err != nil {
+				t.Fatalf("first ListenQUIC: %v", err)
+			}
+			ln2, err := listen(!tc.first)
+			if err != nil {
+				closeTwice(t, ln1)
+				t.Fatalf("second ListenQUIC: %v", err)
+			}
+			defer closeTwice(t, ln1)
+			defer closeTwice(t, ln2)
+
+			if got := supportsWT(t, ln1); got != tc.want {
+				t.Errorf("first listener SupportsWebTransport() = %v, want %v", got, tc.want)
+			}
+			if got := supportsWT(t, ln2); got != tc.want {
+				t.Errorf("second listener SupportsWebTransport() = %v, want %v (pool reuses first creator's config)", got, tc.want)
+			}
+		})
 	}
 }
