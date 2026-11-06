@@ -58,7 +58,16 @@ func (p CustomCertSelectionPolicy) SelectCertificate(hello *tls.ClientHelloInfo,
 
 nextChoice:
 	for _, cert := range choices {
+		if cert.Leaf == nil && len(cert.Certificate.Certificate) > 0 {
+			if leaf, err := x509.ParseCertificate(cert.Certificate.Certificate[0]); err == nil {
+				cert.Leaf = leaf
+			}
+		}
+
 		if len(p.SerialNumber) > 0 {
+			if cert.Leaf == nil {
+				continue
+			}
 			var found bool
 			for _, sn := range p.SerialNumber {
 				snInt := sn.Int // avoid taking address of iteration variable (gosec warning)
@@ -73,6 +82,9 @@ nextChoice:
 		}
 
 		if len(p.SubjectOrganization) > 0 {
+			if cert.Leaf == nil {
+				continue
+			}
 			found := slices.ContainsFunc(p.SubjectOrganization, func(s string) bool {
 				return slices.Contains(cert.Leaf.Subject.Organization, s)
 			})
@@ -81,9 +93,13 @@ nextChoice:
 			}
 		}
 
-		if p.PublicKeyAlgorithm != PublicKeyAlgorithm(x509.UnknownPublicKeyAlgorithm) &&
-			PublicKeyAlgorithm(cert.Leaf.PublicKeyAlgorithm) != p.PublicKeyAlgorithm {
-			continue
+		if p.PublicKeyAlgorithm != PublicKeyAlgorithm(x509.UnknownPublicKeyAlgorithm) {
+			if cert.Leaf == nil {
+				continue
+			}
+			if PublicKeyAlgorithm(cert.Leaf.PublicKeyAlgorithm) != p.PublicKeyAlgorithm {
+				continue
+			}
 		}
 
 		if len(p.AnyTag) > 0 {
