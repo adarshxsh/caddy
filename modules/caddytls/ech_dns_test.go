@@ -2,7 +2,9 @@ package caddytls
 
 import (
 	"encoding/base64"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -62,4 +64,42 @@ func TestECHDNSPublisherPublishedSvcParams(t *testing.T) {
 	if !reflect.DeepEqual(got["ech"], []string{wantECH}) {
 		t.Fatalf("unexpected ECH params: got %v want %v", got["ech"], wantECH)
 	}
+}
+
+func TestRegisterServerNamesConcurrentWithECHPublishing(t *testing.T) {
+	tlsApp := &TLS{
+		serverNames:   make(map[string]serverNameRegistration),
+		serverNamesMu: new(sync.Mutex),
+	}
+
+	var wg sync.WaitGroup
+	const iterations = 500
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			tlsApp.RegisterServerNames([]string{
+				fmt.Sprintf("example%d.com:443", i),
+				fmt.Sprintf("test%d.org", i),
+			}, []string{"h2", "h3"})
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			tlsApp.serverNamesMu.Lock()
+			serverNamesSet := make(map[string]struct{}, len(tlsApp.serverNames))
+			for name := range tlsApp.serverNames {
+				if strings.HasSuffix(name, ".ts.net") {
+					continue
+				}
+				serverNamesSet[name] = struct{}{}
+			}
+			tlsApp.serverNamesMu.Unlock()
+		}
+	}()
+
+	wg.Wait()
 }
