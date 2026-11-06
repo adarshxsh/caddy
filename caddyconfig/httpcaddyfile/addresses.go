@@ -441,9 +441,13 @@ func (a Address) String() string {
 	if a.Port != "" &&
 		((scheme == "https" && a.Port != strconv.Itoa(caddyhttp.DefaultHTTPSPort)) ||
 			(scheme == "http" && a.Port != strconv.Itoa(caddyhttp.DefaultHTTPPort))) {
-		s += net.JoinHostPort(a.Host, a.Port)
+		s += net.JoinHostPort(strings.Trim(a.Host, "[]"), a.Port)
 	} else {
-		s += a.Host
+		host := a.Host
+		if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+			host = "[" + host + "]"
+		}
+		s += host
 	}
 	if a.Path != "" {
 		s += a.Path
