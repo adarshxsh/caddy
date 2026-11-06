@@ -595,14 +595,21 @@ func (h *Handler) countFailure(upstream *Upstream) {
 		return
 	}
 
+	logger := h.HealthChecks.Passive.logger
+	if logger == nil {
+		logger = h.logger
+	}
+
 	// count failure immediately
 	err := upstream.Host.countFail(1)
 	if err != nil {
-		if c := h.HealthChecks.Active.logger.Check(zapcore.ErrorLevel, "could not count failure"); c != nil {
-			c.Write(
-				zap.String("host", upstream.Dial),
-				zap.Error(err),
-			)
+		if logger != nil {
+			if c := logger.Check(zapcore.ErrorLevel, "could not count failure"); c != nil {
+				c.Write(
+					zap.String("host", upstream.Dial),
+					zap.Error(err),
+				)
+			}
 		}
 		return
 	}
@@ -611,11 +618,13 @@ func (h *Handler) countFailure(upstream *Upstream) {
 	go func(host *Host, failDuration time.Duration) {
 		defer func() {
 			if err := recover(); err != nil {
-				if c := h.HealthChecks.Active.logger.Check(zapcore.ErrorLevel, "passive health check failure forgetter panicked"); c != nil {
-					c.Write(
-						zap.Any("error", err),
-						zap.ByteString("stack", debug.Stack()),
-					)
+				if logger != nil {
+					if c := logger.Check(zapcore.ErrorLevel, "passive health check failure forgetter panicked"); c != nil {
+						c.Write(
+							zap.Any("error", err),
+							zap.ByteString("stack", debug.Stack()),
+						)
+					}
 				}
 			}
 		}()
@@ -629,11 +638,13 @@ func (h *Handler) countFailure(upstream *Upstream) {
 		}
 		err := host.countFail(-1)
 		if err != nil {
-			if c := h.HealthChecks.Active.logger.Check(zapcore.ErrorLevel, "could not forget failure"); c != nil {
-				c.Write(
-					zap.String("host", upstream.Dial),
-					zap.Error(err),
-				)
+			if logger != nil {
+				if c := logger.Check(zapcore.ErrorLevel, "could not forget failure"); c != nil {
+					c.Write(
+						zap.String("host", upstream.Dial),
+						zap.Error(err),
+					)
+				}
 			}
 		}
 	}(upstream.Host, failDuration)
