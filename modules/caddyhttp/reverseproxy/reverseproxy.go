@@ -1492,6 +1492,11 @@ func (h *Handler) finalizeResponse(
 		// see: https://github.com/caddyserver/caddy/issues/7845
 		//nolint:bodyclose
 		http.NewResponseController(rw).Flush()
+		if code, ok := extractQUICResetCode(err); ok {
+			tryCancelWrite(rw, code)
+		} else if code, ok := extractQUICResetCode(errClose); ok {
+			tryCancelWrite(rw, code)
+		}
 		// no extra logging from stdlib
 		panic(http.ErrAbortHandler)
 	}
