@@ -27,18 +27,28 @@ func NewShorthandReplacer() ShorthandReplacer {
 	// parameters, but we still want to provide a shorthand
 	// for those, so we use a regexp to replace
 	regexpReplacements := []ComplexShorthandReplacer{
-		{regexp.MustCompile(`{header\.([\w-]*)}`), "{http.request.header.$1}"},
-		{regexp.MustCompile(`{cookie\.([\w-]*)}`), "{http.request.cookie.$1}"},
-		{regexp.MustCompile(`{labels\.([\w-]*)}`), "{http.request.host.labels.$1}"},
-		{regexp.MustCompile(`{path\.([\w-]*)}`), "{http.request.uri.path.$1}"},
-		{regexp.MustCompile(`{file\.([\w-]*)}`), "{http.request.uri.path.file.$1}"},
-		{regexp.MustCompile(`{query\.([\w-]*)}`), "{http.request.uri.query.$1}"},
-		{regexp.MustCompile(`{re\.([\w-\.]*)}`), "{http.regexp.$1}"},
-		{regexp.MustCompile(`{vars\.([\w-]*)}`), "{http.vars.$1}"},
-		{regexp.MustCompile(`{rp\.([\w-\.]*)}`), "{http.reverse_proxy.$1}"},
-		{regexp.MustCompile(`{resp\.([\w-\.]*)}`), "{http.intercept.$1}"},
-		{regexp.MustCompile(`{err\.([\w-\.]*)}`), "{http.error.$1}"},
-		{regexp.MustCompile(`{file_match\.([\w-]*)}`), "{http.matchers.file.$1}"},
+		{regexp.MustCompile(`\{header\.([\w-]*)(:[^}]*)?\}`), "{http.request.header.$1$2}"},
+		{regexp.MustCompile(`\{cookie\.([\w-]*)(:[^}]*)?\}`), "{http.request.cookie.$1$2}"},
+		{regexp.MustCompile(`\{labels\.([\w-]*)(:[^}]*)?\}`), "{http.request.host.labels.$1$2}"},
+		{regexp.MustCompile(`\{path\.([\w-]*)(:[^}]*)?\}`), "{http.request.uri.path.$1$2}"},
+		{regexp.MustCompile(`\{file\.([\w-]*)(:[^}]*)?\}`), "{http.request.uri.path.file.$1$2}"},
+		{regexp.MustCompile(`\{query\.([\w-]*)(:[^}]*)?\}`), "{http.request.uri.query.$1$2}"},
+		{regexp.MustCompile(`\{re\.([\w-\.]*)(:[^}]*)?\}`), "{http.regexp.$1$2}"},
+		{regexp.MustCompile(`\{vars\.([\w-]*)(:[^}]*)?\}`), "{http.vars.$1$2}"},
+		{regexp.MustCompile(`\{rp\.([\w-\.]*)(:[^}]*)?\}`), "{http.reverse_proxy.$1$2}"},
+		{regexp.MustCompile(`\{resp\.([\w-\.]*)(:[^}]*)?\}`), "{http.intercept.$1$2}"},
+		{regexp.MustCompile(`\{err\.([\w-\.]*)(:[^}]*)?\}`), "{http.error.$1$2}"},
+		{regexp.MustCompile(`\{file_match\.([\w-]*)(:[^}]*)?\}`), "{http.matchers.file.$1$2}"},
+	}
+
+	sh := placeholderShorthands()
+	for i := 0; i < len(sh); i += 2 {
+		key := strings.Trim(sh[i], "{}")
+		val := strings.TrimSuffix(sh[i+1], "}")
+		regexpReplacements = append(regexpReplacements, ComplexShorthandReplacer{
+			search:  regexp.MustCompile(`\{` + regexp.QuoteMeta(key) + `(:[^}]*)?\}`),
+			replace: val + `${1}}`,
+		})
 	}
 
 	return ShorthandReplacer{
