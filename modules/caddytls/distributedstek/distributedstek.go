@@ -213,18 +213,33 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 	for {
 		select {
 		case <-s.timer.C:
-			dstek, err := s.getSTEK()
-			if err != nil {
-				// TODO: improve this handling
-				log.Printf("[ERROR] Loading STEK: %v", err)
-				continue
-			}
+			func() {
+				var nextRotation time.Time
+				defer func() {
+					dur := time.Until(nextRotation)
+					if dur <= 0 {
+						if s.stekConfig != nil {
+							dur = time.Duration(s.stekConfig.RotationInterval)
+						}
+						if dur <= 0 {
+							dur = 12 * time.Hour
+						}
+					}
+					// timer channel is already drained, so reset directly (see godoc)
+					s.timer.Reset(dur)
+				}()
 
-			// send the updated keys to the service
-			keysChan <- dstek.Keys
+				dstek, err := s.getSTEK()
+				if err != nil {
+					// TODO: improve this handling
+					log.Printf("[ERROR] Loading STEK: %v", err)
+					return
+				}
+				nextRotation = dstek.NextRotation
 
-			// timer channel is already drained, so reset directly (see godoc)
-			s.timer.Reset(time.Until(dstek.NextRotation))
+				// send the updated keys to the service
+				keysChan <- dstek.Keys
+			}()
 
 		case <-doneChan:
 			// again, see godocs for why timer is stopped this way
