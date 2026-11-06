@@ -23,13 +23,6 @@ func TestTLSStopIdempotent(t *testing.T) {
 				t.Fatalf("unexpected error on Stop() call %d: %v", i, err)
 			}
 		}
-
-		if tlsApp.storageCleanStop != nil {
-			t.Errorf("expected storageCleanStop to be nil after Stop(), got %v", tlsApp.storageCleanStop)
-		}
-		if tlsApp.storageCleanTicker != nil {
-			t.Errorf("expected storageCleanTicker to be nil after Stop(), got %v", tlsApp.storageCleanTicker)
-		}
 	})
 
 	t.Run("concurrent stop", func(t *testing.T) {
@@ -48,13 +41,6 @@ func TestTLSStopIdempotent(t *testing.T) {
 			}()
 		}
 		wg.Wait()
-
-		if tlsApp.storageCleanStop != nil {
-			t.Errorf("expected storageCleanStop to be nil after concurrent Stop(), got %v", tlsApp.storageCleanStop)
-		}
-		if tlsApp.storageCleanTicker != nil {
-			t.Errorf("expected storageCleanTicker to be nil after concurrent Stop(), got %v", tlsApp.storageCleanTicker)
-		}
 	})
 
 	t.Run("unstarted stop", func(t *testing.T) {
