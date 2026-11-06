@@ -36,12 +36,14 @@ func (m *mockDatagramStream) CancelWrite(code quic.StreamErrorCode) {
 	m.canceledWrite = true
 	m.canceledWriteCode = code
 }
-func (m *mockDatagramStream) StreamID() quic.StreamID            { return 1 }
-func (m *mockDatagramStream) Context() context.Context           { return context.Background() }
-func (m *mockDatagramStream) SetDeadline(t time.Time) error      { return nil }
-func (m *mockDatagramStream) SetReadDeadline(t time.Time) error  { return nil }
-func (m *mockDatagramStream) SetWriteDeadline(t time.Time) error { return nil }
-func (m *mockDatagramStream) SendDatagram(b []byte) error        { return nil }
+func (m *mockDatagramStream) StreamID() quic.StreamID                    { return 1 }
+func (m *mockDatagramStream) Context() context.Context                   { return context.Background() }
+func (m *mockDatagramStream) SetDeadline(t time.Time) error              { return nil }
+func (m *mockDatagramStream) SetReadDeadline(t time.Time) error          { return nil }
+func (m *mockDatagramStream) SetWriteDeadline(t time.Time) error         { return nil }
+func (m *mockDatagramStream) SetPriority(urgency int8, incremental bool) {}
+func (m *mockDatagramStream) TryWriteAll(b []byte) error                 { return nil }
+func (m *mockDatagramStream) SendDatagram(b []byte) error                { return nil }
 func (m *mockDatagramStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	return nil, nil
 }
@@ -208,7 +210,7 @@ func TestReverseProxyQUICStreamReset(t *testing.T) {
 		}
 	}()
 
-	_ = h.finalizeResponse(wrapper, req, res, repl, time.Now(), zap.NewNop())
+	_ = h.finalizeResponse(wrapper, req, res, repl, time.Now(), zap.NewNop(), "127.0.0.1:8080")
 }
 
 func TestReverseProxyNonQUICErrorFallback(t *testing.T) {
@@ -251,7 +253,7 @@ func TestReverseProxyNonQUICErrorFallback(t *testing.T) {
 		}
 	}()
 
-	_ = h.finalizeResponse(wrapper, req, res, repl, time.Now(), zap.NewNop())
+	_ = h.finalizeResponse(wrapper, req, res, repl, time.Now(), zap.NewNop(), "127.0.0.1:8080")
 }
 
 type errorReader struct {
