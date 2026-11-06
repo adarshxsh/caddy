@@ -58,6 +58,19 @@ func (p CustomCertSelectionPolicy) SelectCertificate(hello *tls.ClientHelloInfo,
 
 nextChoice:
 	for _, cert := range choices {
+		if cert.Leaf == nil && len(cert.Certificate.Certificate) > 0 && len(cert.Certificate.Certificate[0]) > 0 {
+			leaf, err := x509.ParseCertificate(cert.Certificate.Certificate[0])
+			if err == nil {
+				cert.Leaf = leaf
+			}
+		}
+
+		if cert.Leaf == nil && (len(p.SerialNumber) > 0 ||
+			len(p.SubjectOrganization) > 0 ||
+			p.PublicKeyAlgorithm != PublicKeyAlgorithm(x509.UnknownPublicKeyAlgorithm)) {
+			continue
+		}
+
 		if len(p.SerialNumber) > 0 {
 			var found bool
 			for _, sn := range p.SerialNumber {
