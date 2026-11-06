@@ -35,24 +35,21 @@ func TestTLSStopRepeated(t *testing.T) {
 		DisableStorageClean: false,
 	}
 
-	// Initialize storage cleaner channel and ticker
+	// Initialize storage cleaner
 	tlsApp.keepStorageClean()
 
-	if tlsApp.storageCleanStop == nil {
-		t.Fatal("expected storageCleanStop channel to be initialized")
+	if tlsApp.bgCancel == nil {
+		t.Fatal("expected bgCancel to be initialized")
 	}
 	if tlsApp.storageCleanTicker == nil {
 		t.Fatal("expected storageCleanTicker to be initialized")
 	}
 
-	// First Stop call should close channel, stop ticker, and set pointers to nil
+	// First Stop call should cancel background context, stop ticker, and set ticker pointer to nil
 	if err := tlsApp.Stop(); err != nil {
 		t.Fatalf("unexpected error on first Stop(): %v", err)
 	}
 
-	if tlsApp.storageCleanStop != nil {
-		t.Error("expected storageCleanStop to be nil after Stop()")
-	}
 	if tlsApp.storageCleanTicker != nil {
 		t.Error("expected storageCleanTicker to be nil after Stop()")
 	}
