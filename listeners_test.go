@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/internal"
@@ -343,6 +344,21 @@ func TestParseNetworkAddress(t *testing.T) {
 			defaultNetwork: "tcp",
 			expectErr:      true,
 		},
+		{
+			input:          "localhost:65535-65535",
+			defaultNetwork: "tcp",
+			expectAddr: NetworkAddress{
+				Network:   "tcp",
+				Host:      "localhost",
+				StartPort: 65535,
+				EndPort:   65535,
+			},
+		},
+		{
+			input:          "localhost:000000000080",
+			defaultNetwork: "tcp",
+			expectErr:      true,
+		},
 	} {
 		actualAddr, err := ParseNetworkAddressWithDefaults(tc.input, tc.defaultNetwork, tc.defaultPort)
 		if tc.expectErr && err == nil {
@@ -357,6 +373,26 @@ func TestParseNetworkAddress(t *testing.T) {
 		}
 		if !reflect.DeepEqual(tc.expectAddr, actualAddr) {
 			t.Errorf("Test %d: Expected addresses %v but got %v", i, tc.expectAddr, actualAddr)
+		}
+	}
+}
+
+// A very long port should fail with a short error (issue #8229).
+func TestParseNetworkAddressLongPort(t *testing.T) {
+	junk := strings.Repeat("\x7f", 1<<20)
+	for i, input := range []string{
+		":" + junk,
+		":80-" + junk,
+		":" + junk + "-80",
+		"localhost:" + strings.Repeat("9", 1<<20),
+	} {
+		_, err := ParseNetworkAddress(input)
+		if err == nil {
+			t.Errorf("Test %d: expected error but got none", i)
+			continue
+		}
+		if len(err.Error()) > 100 {
+			t.Errorf("Test %d: error message is %d bytes, expected at most 100", i, len(err.Error()))
 		}
 	}
 }
@@ -733,10 +769,10 @@ func TestListenQUIC_0RTT(t *testing.T) {
 	keyFalse := listenerKey("quicudp_0rtt_false", addrStr)
 	keyUDP := listenerKey("udp", addrStr)
 
-	// 1. Listen with allow0rttconf = nil (defaults to true)
-	ln1, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, nil, nil, nil)
+	// 1. Listen with Allow0RTT = nil (defaults to true)
+	ln1, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, ListenQUICOptions{})
 	if err != nil {
-		t.Fatalf("ListenQUIC with nil allow0rttconf failed: %v", err)
+		t.Fatalf("ListenQUIC with nil Allow0RTT failed: %v", err)
 	}
 
 	if count, _ := listenerPool.References(keyTrue); count != 1 {
@@ -746,10 +782,12 @@ func TestListenQUIC_0RTT(t *testing.T) {
 		t.Errorf("expected keyFalse ref count 0, got %d", count)
 	}
 
-	// 2. Listen with allow0rttconf = &true (should share keyTrue)
-	ln2, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, nil, nil, &trueVal)
+	// 2. Listen with Allow0RTT = &true (should share keyTrue)
+	ln2, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, ListenQUICOptions{
+		Allow0RTT: &trueVal,
+	})
 	if err != nil {
-		t.Fatalf("ListenQUIC with allow0rttconf=true failed: %v", err)
+		t.Fatalf("ListenQUIC with Allow0RTT=true failed: %v", err)
 	}
 
 	if count, _ := listenerPool.References(keyTrue); count != 2 {
@@ -759,10 +797,12 @@ func TestListenQUIC_0RTT(t *testing.T) {
 		t.Errorf("expected keyFalse ref count 0, got %d", count)
 	}
 
-	// 3. Listen with allow0rttconf = &false (should create keyFalse)
-	ln3, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, nil, nil, &falseVal)
+	// 3. Listen with Allow0RTT = &false (should create keyFalse)
+	ln3, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, ListenQUICOptions{
+		Allow0RTT: &falseVal,
+	})
 	if err != nil {
-		t.Fatalf("ListenQUIC with allow0rttconf=false failed: %v", err)
+		t.Fatalf("ListenQUIC with Allow0RTT=false failed: %v", err)
 	}
 
 	if count, _ := listenerPool.References(keyTrue); count != 2 {
@@ -808,3 +848,92 @@ func TestListenQUIC_0RTT(t *testing.T) {
 	}
 }
 
+// TestListenQUICOptions_ZeroValueAllows0RTT checks that ListenQUIC accepts a
+// zero-value options struct (historical default: 0-RTT allowed) and that the
+// returned listener is released by closing it twice, per ListenQUIC's contract.
+func TestListenQUICOptions_ZeroValueAllows0RTT(t *testing.T) {
+	na, err := ParseNetworkAddress("udp/127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ParseNetworkAddress: %v", err)
+	}
+
+	ln, err := na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, ListenQUICOptions{
+		TLSConfig: &tls.Config{}, //nolint:gosec // test listener; no client handshake
+	})
+	if err != nil {
+		t.Fatalf("ListenQUIC: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Errorf("first Close: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+}
+
+// TestListenQUICWebTransportCapability verifies that WebTransport QUIC
+// capabilities are fixed by the first creator of a pooled QUIC listener.
+func TestListenQUICWebTransportCapability(t *testing.T) {
+	closeTwice := func(t *testing.T, ln interface{ Close() error }) {
+		t.Helper()
+		if err := ln.Close(); err != nil {
+			t.Errorf("first Close: %v", err)
+		}
+		if err := ln.Close(); err != nil {
+			t.Errorf("second Close: %v", err)
+		}
+	}
+	supportsWT := func(t *testing.T, ln any) bool {
+		t.Helper()
+		wt, ok := ln.(interface{ SupportsWebTransport() bool })
+		if !ok {
+			t.Fatal("listener does not implement SupportsWebTransport()")
+		}
+		return wt.SupportsWebTransport()
+	}
+
+	for _, tc := range []struct {
+		name        string
+		first, want bool
+	}{
+		{name: "off-then-on", first: false, want: false},
+		{name: "on-then-off", first: true, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("ListenPacket probe: %v", err)
+			}
+			port := uint(probe.LocalAddr().(*net.UDPAddr).Port)
+			_ = probe.Close()
+
+			na := NetworkAddress{Network: "udp", Host: "127.0.0.1", StartPort: port, EndPort: port}
+			tlsConf := &tls.Config{}
+			listen := func(enable bool) (interface{ Close() error }, error) {
+				return na.ListenQUIC(context.Background(), 0, net.ListenConfig{}, ListenQUICOptions{
+					TLSConfig:          tlsConf,
+					EnableWebTransport: enable,
+				})
+			}
+
+			ln1, err := listen(tc.first)
+			if err != nil {
+				t.Fatalf("first ListenQUIC: %v", err)
+			}
+			ln2, err := listen(!tc.first)
+			if err != nil {
+				closeTwice(t, ln1)
+				t.Fatalf("second ListenQUIC: %v", err)
+			}
+			defer closeTwice(t, ln1)
+			defer closeTwice(t, ln2)
+
+			if got := supportsWT(t, ln1); got != tc.want {
+				t.Errorf("first listener SupportsWebTransport() = %v, want %v", got, tc.want)
+			}
+			if got := supportsWT(t, ln2); got != tc.want {
+				t.Errorf("second listener SupportsWebTransport() = %v, want %v (pool reuses first creator's config)", got, tc.want)
+			}
+		})
+	}
+}
