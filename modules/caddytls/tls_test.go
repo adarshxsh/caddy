@@ -13,9 +13,6 @@ func TestTLSStopIdempotent(t *testing.T) {
 
 	tlsApp.keepStorageClean()
 
-	if tlsApp.storageCleanStop == nil {
-		t.Fatal("expected storageCleanStop channel to be initialized")
-	}
 	if tlsApp.storageCleanTicker == nil {
 		t.Fatal("expected storageCleanTicker to be initialized")
 	}
@@ -25,9 +22,6 @@ func TestTLSStopIdempotent(t *testing.T) {
 		t.Fatalf("unexpected error on first Stop: %v", err)
 	}
 
-	if tlsApp.storageCleanStop != nil {
-		t.Error("expected storageCleanStop to be nil after Stop")
-	}
 	if tlsApp.storageCleanTicker != nil {
 		t.Error("expected storageCleanTicker to be nil after Stop")
 	}
@@ -37,16 +31,9 @@ func TestTLSStopIdempotent(t *testing.T) {
 		t.Fatalf("unexpected error on second Stop: %v", err)
 	}
 
-	// Also test when storageCleanStop is non-nil but already closed
-	ch := make(chan struct{})
-	close(ch)
-	tlsAppClosedCh := &TLS{
-		storageCleanStop: ch,
-	}
-	if err := tlsAppClosedCh.Stop(); err != nil {
-		t.Fatalf("unexpected error when stopping with closed channel: %v", err)
-	}
-	if tlsAppClosedCh.storageCleanStop != nil {
-		t.Error("expected storageCleanStop to be nil after Stop")
+	// Stop on an unstarted TLS instance should also succeed
+	emptyTLS := &TLS{}
+	if err := emptyTLS.Stop(); err != nil {
+		t.Fatalf("unexpected error when stopping unstarted TLS: %v", err)
 	}
 }
