@@ -111,7 +111,7 @@ func TestRegisterServerNamesConcurrency(t *testing.T) {
 		defer wg.Done()
 		logger := zap.NewNop()
 		for i := 0; i < iterations; i++ {
-			_ = tlsApp.publishECHConfigs(logger)
+			_ = tlsApp.publishECHConfigs(caddyCtx, logger)
 		}
 	}()
 
