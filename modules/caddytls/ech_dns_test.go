@@ -176,7 +176,7 @@ func TestECHPublicationConcurrentRotation(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					_ = tlsApp.publishECHConfigs(logger)
+					_ = tlsApp.publishECHConfigs(caddyCtx, logger)
 				}
 			}
 		}()
