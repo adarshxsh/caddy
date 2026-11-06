@@ -221,7 +221,10 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	if h.streamLogsSkipHandshake() {
 		caddyhttp.SetVar(req.Context(), caddyhttp.LogSkipVar, true)
 	}
-	repl := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl, _ := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	if repl == nil {
+		repl = caddy.NewReplacer()
+	}
 	repl.Set("http.reverse_proxy.upgraded", true)
 	streamUUID, _ := repl.GetString("http.request.uuid")
 	streamFields := makeStreamLogFields(streamUUID)
@@ -232,8 +235,13 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	start := time.Now()
 
 	tunnelOwnsConnections = true
+	var tunnelCtx context.Context
+	if !detached {
+		tunnelCtx = req.Context()
+	}
 	if !detached {
 		handleUpgradeTunnel(
+			tunnelCtx,
 			streamLogger,
 			streamLevel,
 			conn,
@@ -249,6 +257,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	} else {
 		// start a new goroutine
 		go handleUpgradeTunnel(
+			tunnelCtx,
 			streamLogger,
 			streamLevel,
 			conn,
@@ -266,6 +275,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 
 // handleUpgradeTunnel returns when transfer is done.
 func handleUpgradeTunnel(
+	ctx context.Context,
 	streamLogger *zap.Logger,
 	streamLevel zapcore.Level,
 	conn io.ReadWriteCloser,
@@ -309,6 +319,11 @@ func handleUpgradeTunnel(
 		timeoutc = timer.C
 	}
 
+	var donec <-chan struct{}
+	if ctx != nil {
+		donec = ctx.Done()
+	}
+
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
 	// Wait for both directions to finish. A clean EOF in one direction is a
@@ -349,6 +364,9 @@ copyLoop:
 			if c := streamLogger.Check(streamLevel, "stream timed out"); c != nil {
 				c.Write(zap.Time("timeout", t))
 			}
+			break copyLoop
+		case <-donec:
+			result = "closed"
 			break copyLoop
 		}
 	}
@@ -572,6 +590,9 @@ func newTunnelTracker(logger *zap.Logger, closeDelay time.Duration) *tunnelTrack
 // registerConnection stores conn in the tracking map. The caller must invoke
 // the returned del func when the connection is done.
 func (ts *tunnelTracker) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error, detached bool, upstream string) (del func()) {
+	if ts == nil {
+		return func() {}
+	}
 	ts.mu.Lock()
 	ts.connections[conn] = openConnection{conn, gracefulClose, detached, upstream}
 	ts.mu.Unlock()
