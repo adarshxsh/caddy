@@ -393,15 +393,16 @@ func ParseAddress(str string) (Address, error) {
 	// extract host and port
 	hostSplit := strings.SplitN(remaining, "/", 2)
 	if len(hostSplit) > 0 {
-		host, port, err := net.SplitHostPort(hostSplit[0])
+		masked, replacements := maskPlaceholders(hostSplit[0])
+		host, port, err := net.SplitHostPort(masked)
 		if err != nil {
-			host, port, err = net.SplitHostPort(hostSplit[0] + ":")
+			host, port, err = net.SplitHostPort(masked + ":")
 			if err != nil {
-				host = hostSplit[0]
+				host = masked
 			}
 		}
-		a.Host = host
-		a.Port = port
+		a.Host = unmaskPlaceholders(host, replacements)
+		a.Port = unmaskPlaceholders(port, replacements)
 	}
 	if len(hostSplit) == 2 {
 		// all that remains is the path
@@ -409,7 +410,7 @@ func ParseAddress(str string) (Address, error) {
 	}
 
 	// make sure port is valid
-	if a.Port != "" {
+	if a.Port != "" && !strings.Contains(a.Port, "{") {
 		if portNum, err := strconv.Atoi(a.Port); err != nil {
 			return Address{}, fmt.Errorf("invalid port '%s': %v", a.Port, err)
 		} else if portNum < 0 || portNum > 65535 {
@@ -418,6 +419,68 @@ func ParseAddress(str string) (Address, error) {
 	}
 
 	return a, nil
+}
+
+type placeholderReplacements map[string]string
+
+func maskPlaceholders(str string) (string, placeholderReplacements) {
+	var spans []struct{ start, end int }
+	var depth int
+	var start int
+	var escaped bool
+
+	for i := 0; i < len(str); i++ {
+		b := str[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if b == '\\' {
+			escaped = true
+			continue
+		}
+		if b == '{' {
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		} else if b == '}' && depth > 0 {
+			depth--
+			if depth == 0 {
+				spans = append(spans, struct{ start, end int }{start, i + 1})
+			}
+		}
+	}
+
+	if len(spans) == 0 {
+		return str, nil
+	}
+
+	replacements := make(placeholderReplacements, len(spans))
+	var sb strings.Builder
+	lastEnd := 0
+
+	for i, span := range spans {
+		sb.WriteString(str[lastEnd:span.start])
+		token := fmt.Sprintf("\x00PH_%d\x00", i)
+		original := str[span.start:span.end]
+		replacements[token] = original
+		sb.WriteString(token)
+		lastEnd = span.end
+	}
+	sb.WriteString(str[lastEnd:])
+
+	return sb.String(), replacements
+}
+
+func unmaskPlaceholders(str string, replacements placeholderReplacements) string {
+	if len(replacements) == 0 || str == "" {
+		return str
+	}
+	for token, original := range replacements {
+		str = strings.ReplaceAll(str, token, original)
+	}
+	return str
 }
 
 // String returns a human-readable form of a. It will
@@ -441,7 +504,11 @@ func (a Address) String() string {
 	if a.Port != "" &&
 		((scheme == "https" && a.Port != strconv.Itoa(caddyhttp.DefaultHTTPSPort)) ||
 			(scheme == "http" && a.Port != strconv.Itoa(caddyhttp.DefaultHTTPPort))) {
-		s += net.JoinHostPort(a.Host, a.Port)
+		if strings.Contains(a.Host, "{") && !strings.HasPrefix(a.Host, "[") {
+			s += a.Host + ":" + a.Port
+		} else {
+			s += net.JoinHostPort(a.Host, a.Port)
+		}
 	} else {
 		s += a.Host
 	}
