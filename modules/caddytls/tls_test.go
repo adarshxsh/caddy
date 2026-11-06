@@ -1,14 +1,17 @@
 package caddytls
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestTLSStopRepeated(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
 	tlsApp := &TLS{
-		storageCleanStop:   make(chan struct{}),
+		bgCancel:           cancel,
+		bgWg:               new(sync.WaitGroup),
 		storageCleanTicker: time.NewTicker(time.Hour),
 	}
 
@@ -21,8 +24,10 @@ func TestTLSStopRepeated(t *testing.T) {
 }
 
 func TestTLSStopConcurrent(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
 	tlsApp := &TLS{
-		storageCleanStop:   make(chan struct{}),
+		bgCancel:           cancel,
+		bgWg:               new(sync.WaitGroup),
 		storageCleanTicker: time.NewTicker(time.Hour),
 	}
 
