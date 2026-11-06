@@ -2,7 +2,9 @@ package caddytls
 
 import (
 	"encoding/base64"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -62,4 +64,45 @@ func TestECHDNSPublisherPublishedSvcParams(t *testing.T) {
 	if !reflect.DeepEqual(got["ech"], []string{wantECH}) {
 		t.Fatalf("unexpected ECH params: got %v want %v", got["ech"], wantECH)
 	}
+}
+
+func TestServerNamesConcurrency(t *testing.T) {
+	tlsApp := &TLS{
+		serverNames:   make(map[string]serverNameRegistration),
+		serverNamesMu: new(sync.Mutex),
+	}
+
+	var wg sync.WaitGroup
+	workers := 10
+	iterations := 100
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				domain := fmt.Sprintf("sub%d-%d.example.com", id, j)
+				tlsApp.RegisterServerNames([]string{domain}, []string{"h2", "h3"})
+			}
+		}(i)
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				names := tlsApp.ServerNames()
+				serverNamesSet := make(map[string]struct{}, len(names))
+				for _, name := range names {
+					if strings.HasSuffix(name, ".ts.net") {
+						continue
+					}
+					serverNamesSet[name] = struct{}{}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }
