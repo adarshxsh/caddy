@@ -127,16 +127,32 @@ func (r *WeightedRoundRobinSelection) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+// Validate ensures that r's configuration is valid
+func (r *WeightedRoundRobinSelection) Validate() error {
+	if r.totalWeight <= 0 {
+		return fmt.Errorf("weighted_round_robin requires at least one upstream with a positive weight")
+	}
+	for _, weight := range r.Weights {
+		if weight < 0 {
+			return fmt.Errorf("weight of an upstream cannot be negative")
+		}
+	}
+	return nil
+}
+
 // Select returns an available host, if any.
 func (r *WeightedRoundRobinSelection) Select(pool UpstreamPool, _ *http.Request, _ http.ResponseWriter) *Upstream {
 	if len(pool) == 0 {
 		return nil
 	}
 	if len(r.Weights) < 2 {
+		if !pool[0].Available() {
+			return nil
+		}
 		return pool[0]
 	}
 	var index, totalWeight int
-	var weights []int
+	weights := make([]int, 0, len(r.Weights))
 
 	for _, w := range r.Weights {
 		if w > 0 {
@@ -154,7 +170,7 @@ func (r *WeightedRoundRobinSelection) Select(pool UpstreamPool, _ *http.Request,
 
 	upstreams := make([]*Upstream, 0, len(weights))
 	for i, upstream := range pool {
-		if !upstream.Available() || r.Weights[i] == 0 {
+		if i >= len(r.Weights) || !upstream.Available() || r.Weights[i] == 0 {
 			continue
 		}
 		upstreams = append(upstreams, upstream)
@@ -220,12 +236,23 @@ func (r RandomChoiceSelection) Validate() error {
 // Select returns an available host, if any.
 func (r RandomChoiceSelection) Select(pool UpstreamPool, _ *http.Request, _ http.ResponseWriter) *Upstream {
 	k := min(r.Choose, len(pool))
-	choices := make([]*Upstream, k)
-	for i, upstream := range pool {
+
+	// reservoir sampling (Algorithm R) over the available upstreams:
+	// the first k available upstreams fill the reservoir, then each
+	// subsequent one replaces a random reservoir entry with probability
+	// k/n, so every available upstream is sampled uniformly
+	choices := make([]*Upstream, 0, k)
+	var available int
+	for _, upstream := range pool {
 		if !upstream.Available() {
 			continue
 		}
-		j := weakrand.IntN(i + 1) //nolint:gosec
+		available++
+		if len(choices) < k {
+			choices = append(choices, upstream)
+			continue
+		}
+		j := weakrand.IntN(available) //nolint:gosec
 		if j < k {
 			choices[j] = upstream
 		}
@@ -701,7 +728,7 @@ func (s CookieHashSelection) Select(pool UpstreamPool, req *http.Request, w http
 			continue
 		}
 		sha, err := hashCookie(s.Secret, upstream.Dial)
-		if err == nil && sha == cookieValue {
+		if err == nil && hmac.Equal([]byte(sha), []byte(cookieValue)) {
 			return upstream
 		}
 	}
@@ -818,10 +845,10 @@ func leastRequests(upstreams []*Upstream) *Upstream {
 		if reqs == 0 {
 			return upstream
 		}
-		// If bestReqs was just initialized to -1
-		// we need to append upstream also
-		if reqs <= bestReqs || bestReqs == -1 {
+		if reqs < bestReqs || bestReqs == -1 {
 			bestReqs = reqs
+			best = []*Upstream{upstream}
+		} else if reqs == bestReqs {
 			best = append(best, upstream)
 		}
 	}
@@ -893,6 +920,7 @@ var (
 	_ Selector = (*CookieHashSelection)(nil)
 
 	_ caddy.Validator = (*RandomChoiceSelection)(nil)
+	_ caddy.Validator = (*WeightedRoundRobinSelection)(nil)
 
 	_ caddy.Provisioner = (*RandomChoiceSelection)(nil)
 	_ caddy.Provisioner = (*WeightedRoundRobinSelection)(nil)
