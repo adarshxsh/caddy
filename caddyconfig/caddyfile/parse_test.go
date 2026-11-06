@@ -83,7 +83,7 @@ func TestParseVariadic(t *testing.T) {
 		},
 		{
 			input:  "{args[:11]}",
-			result: false,
+			result: true,
 		},
 		{
 			input:  "{args[10:0]}",

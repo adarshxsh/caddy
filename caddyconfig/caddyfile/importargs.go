@@ -84,12 +84,27 @@ func parseVariadic(token Token, argCount int) (bool, int, int) {
 	}
 
 	// bound check
-	if startIndex < 0 || startIndex > endIndex || endIndex > argCount {
+	if startIndex < 0 || endIndex < 0 || startIndex > endIndex {
 		caddy.Log().Named("caddyfile").Warn(
 			"Variadic placeholder "+token.Text+" indices are out of bounds, only "+strconv.Itoa(argCount)+" argument(s) exist",
 			zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
 		return false, 0, 0
 	}
+
+	// clamp indices to available argument count
+	if startIndex > argCount {
+		startIndex = argCount
+	}
+	if endIndex > argCount {
+		endIndex = argCount
+	}
+
+	if startIndex == endIndex {
+		caddy.Log().Named("caddyfile").Warn(
+			"Variadic placeholder "+token.Text+" yielded no arguments",
+			zap.String("file", token.File+":"+strconv.Itoa(token.Line)), zap.Strings("import_chain", token.imports))
+	}
+
 	return true, startIndex, endIndex
 }
 
