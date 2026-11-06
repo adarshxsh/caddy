@@ -59,6 +59,65 @@ func (rwc extendedConnectReadWriteCloser) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
+func (rwc extendedConnectReadWriteCloser) SetWriteDeadline(t time.Time) error {
+	//nolint:bodyclose
+	return http.NewResponseController(rwc.ResponseWriter).SetWriteDeadline(t)
+}
+
+func (rwc extendedConnectReadWriteCloser) SetReadDeadline(t time.Time) error {
+	if s, ok := rwc.ReadCloser.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return s.SetReadDeadline(t)
+	}
+	if s, ok := rwc.ReadCloser.(interface{ SetDeadline(time.Time) error }); ok {
+		return s.SetDeadline(t)
+	}
+	//nolint:bodyclose
+	return http.NewResponseController(rwc.ResponseWriter).SetReadDeadline(t)
+}
+
+func (rwc extendedConnectReadWriteCloser) SetDeadline(t time.Time) error {
+	rErr := rwc.SetReadDeadline(t)
+	wErr := rwc.SetWriteDeadline(t)
+	if rErr != nil && !errors.Is(rErr, http.ErrNotSupported) {
+		return rErr
+	}
+	if wErr != nil && !errors.Is(wErr, http.ErrNotSupported) {
+		return wErr
+	}
+	return nil
+}
+
+func (rwc extendedConnectReadWriteCloser) Close() error {
+	err := rwc.ReadCloser.Close()
+
+	//nolint:bodyclose
+	_ = http.NewResponseController(rwc.ResponseWriter).Flush()
+
+	rw := rwc.ResponseWriter
+	for rw != nil {
+		if c, ok := rw.(io.Closer); ok {
+			if cErr := c.Close(); cErr != nil && err == nil {
+				err = cErr
+			}
+			break
+		}
+		if c, ok := rw.(interface{ CloseWrite() error }); ok {
+			if cErr := c.CloseWrite(); cErr != nil && err == nil {
+				err = cErr
+			}
+			break
+		}
+		if u, ok := rw.(interface{ Unwrap() http.ResponseWriter }); ok {
+			rw = u.Unwrap()
+		} else {
+			break
+		}
+	}
+	return err
+}
+
+type h2ReadWriteCloser = extendedConnectReadWriteCloser
+
 func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWriter, req *http.Request, res *http.Response, upstreamAddr string) {
 	// Until the tunnel takes ownership, every setup failure must close the
 	// backend body and any hijacked client connection. net/http no longer
@@ -69,6 +128,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 		if !tunnelOwnsConnections {
 			res.Body.Close()
 			if conn != nil {
+				setDeadlineImmediate(conn)
 				conn.Close()
 			}
 		}
@@ -234,6 +294,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	tunnelOwnsConnections = true
 	if !detached {
 		handleUpgradeTunnel(
+			req.Context(),
 			streamLogger,
 			streamLevel,
 			conn,
@@ -249,6 +310,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	} else {
 		// start a new goroutine
 		go handleUpgradeTunnel(
+			context.Background(),
 			streamLogger,
 			streamLevel,
 			conn,
@@ -266,6 +328,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 
 // handleUpgradeTunnel returns when transfer is done.
 func handleUpgradeTunnel(
+	ctx context.Context,
 	streamLogger *zap.Logger,
 	streamLevel zapcore.Level,
 	conn io.ReadWriteCloser,
@@ -280,6 +343,10 @@ func handleUpgradeTunnel(
 ) {
 	defer deleteBackConn()
 	defer deleteFrontConn()
+	defer func() {
+		setDeadlineImmediate(conn)
+		setDeadlineImmediate(backConn)
+	}()
 	var (
 		wg          sync.WaitGroup
 		toBackend   int64
@@ -307,6 +374,11 @@ func handleUpgradeTunnel(
 		timer := time.NewTimer(streamTimeout)
 		defer timer.Stop()
 		timeoutc = timer.C
+	}
+
+	var doneCtx <-chan struct{}
+	if ctx != nil {
+		doneCtx = ctx.Done()
 	}
 
 	go spc.copyToBackend(errc)
@@ -350,11 +422,19 @@ copyLoop:
 				c.Write(zap.Time("timeout", t))
 			}
 			break copyLoop
+		case <-doneCtx:
+			result = classifyStreamResult(ctx.Err())
+			if c := streamLogger.Check(streamLevel, "request context canceled"); c != nil {
+				c.Write(zap.Error(ctx.Err()))
+			}
+			break copyLoop
 		}
 	}
 
 	// Close both ends to unblock the still-running copy goroutine,
 	// then wait for it so byte counts are final before metrics/logging.
+	setDeadlineImmediate(conn)
+	setDeadlineImmediate(backConn)
 	conn.Close()
 	backConn.Close()
 	wg.Wait()
@@ -368,6 +448,23 @@ copyLoop:
 			zap.Int64("bytes_from_backend", fromBackend),
 		)
 		c.Write(fields...)
+	}
+}
+
+func setDeadlineImmediate(c io.ReadWriteCloser) {
+	if c == nil {
+		return
+	}
+	now := time.Now()
+	if sd, ok := c.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = sd.SetDeadline(now)
+		return
+	}
+	if srd, ok := c.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = srd.SetReadDeadline(now)
+	}
+	if swd, ok := c.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = swd.SetWriteDeadline(now)
 	}
 }
 
