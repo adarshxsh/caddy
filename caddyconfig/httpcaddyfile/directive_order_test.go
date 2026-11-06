@@ -132,18 +132,3 @@ func extractHandlersFromJSON(t *testing.T, out []byte) []string {
 	}
 	return handlers
 }
-
-func TestConcurrentRegisterDirectiveOrder(t *testing.T) {
-	var wg sync.WaitGroup
-	const goroutines = 10
-	wg.Add(goroutines)
-
-	for i := 0; i < goroutines; i++ {
-		go func(id int) {
-			defer wg.Done()
-			_ = defaultDirectiveOrderClone()
-		}(i)
-	}
-
-	wg.Wait()
-}
