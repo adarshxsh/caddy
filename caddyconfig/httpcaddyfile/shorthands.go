@@ -7,43 +7,97 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
-type ComplexShorthandReplacer struct {
-	search  *regexp.Regexp
-	replace string
+type complexShorthand struct {
+	forwardSearch     *regexp.Regexp
+	forwardReplace    string
+	inverseSearch     *regexp.Regexp
+	shorthandTemplate string
+}
+
+var complexShorthands = []complexShorthand{
+	{
+		forwardSearch:     regexp.MustCompile(`{header\.([\w-]*)}`),
+		forwardReplace:    "{http.request.header.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.request\.header\.([\w-]*)$`),
+		shorthandTemplate: "{header.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{cookie\.([\w-]*)}`),
+		forwardReplace:    "{http.request.cookie.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.request\.cookie\.([\w-]*)$`),
+		shorthandTemplate: "{cookie.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{labels\.([\w-]*)}`),
+		forwardReplace:    "{http.request.host.labels.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.request\.host\.labels\.([\w-]*)$`),
+		shorthandTemplate: "{labels.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{file\.([\w-]*)}`),
+		forwardReplace:    "{http.request.uri.path.file.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.request\.uri\.path\.file\.([\w-]*)$`),
+		shorthandTemplate: "{file.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{path\.([\w-]*)}`),
+		forwardReplace:    "{http.request.uri.path.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.request\.uri\.path\.([\w-]*)$`),
+		shorthandTemplate: "{path.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{query\.([\w-]*)}`),
+		forwardReplace:    "{http.request.uri.query.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.request\.uri\.query\.([\w-]*)$`),
+		shorthandTemplate: "{query.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{re\.([\w-\.]*)}`),
+		forwardReplace:    "{http.regexp.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.regexp\.([\w-\.]*)$`),
+		shorthandTemplate: "{re.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{vars\.([\w-]*)}`),
+		forwardReplace:    "{http.vars.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.vars\.([\w-]*)$`),
+		shorthandTemplate: "{vars.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{rp\.([\w-\.]*)}`),
+		forwardReplace:    "{http.reverse_proxy.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.reverse_proxy\.([\w-\.]*)$`),
+		shorthandTemplate: "{rp.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{resp\.([\w-\.]*)}`),
+		forwardReplace:    "{http.intercept.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.intercept\.([\w-\.]*)$`),
+		shorthandTemplate: "{resp.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{err\.([\w-\.]*)}`),
+		forwardReplace:    "{http.error.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.error\.([\w-\.]*)$`),
+		shorthandTemplate: "{err.$1}",
+	},
+	{
+		forwardSearch:     regexp.MustCompile(`{file_match\.([\w-]*)}`),
+		forwardReplace:    "{http.matchers.file.$1}",
+		inverseSearch:     regexp.MustCompile(`^http\.matchers\.file\.([\w-]*)$`),
+		shorthandTemplate: "{file_match.$1}",
+	},
 }
 
 type ShorthandReplacer struct {
-	complex []ComplexShorthandReplacer
+	complex []complexShorthand
 	simple  *strings.Replacer
 }
 
 func NewShorthandReplacer() ShorthandReplacer {
-	// replace shorthand placeholders (which are convenient
-	// when writing a Caddyfile) with their actual placeholder
-	// identifiers or variable names
-	replacer := strings.NewReplacer(placeholderShorthands()...)
-
-	// these are placeholders that allow a user-defined final
-	// parameters, but we still want to provide a shorthand
-	// for those, so we use a regexp to replace
-	regexpReplacements := []ComplexShorthandReplacer{
-		{regexp.MustCompile(`{header\.([\w-]*)}`), "{http.request.header.$1}"},
-		{regexp.MustCompile(`{cookie\.([\w-]*)}`), "{http.request.cookie.$1}"},
-		{regexp.MustCompile(`{labels\.([\w-]*)}`), "{http.request.host.labels.$1}"},
-		{regexp.MustCompile(`{path\.([\w-]*)}`), "{http.request.uri.path.$1}"},
-		{regexp.MustCompile(`{file\.([\w-]*)}`), "{http.request.uri.path.file.$1}"},
-		{regexp.MustCompile(`{query\.([\w-]*)}`), "{http.request.uri.query.$1}"},
-		{regexp.MustCompile(`{re\.([\w-\.]*)}`), "{http.regexp.$1}"},
-		{regexp.MustCompile(`{vars\.([\w-]*)}`), "{http.vars.$1}"},
-		{regexp.MustCompile(`{rp\.([\w-\.]*)}`), "{http.reverse_proxy.$1}"},
-		{regexp.MustCompile(`{resp\.([\w-\.]*)}`), "{http.intercept.$1}"},
-		{regexp.MustCompile(`{err\.([\w-\.]*)}`), "{http.error.$1}"},
-		{regexp.MustCompile(`{file_match\.([\w-]*)}`), "{http.matchers.file.$1}"},
-	}
-
 	return ShorthandReplacer{
-		complex: regexpReplacements,
-		simple:  replacer,
+		complex: complexShorthands,
+		simple:  strings.NewReplacer(placeholderShorthands()...),
 	}
 }
 
@@ -98,7 +152,7 @@ func (s ShorthandReplacer) ApplyToSegment(segment *caddyfile.Segment) {
 			(*segment)[i].Text = s.simple.Replace((*segment)[i].Text)
 			// complex regexp replacements
 			for _, r := range s.complex {
-				(*segment)[i].Text = r.search.ReplaceAllString((*segment)[i].Text, r.replace)
+				(*segment)[i].Text = r.forwardSearch.ReplaceAllString((*segment)[i].Text, r.forwardReplace)
 			}
 		}
 	}
