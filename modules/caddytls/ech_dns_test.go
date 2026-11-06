@@ -119,7 +119,7 @@ func TestConcurrentRegisterServerNamesAndPublishECH(t *testing.T) {
 			defer wg.Done()
 			logger := zap.NewNop()
 			for j := 0; j < iterations; j++ {
-				_ = tlsApp.publishECHConfigs(logger)
+				_ = tlsApp.publishECHConfigs(ctx.Context, logger)
 			}
 		}()
 	}
