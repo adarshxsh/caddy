@@ -15,16 +15,26 @@
 package caddytls
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestTLSStopSequential(t *testing.T) {
-	stopChan := make(chan struct{})
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	ticker := time.NewTicker(time.Hour)
+	var bgWg sync.WaitGroup
+	bgWg.Add(1)
+	go func() {
+		<-bgCtx.Done()
+		bgWg.Done()
+	}()
+
 	tlsModule := &TLS{
-		storageCleanStop:   stopChan,
+		bgCtx:              bgCtx,
+		bgCancel:           bgCancel,
+		bgWg:               &bgWg,
 		storageCleanTicker: ticker,
 	}
 
@@ -33,21 +43,18 @@ func TestTLSStopSequential(t *testing.T) {
 		t.Fatalf("unexpected error on first Stop: %v", err)
 	}
 
-	if tlsModule.storageCleanStop != nil {
-		t.Errorf("expected storageCleanStop to be nil after Stop, got %v", tlsModule.storageCleanStop)
+	if tlsModule.bgCancel != nil {
+		t.Errorf("expected bgCancel to be nil after Stop, got %v", tlsModule.bgCancel)
 	}
 	if tlsModule.storageCleanTicker != nil {
 		t.Errorf("expected storageCleanTicker to be nil after Stop, got %v", tlsModule.storageCleanTicker)
 	}
 
-	// Verify original channel was closed
+	// Verify context was canceled
 	select {
-	case _, open := <-stopChan:
-		if open {
-			t.Errorf("expected storageCleanStop channel to be closed")
-		}
+	case <-bgCtx.Done():
 	default:
-		t.Errorf("expected storageCleanStop channel to receive close signal")
+		t.Errorf("expected bgCtx to be canceled")
 	}
 
 	// Second stop call (must be idempotent and not panic)
@@ -62,10 +69,19 @@ func TestTLSStopSequential(t *testing.T) {
 }
 
 func TestTLSStopConcurrent(t *testing.T) {
-	stopChan := make(chan struct{})
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	ticker := time.NewTicker(time.Hour)
+	var bgWg sync.WaitGroup
+	bgWg.Add(1)
+	go func() {
+		<-bgCtx.Done()
+		bgWg.Done()
+	}()
+
 	tlsModule := &TLS{
-		storageCleanStop:   stopChan,
+		bgCtx:              bgCtx,
+		bgCancel:           bgCancel,
+		bgWg:               &bgWg,
 		storageCleanTicker: ticker,
 	}
 
@@ -84,21 +100,18 @@ func TestTLSStopConcurrent(t *testing.T) {
 
 	wg.Wait()
 
-	if tlsModule.storageCleanStop != nil {
-		t.Errorf("expected storageCleanStop to be nil after concurrent Stop, got %v", tlsModule.storageCleanStop)
+	if tlsModule.bgCancel != nil {
+		t.Errorf("expected bgCancel to be nil after concurrent Stop, got %v", tlsModule.bgCancel)
 	}
 	if tlsModule.storageCleanTicker != nil {
 		t.Errorf("expected storageCleanTicker to be nil after concurrent Stop, got %v", tlsModule.storageCleanTicker)
 	}
 
-	// Verify channel was closed
+	// Verify context was canceled
 	select {
-	case _, open := <-stopChan:
-		if open {
-			t.Errorf("expected storageCleanStop channel to be closed")
-		}
+	case <-bgCtx.Done():
 	default:
-		t.Errorf("expected storageCleanStop channel to receive close signal")
+		t.Errorf("expected bgCtx to be canceled")
 	}
 }
 
