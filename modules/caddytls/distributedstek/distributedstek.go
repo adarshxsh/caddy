@@ -217,6 +217,7 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 			if err != nil {
 				// TODO: improve this handling
 				log.Printf("[ERROR] Loading STEK: %v", err)
+				s.timer.Reset(retryInterval)
 				continue
 			}
 
@@ -245,6 +246,8 @@ const (
 	stekLockName = "stek_check"
 	stekFileName = "stek/stek.bin"
 )
+
+var retryInterval = 1 * time.Minute
 
 // Interface guard
 var _ caddytls.STEKProvider = (*Provider)(nil)
