@@ -354,6 +354,69 @@ func TestHTTPProtoNameNormalization(t *testing.T) {
 	}
 }
 
+func TestHTTPVarReplacement_MissingContextKeys(t *testing.T) {
+	// Request without optional context keys (ServerCtxKey, LocalAddrContextKey, ExtraLogFieldsCtxKey, OriginalRequestCtxKey, etc.)
+	req := httptest.NewRequest(http.MethodGet, "/test?query=val", nil)
+	repl := caddy.NewReplacer()
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	placeholders := []string{
+		"http.shutting_down",
+		"http.time_until_shutdown",
+		"http.request.local",
+		"http.request.local.host",
+		"http.request.local.port",
+		"http.request.orig_method",
+		"http.request.orig_uri",
+		"http.request.orig_uri.path",
+		"http.request.orig_uri.path.file",
+		"http.request.orig_uri.path.file_escaped",
+		"http.request.orig_uri.path.dir",
+		"http.request.orig_uri.query",
+		"http.request.orig_uri.prefixed_query",
+		"http.request.orig_uri.path.0",
+	}
+
+	for _, ph := range placeholders {
+		val, ok := repl.GetString(ph)
+		if !ok {
+			t.Errorf("Expected placeholder %q to be recognized, but got ok=false", ph)
+		}
+		if val != "" {
+			t.Errorf("Expected placeholder %q to return empty string for missing context key, got %q", ph, val)
+		}
+	}
+
+	// Verify http.request.uuid evaluates without panic when ExtraLogFieldsCtxKey is missing
+	if val, ok := repl.GetString("http.request.uuid"); !ok || val == "" {
+		t.Errorf("Expected placeholder http.request.uuid to return generated UUID without ExtraLogFieldsCtxKey, got %q (ok=%t)", val, ok)
+	}
+
+	// Request with a context that has no VarsCtxKey set (testing duration without start_time var)
+	bareReq, _ := http.NewRequest(http.MethodGet, "/bare", nil)
+	bareRepl := caddy.NewReplacer()
+
+	// Map httpVars manually without calling SetVar to simulate missing start_time
+	addHTTPVarsToReplacer(bareRepl, bareReq, nil)
+	// Clear the vars map in context to test missing start_time
+	*bareReq = *bareReq.WithContext(context.Background())
+
+	missingVarPlaceholders := []string{
+		"http.request.duration",
+		"http.request.duration_ms",
+	}
+
+	for _, ph := range missingVarPlaceholders {
+		val, ok := bareRepl.GetString(ph)
+		if !ok {
+			t.Errorf("Expected placeholder %q to be recognized, but got ok=false", ph)
+		}
+		if val != "" {
+			t.Errorf("Expected placeholder %q to return empty string when vars are missing, got %q", ph, val)
+		}
+	}
+}
+
 // BenchmarkAddHTTPVarsToReplacer measures the per-request replacer setup, which
 // is the common path where the request UUID is never referenced.
 func BenchmarkAddHTTPVarsToReplacer(b *testing.B) {
