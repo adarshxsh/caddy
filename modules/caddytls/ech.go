@@ -101,8 +101,10 @@ func (ech *ECH) Provision(ctx caddy.Context) ([]string, error) {
 		return nil, err
 	}
 	defer func() {
-		if err := storage.Unlock(ctx, echStorageLockName); err != nil {
-			logger.Error("unable to unlock ECH provisioning in storage", zap.Error(err))
+		if err := storage.Unlock(context.WithoutCancel(ctx), echStorageLockName); err != nil {
+			if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				logger.Error("unable to unlock ECH provisioning in storage", zap.Error(err))
+			}
 		}
 	}()
 
@@ -201,6 +203,17 @@ func (ech *ECH) setConfigsFromStorage(ctx caddy.Context, logger *zap.Logger) ([]
 // the local memory write lock (configsMu). The write lock is acquired briefly only when
 // updating in-memory key maps and stdlib-ready key list state.
 func (ech *ECH) rotateECHKeys(ctx caddy.Context, logger *zap.Logger, storageSynced bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if ctx.Context == nil {
+		return nil
+	}
+	storage := ctx.Storage()
+	if storage == nil {
+		return nil
+	}
+
 	const (
 		rotationInterval = 24 * time.Hour * 30
 		deleteAfter      = 24 * time.Hour * 90
@@ -215,16 +228,16 @@ func (ech *ECH) rotateECHKeys(ctx caddy.Context, logger *zap.Logger, storageSync
 		return nil
 	}
 
-	storage := ctx.Storage()
-
 	// sync this operation across cluster if not already
 	if !storageSynced {
 		if err := storage.Lock(ctx, echStorageLockName); err != nil {
 			return err
 		}
 		defer func() {
-			if err := storage.Unlock(ctx, echStorageLockName); err != nil {
-				logger.Error("unable to unlock ECH rotation in storage", zap.Error(err))
+			if err := storage.Unlock(context.WithoutCancel(ctx), echStorageLockName); err != nil {
+				if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+					logger.Error("unable to unlock ECH rotation in storage", zap.Error(err))
+				}
 			}
 		}()
 	}
@@ -237,7 +250,13 @@ func (ech *ECH) rotateECHKeys(ctx caddy.Context, logger *zap.Logger, storageSync
 
 	// iterate the updated list and do any updates as needed
 	for publicName := range updatedConfigs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		for i := 0; i < len(updatedConfigs[publicName]); i++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			cfg := updatedConfigs[publicName][i]
 			if time.Since(cfg.meta.Created) >= rotationInterval && cfg.meta.Replaced.IsZero() {
 				// key is due for rotation and it hasn't been replaced yet; do that now
@@ -330,16 +349,27 @@ func (ech *ECH) updateKeyList() {
 }
 
 // publishECHConfigs publishes any configs that are configured for publication and which haven't been published already.
-func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
+func (t *TLS) publishECHConfigs(ctx context.Context, logger *zap.Logger) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if t.ctx.Context == nil {
+		return nil
+	}
 	// make publication exclusive, since we don't need to repeat this unnecessarily
 	storage := t.ctx.Storage()
+	if storage == nil {
+		return nil
+	}
 	const echLockName = "ech_publish"
-	if err := storage.Lock(t.ctx, echLockName); err != nil {
+	if err := storage.Lock(ctx, echLockName); err != nil {
 		return err
 	}
 	defer func() {
-		if err := storage.Unlock(t.ctx, echLockName); err != nil {
-			logger.Error("unable to unlock ECH provisioning in storage", zap.Error(err))
+		if err := storage.Unlock(context.WithoutCancel(ctx), echLockName); err != nil {
+			if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				logger.Error("unable to unlock ECH provisioning in storage", zap.Error(err))
+			}
 		}
 	}()
 
@@ -465,7 +495,7 @@ func (t *TLS) publishECHConfigs(logger *zap.Logger) error {
 
 			// publish this ECH config list with this publisher
 			pubTime := time.Now()
-			err := publisher.PublishECHConfigList(t.ctx, dnsNamesToPublish, echCfgListBin)
+			err := publisher.PublishECHConfigList(ctx, dnsNamesToPublish, echCfgListBin)
 
 			var publishErrs PublishECHConfigListErrors
 			if errors.As(err, &publishErrs) {
