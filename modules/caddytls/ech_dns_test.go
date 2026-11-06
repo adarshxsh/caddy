@@ -11,8 +11,7 @@ import (
 
 func TestRegisterServerNamesWithALPN(t *testing.T) {
 	tlsApp := &TLS{
-		serverNames:   make(map[string]serverNameRegistration),
-		serverNamesMu: new(sync.Mutex),
+		serverNames: make(map[string]serverNameRegistration),
 	}
 
 	tlsApp.RegisterServerNames([]string{
@@ -61,5 +60,56 @@ func TestECHDNSPublisherPublishedSvcParams(t *testing.T) {
 	wantECH := base64.StdEncoding.EncodeToString([]byte{0x01, 0x02, 0x03})
 	if !reflect.DeepEqual(got["ech"], []string{wantECH}) {
 		t.Fatalf("unexpected ECH params: got %v want %v", got["ech"], wantECH)
+	}
+}
+
+func TestServerNamesConcurrency(t *testing.T) {
+	tlsApp := &TLS{
+		serverNames: make(map[string]serverNameRegistration),
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer goroutine calling RegisterServerNames concurrently
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				tlsApp.RegisterServerNames([]string{"example.com", "sub.example.com"}, []string{"h2", "h3"})
+			}
+		}
+	}()
+
+	// Reader goroutines calling ServerNames and alpnValuesForServerNames concurrently
+	var readersWg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		readersWg.Add(1)
+		go func() {
+			defer readersWg.Done()
+			for j := 0; j < 500; j++ {
+				names := tlsApp.ServerNames()
+				_ = tlsApp.alpnValuesForServerNames(names)
+			}
+		}()
+	}
+
+	readersWg.Wait()
+	close(stop)
+	wg.Wait()
+}
+
+func TestServerNamesNilMap(t *testing.T) {
+	tlsApp := &TLS{}
+	names := tlsApp.ServerNames()
+	if names == nil {
+		t.Fatalf("expected non-nil slice, got nil")
+	}
+	if len(names) != 0 {
+		t.Fatalf("expected empty slice, got len %d", len(names))
 	}
 }
