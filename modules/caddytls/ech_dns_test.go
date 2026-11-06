@@ -2,6 +2,7 @@ package caddytls
 
 import (
 	"encoding/base64"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -11,8 +12,7 @@ import (
 
 func TestRegisterServerNamesWithALPN(t *testing.T) {
 	tlsApp := &TLS{
-		serverNames:   make(map[string]serverNameRegistration),
-		serverNamesMu: new(sync.Mutex),
+		serverNames: make(map[string]serverNameRegistration),
 	}
 
 	tlsApp.RegisterServerNames([]string{
@@ -29,6 +29,59 @@ func TestRegisterServerNamesWithALPN(t *testing.T) {
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected ALPN values: got %#v want %#v", got, want)
+	}
+}
+
+func TestServerNamesConcurrency(t *testing.T) {
+	tlsApp := &TLS{
+		serverNames: make(map[string]serverNameRegistration),
+	}
+
+	// Verify uninitialized/empty TLS handles ServerNames safely
+	emptyTLS := &TLS{}
+	if names := emptyTLS.ServerNames(); names == nil || len(names) != 0 {
+		t.Fatalf("expected empty non-nil slice from uninitialized TLS, got: %#v", names)
+	}
+
+	var wg sync.WaitGroup
+	numGoroutines := 20
+	iterations := 100
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(3)
+
+		// Goroutine 1: RegisterServerNames
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				domain := fmt.Sprintf("sub%d-%d.example.com", id, j)
+				tlsApp.RegisterServerNames([]string{domain}, []string{"h2", "h3"})
+			}
+		}(i)
+
+		// Goroutine 2: ServerNames
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				_ = tlsApp.ServerNames()
+			}
+		}()
+
+		// Goroutine 3: alpnValuesForServerNames
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				domain := fmt.Sprintf("sub%d-%d.example.com", id, j)
+				_ = tlsApp.alpnValuesForServerNames([]string{domain})
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	names := tlsApp.ServerNames()
+	if len(names) == 0 {
+		t.Fatalf("expected registered server names, got empty slice")
 	}
 }
 
