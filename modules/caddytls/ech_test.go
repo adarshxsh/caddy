@@ -202,7 +202,7 @@ func TestConcurrentPublishAndRotateECHKeys(t *testing.T) {
 				case <-stopChan:
 					return
 				default:
-					_ = tlsApp.publishECHConfigs(logger)
+					_ = tlsApp.publishECHConfigs(context.Background(), logger)
 					time.Sleep(1 * time.Millisecond)
 				}
 			}
@@ -319,7 +319,7 @@ func TestPublishECHConfigHandlesDeletedConfigID(t *testing.T) {
 	}
 	ech.Publication[0].publishers = []ECHPublisher{deletingPub}
 
-	err = tlsApp.publishECHConfigs(logger)
+	err = tlsApp.publishECHConfigs(context.Background(), logger)
 	if err != nil {
 		t.Fatalf("publishECHConfigs failed unexpectedly: %v", err)
 	}
