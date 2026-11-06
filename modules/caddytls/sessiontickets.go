@@ -92,10 +92,16 @@ func (s *SessionTicketService) provision(ctx caddy.Context) error {
 // stop() is called. If start() was already called, this
 // is a no-op.
 func (s *SessionTicketService) start() error {
+	if s.mu == nil {
+		s.mu = new(sync.Mutex)
+	}
+	s.mu.Lock()
 	if s.stopChan != nil {
+		s.mu.Unlock()
 		return nil
 	}
 	s.stopChan = make(chan struct{})
+	s.mu.Unlock()
 
 	// initializing the key source gives us our
 	// initial key(s) to start with; if successful,
@@ -126,22 +132,33 @@ func (s *SessionTicketService) stayUpdated() {
 		}
 	}()
 
+	s.mu.Lock()
+	stopChan := s.stopChan
+	s.mu.Unlock()
+
+	if stopChan == nil {
+		return
+	}
+
 	// this call is essential when Initialize()
 	// returns without error, because the stop
 	// channel is the only way the key source
 	// will know when to clean up
-	keysChan := s.keySource.Next(s.stopChan)
+	keysChan := s.keySource.Next(stopChan)
 
 	for {
 		select {
-		case newKeys := <-keysChan:
+		case newKeys, ok := <-keysChan:
+			if !ok {
+				return
+			}
 			s.mu.Lock()
 			s.currentKeys = newKeys
 			for cfg := range s.configs {
 				cfg.SetSessionTicketKeys(newKeys)
 			}
 			s.mu.Unlock()
-		case <-s.stopChan:
+		case <-stopChan:
 			return
 		}
 	}
@@ -149,8 +166,15 @@ func (s *SessionTicketService) stayUpdated() {
 
 // stop terminates the key rotation goroutine.
 func (s *SessionTicketService) stop() {
+	if s.mu == nil {
+		s.mu = new(sync.Mutex)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.stopChan != nil {
 		close(s.stopChan)
+		s.stopChan = nil
 	}
 }
 
