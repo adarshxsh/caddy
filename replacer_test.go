@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -485,6 +486,158 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerTimeNowRFC3339(t *testing.T) {
+	originalNowFunc := nowFunc
+	t.Cleanup(func() { nowFunc = originalNowFunc })
+
+	for _, tc := range []struct {
+		name string
+		now  time.Time
+		want string
+	}{
+		{
+			name: "UTC",
+			now:  time.Date(2026, time.October, 3, 4, 30, 0, 123456789, time.UTC),
+			want: "2026-10-03T04:30:00Z",
+		},
+		{
+			name: "numeric offset",
+			now:  time.Date(2026, time.October, 3, 10, 15, 0, 123456789, time.FixedZone("NPT", 5*60*60+45*60)),
+			want: "2026-10-03T10:15:00+05:45",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nowFunc = func() time.Time { return tc.now }
+			got, ok := NewReplacer().GetString("time.now.rfc3339")
+			if !ok {
+				t.Fatal("time.now.rfc3339 placeholder was not found")
+			}
+			if got != tc.want {
+				t.Fatalf("time.now.rfc3339 = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReplacerRepeatedFilePlaceholders(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.txt")
+	fileB := filepath.Join(dir, "b.txt")
+	missing := filepath.Join(dir, "missing.txt")
+	if err := os.WriteFile(fileA, []byte("alpha\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileB, []byte("beta"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	phA, phB, phMissing := "{file."+fileA+"}", "{file."+fileB+"}", "{file."+missing+"}"
+
+	for i, tc := range []struct {
+		repl     func() *Replacer
+		known    bool
+		input    string
+		expected string
+	}{
+		{
+			repl:     NewReplacer,
+			input:    phA + "|" + phA + "|" + phB + "|" + phA,
+			expected: "alpha|alpha|beta|alpha",
+		},
+		{
+			repl:     NewReplacer,
+			input:    strings.Repeat(phA, 20000),
+			expected: strings.Repeat("alpha", 20000),
+		},
+		{
+			repl:     NewReplacer,
+			known:    true,
+			input:    phMissing + "|" + phMissing,
+			expected: "EMPTY|EMPTY",
+		},
+		{
+			repl:     NewReplacer,
+			known:    false,
+			input:    phMissing + "|" + phMissing,
+			expected: "EMPTY|EMPTY",
+		},
+		{
+			repl:     NewEmptyReplacer,
+			known:    true,
+			input:    phMissing + "|" + phMissing,
+			expected: phMissing + "|" + phMissing,
+		},
+		{
+			repl:     func() *Replacer { return NewReplacer().WithoutFile() },
+			known:    true,
+			input:    phA + "|" + phA,
+			expected: phA + "|" + phA,
+		},
+	} {
+		var actual string
+		if tc.known {
+			actual = tc.repl().ReplaceKnown(tc.input, "EMPTY")
+		} else {
+			actual = tc.repl().ReplaceAll(tc.input, "EMPTY")
+		}
+		if actual != tc.expected {
+			t.Errorf("Test %d: expected %.80q, got %.80q", i, tc.expected, actual)
+		}
+	}
+}
+
+func TestFileCacheEviction(t *testing.T) {
+	big := strings.Repeat("x", maxFileCacheBytes/2+1)
+	var loads int
+	load := func(key string) (any, bool) {
+		loads++
+		if key == "file.unknown" {
+			return nil, false
+		}
+		return key + big, true
+	}
+
+	var c fileCache
+	for i, tc := range []struct {
+		key       string
+		found     bool
+		wantLoads int
+	}{
+		{key: "file.a", found: true, wantLoads: 1},
+		{key: "file.a", found: true, wantLoads: 1},
+		{key: "file.b", found: true, wantLoads: 2}, // evicts file.a
+		{key: "file.b", found: true, wantLoads: 2},
+		{key: "file.a", found: true, wantLoads: 3},
+		{key: "file.unknown", found: false, wantLoads: 4},
+		{key: "file.unknown", found: false, wantLoads: 5},
+	} {
+		val, found := c.get(tc.key, load)
+		if found != tc.found {
+			t.Errorf("Test %d: expected found=%t, got %t", i, tc.found, found)
+		}
+		if tc.found && val != tc.key+big {
+			t.Errorf("Test %d: wrong value for %s", i, tc.key)
+		}
+		if loads != tc.wantLoads {
+			t.Errorf("Test %d: expected %d loads, got %d", i, tc.wantLoads, loads)
+		}
+		if c.size > maxFileCacheBytes {
+			t.Errorf("Test %d: cache holds %d bytes, over the %d limit", i, c.size, maxFileCacheBytes)
+		}
+	}
+}
+
+func BenchmarkReplacerRepeatedFile(b *testing.B) {
+	file := filepath.Join(b.TempDir(), "a.txt")
+	if err := os.WriteFile(file, []byte("alpha"), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	input := strings.Repeat("{file."+file+"}", 1000)
+	rep := NewReplacer()
+	for b.Loop() {
+		rep.ReplaceAll(input, "")
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
@@ -553,6 +706,7 @@ func TestTimePlaceholders(t *testing.T) {
 	}
 
 	check("time.now.http", "Fri, 23 Oct 2026 15:30:45 GMT")
+	check("time.now.rfc3339", "2026-10-23T15:30:45Z")
 	check("time.now.common_log", "23/Oct/2026:15:30:45 +0000")
 	check("time.now.year", "2026")
 	check("time.now.unix", "1792769445")
@@ -560,12 +714,14 @@ func TestTimePlaceholders(t *testing.T) {
 
 	// Verify cache hit returns identical value
 	check("time.now.http", "Fri, 23 Oct 2026 15:30:45 GMT")
+	check("time.now.rfc3339", "2026-10-23T15:30:45Z")
 
 	// Advance time by 500 ms (same second, new millisecond)
 	t1 := t0.Add(500 * time.Millisecond)
 	nowFunc = func() time.Time { return t1 }
 
 	check("time.now.http", "Fri, 23 Oct 2026 15:30:45 GMT")
+	check("time.now.rfc3339", "2026-10-23T15:30:45Z")
 	check("time.now.unix_ms", "1792769445623")
 
 	// Advance time by 1 second
@@ -573,6 +729,7 @@ func TestTimePlaceholders(t *testing.T) {
 	nowFunc = func() time.Time { return t2 }
 
 	check("time.now.http", "Fri, 23 Oct 2026 15:30:46 GMT")
+	check("time.now.rfc3339", "2026-10-23T15:30:46Z")
 	check("time.now.common_log", "23/Oct/2026:15:30:46 +0000")
 	check("time.now.unix", "1792769446")
 	check("time.now.unix_ms", "1792769446123")
@@ -590,6 +747,7 @@ func TestTimePlaceholdersAllocations(t *testing.T) {
 	// Warm cache
 	keys := []string{
 		"time.now.http",
+		"time.now.rfc3339",
 		"time.now.common_log",
 		"time.now.year",
 		"time.now.unix",
@@ -625,6 +783,7 @@ func TestTimePlaceholdersConcurrency(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
 				_, _ = rep.GetString("time.now.http")
+				_, _ = rep.GetString("time.now.rfc3339")
 				_, _ = rep.GetString("time.now.common_log")
 				_, _ = rep.GetString("time.now.year")
 				_, _ = rep.GetString("time.now.unix")
