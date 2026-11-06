@@ -16,6 +16,7 @@ package caddy
 
 import (
 	"bytes"
+	"container/list"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +29,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2/internal/systemd"
 )
 
 // NewReplacer returns a new Replacer.
@@ -192,6 +195,9 @@ func (r *Replacer) replace(input, empty string,
 	// fail fast if too many placeholders are unclosed
 	var unclosedCount int
 
+	// {file.*} lookups hit the disk, so repeats within one call are memoized
+	var files *fileCache
+
 scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
@@ -236,7 +242,17 @@ scan:
 		key := input[i+1 : end]
 
 		// try to get a value for this key, handle empty values accordingly
-		val, found := r.Get(key)
+		var val any
+		var found bool
+		isFileKey := strings.HasPrefix(key, filePrefix)
+		if files == nil && isFileKey && r.hasFileProvider() {
+			files = new(fileCache)
+		}
+		if files != nil && isFileKey {
+			val, found = files.get(key, r.Get)
+		} else {
+			val, found = r.Get(key)
+		}
 		if !found {
 			// placeholder is unknown (unrecognized); handle accordingly
 			if errOnUnknown {
@@ -350,11 +366,11 @@ type replacementProvider interface {
 // fileReplacementProvider handles {file.*} replacements,
 // reading a file from disk and replacing with its contents.
 type fileReplacementProvider struct {
-	cache *fileCache
+	cache *fileTTLCache
 	ttl   time.Duration
 }
 
-func (f fileReplacementProvider) getCache() *fileCache {
+func (f fileReplacementProvider) getCache() *fileTTLCache {
 	if f.cache != nil {
 		return f.cache
 	}
@@ -390,33 +406,37 @@ func (f fileReplacementProvider) replace(key string) (any, bool) {
 	return val, true
 }
 
-type fileCacheEntry struct {
+type fileTTLCacheEntry struct {
 	value     string
 	createdAt time.Time
 }
 
-type fileCache struct {
+type fileTTLCache struct {
 	mu         sync.RWMutex
-	items      map[string]fileCacheEntry
+	items      map[string]fileTTLCacheEntry
 	maxEntries int
 	ttl        time.Duration
 }
 
-func newFileCache(maxEntries int, ttl time.Duration) *fileCache {
+func newFileTTLCache(maxEntries int, ttl time.Duration) *fileTTLCache {
 	if maxEntries <= 0 {
 		maxEntries = defaultFileCacheMaxEntries
 	}
 	if ttl <= 0 {
 		ttl = defaultFileCacheTTL
 	}
-	return &fileCache{
-		items:      make(map[string]fileCacheEntry),
+	return &fileTTLCache{
+		items:      make(map[string]fileTTLCacheEntry),
 		maxEntries: maxEntries,
 		ttl:        ttl,
 	}
 }
 
-func (c *fileCache) get(key string) (string, bool) {
+func newFileCache(maxEntries int, ttl time.Duration) *fileTTLCache {
+	return newFileTTLCache(maxEntries, ttl)
+}
+
+func (c *fileTTLCache) get(key string) (string, bool) {
 	c.mu.RLock()
 	entry, ok := c.items[key]
 	c.mu.RUnlock()
@@ -432,12 +452,12 @@ func (c *fileCache) get(key string) (string, bool) {
 	return entry.value, true
 }
 
-func (c *fileCache) set(key string, value string) {
+func (c *fileTTLCache) set(key string, value string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if _, ok := c.items[key]; ok {
-		c.items[key] = fileCacheEntry{
+		c.items[key] = fileTTLCacheEntry{
 			value:     value,
 			createdAt: time.Now(),
 		}
@@ -469,15 +489,15 @@ func (c *fileCache) set(key string, value string) {
 		}
 	}
 
-	c.items[key] = fileCacheEntry{
+	c.items[key] = fileTTLCacheEntry{
 		value:     value,
 		createdAt: time.Now(),
 	}
 }
 
-func (c *fileCache) clear() {
+func (c *fileTTLCache) clear() {
 	c.mu.Lock()
-	c.items = make(map[string]fileCacheEntry)
+	c.items = make(map[string]fileTTLCacheEntry)
 	c.mu.Unlock()
 }
 
@@ -486,8 +506,70 @@ const (
 	defaultFileCacheTTL        = 2 * time.Second
 )
 
-var defaultFileCache = newFileCache(defaultFileCacheMaxEntries, defaultFileCacheTTL)
+var defaultFileCache = newFileTTLCache(defaultFileCacheMaxEntries, defaultFileCacheTTL)
 
+func (r *Replacer) hasFileProvider() bool {
+	for _, p := range r.providers {
+		if _, ok := p.(fileReplacementProvider); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// fileCache memoizes {file.*} lookups for one replace call. Contents live in a
+// byte-bounded LRU; misses and empty results cost no more than their key.
+type fileCache struct {
+	lru          *list.List
+	entries      map[string]*list.Element
+	size         int
+	emptyResults map[string]any
+}
+
+type fileCacheEntry struct {
+	key  string
+	val  any
+	size int
+}
+
+func (c *fileCache) get(key string, load func(string) (any, bool)) (any, bool) {
+	if el, ok := c.entries[key]; ok {
+		c.lru.MoveToFront(el)
+		return el.Value.(*fileCacheEntry).val, true
+	}
+	if val, ok := c.emptyResults[key]; ok {
+		return val, true
+	}
+
+	val, found := load(key)
+	if !found {
+		return val, found
+	}
+	switch s, isStr := val.(string); {
+	case val == nil || (isStr && s == ""):
+		if c.emptyResults == nil {
+			c.emptyResults = make(map[string]any)
+		}
+		c.emptyResults[key] = val
+	case isStr && len(s) <= maxFileCacheBytes:
+		c.add(key, val, len(s))
+	}
+	return val, found
+}
+
+func (c *fileCache) add(key string, val any, size int) {
+	if c.lru == nil {
+		c.lru = list.New()
+		c.entries = make(map[string]*list.Element)
+	}
+	for c.size+size > maxFileCacheBytes {
+		evicted := c.lru.Remove(c.lru.Back()).(*fileCacheEntry)
+		delete(c.entries, evicted.key)
+		c.size -= evicted.size
+	}
+	c.entries[key] = c.lru.PushFront(&fileCacheEntry{key: key, val: val, size: size})
+	c.size += size
+}
 // globalDefaultReplacementProvider handles replacements
 // that can be used in any context, such as system variables,
 // time, or environment variables.
@@ -498,6 +580,13 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	const envPrefix = "env."
 	if strings.HasPrefix(key, envPrefix) {
 		return os.Getenv(key[len(envPrefix):]), true
+	}
+	if name, ok := strings.CutPrefix(key, systemdListenPrefix); ok {
+		descriptor, err := systemd.ListenFD(name)
+		if err != nil {
+			return nil, false
+		}
+		return descriptor, true
 	}
 
 	switch key {
@@ -522,6 +611,8 @@ func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 		// to generate the correct format.
 		// https://github.com/caddyserver/caddy/issues/5773
 		return nowFunc().UTC().Format(http.TimeFormat), true
+	case "time.now.rfc3339":
+		return nowFunc().Format(time.RFC3339), true
 	case "time.now.common_log":
 		return nowFunc().Format("02/Jan/2006:15:04:05 -0700"), true
 	case "time.now.year":
@@ -567,3 +658,8 @@ const ReplacerCtxKey CtxKey = "replacer"
 const phOpen, phClose, phEscape = '{', '}', '\\'
 
 const filePrefix = "file."
+
+const systemdListenPrefix = "systemd.listen."
+
+// maxFileCacheBytes bounds the memoized file contents to 8 MiB (8,388,608 bytes) per replace call.
+const maxFileCacheBytes = 8 << 20
