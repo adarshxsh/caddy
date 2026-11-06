@@ -178,7 +178,7 @@ func TestECHPublicationAndRotationRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				_ = tlsApp.publishECHConfigs(logger)
+				_ = tlsApp.publishECHConfigs(caddyCtx.Context, logger)
 			}
 		}()
 	}
