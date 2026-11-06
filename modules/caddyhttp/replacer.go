@@ -26,6 +26,7 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -71,332 +72,330 @@ type reqProvider struct {
 
 func (p reqProvider) Replace(key string) (any, bool) {
 	req := p.req
-	if req != nil {
-		// query string parameters
-		if strings.HasPrefix(key, reqURIQueryReplPrefix) {
-			vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
-			// always return true, since the query param might
-			// be present only in some requests
-			return strings.Join(vals, ","), true
-		}
+		if req != nil {
+			// query string parameters
+			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
+				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
+				// always return true, since the query param might
+				// be present only in some requests
+				return strings.Join(vals, ","), true
+			}
 
-		// request header fields
-		if strings.HasPrefix(key, reqHeaderReplPrefix) {
-			field := key[len(reqHeaderReplPrefix):]
-			vals := req.Header[textproto.CanonicalMIMEHeaderKey(field)]
-			// always return true, since the header field might
-			// be present only in some requests
-			return strings.Join(vals, ","), true
-		}
+			// request header fields
+			if strings.HasPrefix(key, reqHeaderReplPrefix) {
+				field := key[len(reqHeaderReplPrefix):]
+				vals := req.Header[textproto.CanonicalMIMEHeaderKey(field)]
+				// always return true, since the header field might
+				// be present only in some requests
+				return strings.Join(vals, ","), true
+			}
 
-		// cookies
-		if strings.HasPrefix(key, reqCookieReplPrefix) {
-			name := key[len(reqCookieReplPrefix):]
-			for _, cookie := range req.Cookies() {
-				if strings.EqualFold(name, cookie.Name) {
-					// always return true, since the cookie might
-					// be present only in some requests
-					return cookie.Value, true
+			// cookies
+			if strings.HasPrefix(key, reqCookieReplPrefix) {
+				name := key[len(reqCookieReplPrefix):]
+				for _, cookie := range req.Cookies() {
+					if strings.EqualFold(name, cookie.Name) {
+						// always return true, since the cookie might
+						// be present only in some requests
+						return cookie.Value, true
+					}
 				}
+				return "", true
 			}
-		}
 
-		// http.request.tls.*
-		if strings.HasPrefix(key, reqTLSReplPrefix) {
-			return getReqTLSReplacement(req, key)
-		}
+			// http.request.tls.*
+			if strings.HasPrefix(key, reqTLSReplPrefix) {
+				return getReqTLSReplacement(req, key)
+			}
 
-		switch key {
-		case "http.request.method":
-			return req.Method, true
-		case "http.request.scheme":
-			if req.TLS != nil {
-				return "https", true
-			}
-			return "http", true
-		case "http.request.proto":
-			return req.Proto, true
-		case "http.request.proto_name":
-			if req.ProtoMajor == 2 {
-				return "HTTP/2", true
-			}
-			if req.ProtoMajor == 3 {
-				return "HTTP/3", true
-			}
-			return req.Proto, true
-		case "http.request.host":
-			host, _, err := net.SplitHostPort(req.Host)
-			if err != nil {
-				return req.Host, true // OK; there probably was no port
-			}
-			return host, true
-		case "http.request.port":
-			_, port, _ := net.SplitHostPort(req.Host)
-			if portNum, err := strconv.Atoi(port); err == nil {
-				return portNum, true
-			}
-			return port, true
-		case "http.request.hostport":
-			return req.Host, true
-		case "http.request.local":
-			localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-			return localAddr.String(), true
-		case "http.request.local.host":
-			localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-			host, _, err := net.SplitHostPort(localAddr.String())
-			if err != nil {
-				// localAddr is host:port for tcp and udp sockets and /unix/socket.path
-				// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
-				// not unix sockets and will fail with the latter.
-				// We assume when net.SplitHostPort fails, localAddr is a unix socket and thus
-				// already "split" and save to return.
-				return localAddr, true
-			}
-			return host, true
-		case "http.request.local.port":
-			localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
-			_, port, _ := net.SplitHostPort(localAddr.String())
-			if portNum, err := strconv.Atoi(port); err == nil {
-				return portNum, true
-			}
-			return port, true
-		case "http.request.remote":
-			if req.TLS != nil && !req.TLS.HandshakeComplete {
-				// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
-				return nil, true
-			}
-			return req.RemoteAddr, true
-		case "http.request.remote.host":
-			if req.TLS != nil && !req.TLS.HandshakeComplete {
-				// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
-				return nil, true
-			}
-			host, _, err := net.SplitHostPort(req.RemoteAddr)
-			if err != nil {
-				// req.RemoteAddr is host:port for tcp and udp sockets and /unix/socket.path
-				// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
-				// not unix sockets and will fail with the latter.
-				// We assume when net.SplitHostPort fails, req.RemoteAddr is a unix socket
-				// and thus already "split" and save to return.
+			switch key {
+			case "http.request.method":
+				return req.Method, true
+			case "http.request.scheme":
+				if req.TLS != nil {
+					return "https", true
+				}
+				return "http", true
+			case "http.request.proto":
+				return req.Proto, true
+			case "http.request.proto_name":
+				if req.ProtoMajor == 2 {
+					return "HTTP/2", true
+				}
+				if req.ProtoMajor == 3 {
+					return "HTTP/3", true
+				}
+				return req.Proto, true
+			case "http.request.host":
+				host, _, err := net.SplitHostPort(req.Host)
+				if err != nil {
+					return req.Host, true // OK; there probably was no port
+				}
+				return host, true
+			case "http.request.port":
+				_, port, _ := net.SplitHostPort(req.Host)
+				if portNum, err := strconv.Atoi(port); err == nil {
+					return portNum, true
+				}
+				return port, true
+			case "http.request.hostport":
+				return req.Host, true
+			case "http.request.local":
+				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				return localAddr.String(), true
+			case "http.request.local.host":
+				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				host, _, err := net.SplitHostPort(localAddr.String())
+				if err != nil {
+					// localAddr is host:port for tcp and udp sockets and /unix/socket.path
+					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
+					// not unix sockets and will fail with the latter.
+					// We assume when net.SplitHostPort fails, localAddr is a unix socket and thus
+					// already "split" and save to return.
+					return localAddr, true
+				}
+				return host, true
+			case "http.request.local.port":
+				localAddr, _ := req.Context().Value(http.LocalAddrContextKey).(net.Addr)
+				_, port, _ := net.SplitHostPort(localAddr.String())
+				if portNum, err := strconv.Atoi(port); err == nil {
+					return portNum, true
+				}
+				return port, true
+			case "http.request.remote":
+				if req.TLS != nil && !req.TLS.HandshakeComplete {
+					// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
+					return nil, true
+				}
 				return req.RemoteAddr, true
-			}
-			return host, true
-		case "http.request.remote.port":
-			_, port, _ := net.SplitHostPort(req.RemoteAddr)
-			if portNum, err := strconv.Atoi(port); err == nil {
-				return portNum, true
-			}
-			return port, true
+			case "http.request.remote.host":
+				if req.TLS != nil && !req.TLS.HandshakeComplete {
+					// without a complete handshake (QUIC "early data") we can't trust the remote IP address to not be spoofed
+					return nil, true
+				}
+				host, _, err := net.SplitHostPort(req.RemoteAddr)
+				if err != nil {
+					// req.RemoteAddr is host:port for tcp and udp sockets and /unix/socket.path
+					// for unix sockets. net.SplitHostPort only operates on tcp and udp sockets,
+					// not unix sockets and will fail with the latter.
+					// We assume when net.SplitHostPort fails, req.RemoteAddr is a unix socket
+					// and thus already "split" and save to return.
+					return req.RemoteAddr, true
+				}
+				return host, true
+			case "http.request.remote.port":
+				_, port, _ := net.SplitHostPort(req.RemoteAddr)
+				if portNum, err := strconv.Atoi(port); err == nil {
+					return portNum, true
+				}
+				return port, true
 
-		// current URI, including any internal rewrites
-		case "http.request.uri":
-			return req.URL.RequestURI(), true
-		case "http.request.uri_escaped":
-			return url.QueryEscape(req.URL.RequestURI()), true
-		case "http.request.uri.path":
-			return req.URL.Path, true
-		case "http.request.uri.path_escaped":
-			return url.QueryEscape(req.URL.Path), true
-		case "http.request.uri.path.file":
-			_, file := path.Split(req.URL.Path)
-			return file, true
-		case "http.request.uri.path.dir":
-			dir, _ := path.Split(req.URL.Path)
-			return dir, true
-		case "http.request.uri.path.file.base":
-			return strings.TrimSuffix(path.Base(req.URL.Path), path.Ext(req.URL.Path)), true
-		case "http.request.uri.path.file.ext":
-			return path.Ext(req.URL.Path), true
-		case "http.request.uri.query":
-			return req.URL.RawQuery, true
-		case "http.request.uri.query_escaped":
-			return url.QueryEscape(req.URL.RawQuery), true
-		case "http.request.uri.prefixed_query":
-			if req.URL.RawQuery == "" {
-				return "", true
-			}
-			return "?" + req.URL.RawQuery, true
-		case "http.request.duration":
-			start := GetVar(req.Context(), "start_time").(time.Time)
-			return time.Since(start), true
-		case "http.request.duration_ms":
-			start := GetVar(req.Context(), "start_time").(time.Time)
-			return time.Since(start).Seconds() * 1e3, true // multiply seconds to preserve decimal (see #4666)
+			// current URI, including any internal rewrites
+			case "http.request.uri":
+				return req.URL.RequestURI(), true
+			case "http.request.uri_escaped":
+				return url.QueryEscape(req.URL.RequestURI()), true
+			case "http.request.uri.path":
+				return req.URL.Path, true
+			case "http.request.uri.path_escaped":
+				return url.QueryEscape(req.URL.Path), true
+			case "http.request.uri.path.file":
+				_, file := path.Split(req.URL.Path)
+				return file, true
+			case "http.request.uri.path.dir":
+				dir, _ := path.Split(req.URL.Path)
+				return dir, true
+			case "http.request.uri.path.file.base":
+				return strings.TrimSuffix(path.Base(req.URL.Path), path.Ext(req.URL.Path)), true
+			case "http.request.uri.path.file.ext":
+				return path.Ext(req.URL.Path), true
+			case "http.request.uri.query":
+				return req.URL.RawQuery, true
+			case "http.request.uri.query_escaped":
+				return url.QueryEscape(req.URL.RawQuery), true
+			case "http.request.uri.prefixed_query":
+				if req.URL.RawQuery == "" {
+					return "", true
+				}
+				return "?" + req.URL.RawQuery, true
+			case "http.request.duration":
+				start := GetVar(req.Context(), "start_time").(time.Time)
+				return time.Since(start), true
+			case "http.request.duration_ms":
+				start := GetVar(req.Context(), "start_time").(time.Time)
+				return time.Since(start).Seconds() * 1e3, true // multiply seconds to preserve decimal (see #4666)
 
-		case "http.request.uuid":
-			// fetch or initialize the UUID for this request
-			var id *requestID
-			if val := GetVar(req.Context(), "uuid"); val != nil {
-				id = val.(*requestID)
-			} else {
-				id = new(requestID)
-				SetVar(req.Context(), "uuid", id)
+			case "http.request.uuid":
+				// fetch the UUID for this request, generating and caching it
+				// on first access so requests that never reference the UUID
+				// don't pay for the allocation
+				id, ok := GetVar(req.Context(), "uuid").(*requestID)
+				if !ok {
+					id = new(requestID)
+					SetVar(req.Context(), "uuid", id)
+				}
+
+				// set it to this request's access log
+				if extra, ok := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields); ok && extra != nil {
+					extra.Set(zap.String("uuid", id.String()))
+				}
+
+				return id.String(), true
+
+			case "http.request.body":
+				if req.Body == nil {
+					return "", true
+				}
+				body, err := readRequestBodyForPlaceholder(req)
+				if err != nil {
+					return err, true
+				}
+				return string(body), true
+
+			case "http.request.body_base64":
+				if req.Body == nil {
+					return "", true
+				}
+				body, err := readRequestBodyForPlaceholder(req)
+				if err != nil {
+					return err, true
+				}
+				return base64.StdEncoding.EncodeToString(body), true
+
+			// original request, before any internal changes
+			case "http.request.orig_method":
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				return or.Method, true
+			case "http.request.orig_uri":
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				return or.RequestURI, true
+			case "http.request.orig_uri.path":
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				return or.URL.Path, true
+			case "http.request.orig_uri.path.file":
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				_, file := path.Split(or.URL.Path)
+				return file, true
+			case "http.request.orig_uri.path.file_escaped":
+				// split the escaped path rather than escaping the decoded
+				// file name, since an encoded slash (%2F) in the request
+				// is part of the last segment, not a separator
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				_, file := path.Split(or.URL.EscapedPath())
+				return file, true
+			case "http.request.orig_uri.path.dir":
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				dir, _ := path.Split(or.URL.Path)
+				return dir, true
+			case "http.request.orig_uri.query":
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				return or.URL.RawQuery, true
+			case "http.request.orig_uri.prefixed_query":
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				if or.URL.RawQuery == "" {
+					return "", true
+				}
+				return "?" + or.URL.RawQuery, true
 			}
 
-			// set it to this request's access log
-			if extra, ok := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields); ok && extra != nil {
-				extra.Set(zap.String("uuid", id.String()))
+			// remote IP range/prefix (e.g. keep top 24 bits of 1.2.3.4  => "1.2.3.0/24")
+			// syntax: "/V4,V6" where V4 = IPv4 bits, and V6 = IPv6 bits; if no comma, then same bit length used for both
+			// (EXPERIMENTAL)
+			if strings.HasPrefix(key, "http.request.remote.host/") {
+				host, _, err := net.SplitHostPort(req.RemoteAddr)
+				if err != nil {
+					host = req.RemoteAddr // assume no port, I guess?
+				}
+				addr, err := netip.ParseAddr(host)
+				if err != nil {
+					return host, true // not an IP address
+				}
+				// extract the bits from the end of the placeholder (start after "/") then split on ","
+				bitsBoth := key[strings.Index(key, "/")+1:]
+				ipv4BitsStr, ipv6BitsStr, cutOK := strings.Cut(bitsBoth, ",")
+				bitsStr := ipv4BitsStr
+				if addr.Is6() && cutOK {
+					bitsStr = ipv6BitsStr
+				}
+				// convert to integer then compute prefix
+				bits, err := strconv.Atoi(bitsStr)
+				if err != nil {
+					return "", true
+				}
+				prefix, err := addr.Prefix(bits)
+				if err != nil {
+					return "", true
+				}
+				return prefix.String(), true
 			}
 
-			return id.String(), true
+			// hostname labels (case insensitive, so normalize to lowercase)
+			if strings.HasPrefix(key, reqHostLabelsReplPrefix) {
+				idxStr := key[len(reqHostLabelsReplPrefix):]
+				idx, err := strconv.Atoi(idxStr)
+				if err != nil || idx < 0 {
+					return "", false
+				}
+				reqHost, _, err := net.SplitHostPort(req.Host)
+				if err != nil {
+					reqHost = req.Host // OK; assume there was no port
+				}
+				hostLabels := strings.Split(reqHost, ".")
+				if idx >= len(hostLabels) {
+					return "", true
+				}
+				return strings.ToLower(hostLabels[len(hostLabels)-idx-1]), true
+			}
 
-		case "http.request.body":
-			if req.Body == nil {
-				return "", true
+			// path parts
+			if strings.HasPrefix(key, reqURIPathReplPrefix) {
+				idxStr := key[len(reqURIPathReplPrefix):]
+				idx, err := strconv.Atoi(idxStr)
+				if err != nil {
+					return "", false
+				}
+				pathParts := strings.Split(req.URL.Path, "/")
+				if len(pathParts) > 0 && pathParts[0] == "" {
+					pathParts = pathParts[1:]
+				}
+				if idx < 0 {
+					return "", false
+				}
+				if idx >= len(pathParts) {
+					return "", true
+				}
+				return pathParts[idx], true
 			}
-			// normally net/http will close the body for us, but since we
-			// are replacing it with a fake one, we have to ensure we close
-			// the real body ourselves when we're done
-			defer req.Body.Close()
-			// read the request body into a buffer (can't pool because we
-			// don't know its lifetime and would have to make a copy anyway)
-			buf := new(bytes.Buffer)
-			_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-			req.Body = io.NopCloser(buf)  // replace real body with buffered data
-			return buf.String(), true
 
-		case "http.request.body_base64":
-			if req.Body == nil {
-				return "", true
+			// orig uri path parts
+			if strings.HasPrefix(key, reqOrigURIPathReplPrefix) {
+				idxStr := key[len(reqOrigURIPathReplPrefix):]
+				idx, err := strconv.Atoi(idxStr)
+				if err != nil {
+					return "", false
+				}
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				pathParts := strings.Split(or.URL.Path, "/")
+				if len(pathParts) > 0 && pathParts[0] == "" {
+					pathParts = pathParts[1:]
+				}
+				if idx < 0 {
+					return "", false
+				}
+				if idx >= len(pathParts) {
+					return "", true
+				}
+				return pathParts[idx], true
 			}
-			// normally net/http will close the body for us, but since we
-			// are replacing it with a fake one, we have to ensure we close
-			// the real body ourselves when we're done
-			defer req.Body.Close()
-			// read the request body into a buffer (can't pool because we
-			// don't know its lifetime and would have to make a copy anyway)
-			buf := new(bytes.Buffer)
-			_, _ = io.Copy(buf, req.Body) // can't handle error, so just ignore it
-			req.Body = io.NopCloser(buf)  // replace real body with buffered data
-			return base64.StdEncoding.EncodeToString(buf.Bytes()), true
 
-		// original request, before any internal changes
-		case "http.request.orig_method":
-			or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-			return or.Method, true
-		case "http.request.orig_uri":
-			or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-			return or.RequestURI, true
-		case "http.request.orig_uri.path":
-			or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-			return or.URL.Path, true
-		case "http.request.orig_uri.path.file":
-			or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-			_, file := path.Split(or.URL.Path)
-			return file, true
-		case "http.request.orig_uri.path.dir":
-			or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-			dir, _ := path.Split(or.URL.Path)
-			return dir, true
-		case "http.request.orig_uri.query":
-			or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-			return or.URL.RawQuery, true
-		case "http.request.orig_uri.prefixed_query":
-			or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-			if or.URL.RawQuery == "" {
-				return "", true
+			// middleware variables
+			if strings.HasPrefix(key, varsReplPrefix) {
+				varName := key[len(varsReplPrefix):]
+				raw := GetVar(req.Context(), varName)
+				// variables can be dynamic, so always return true
+				// even when it may not be set; treat as empty then
+				return raw, true
 			}
-			return "?" + or.URL.RawQuery, true
-		}
-
-		// remote IP range/prefix (e.g. keep top 24 bits of 1.2.3.4  => "1.2.3.0/24")
-		// syntax: "/V4,V6" where V4 = IPv4 bits, and V6 = IPv6 bits; if no comma, then same bit length used for both
-		// (EXPERIMENTAL)
-		if strings.HasPrefix(key, "http.request.remote.host/") {
-			host, _, err := net.SplitHostPort(req.RemoteAddr)
-			if err != nil {
-				host = req.RemoteAddr // assume no port, I guess?
-			}
-			addr, err := netip.ParseAddr(host)
-			if err != nil {
-				return host, true // not an IP address
-			}
-			// extract the bits from the end of the placeholder (start after "/") then split on ","
-			bitsBoth := key[strings.Index(key, "/")+1:]
-			ipv4BitsStr, ipv6BitsStr, cutOK := strings.Cut(bitsBoth, ",")
-			bitsStr := ipv4BitsStr
-			if addr.Is6() && cutOK {
-				bitsStr = ipv6BitsStr
-			}
-			// convert to integer then compute prefix
-			bits, err := strconv.Atoi(bitsStr)
-			if err != nil {
-				return "", true
-			}
-			prefix, err := addr.Prefix(bits)
-			if err != nil {
-				return "", true
-			}
-			return prefix.String(), true
-		}
-
-		// hostname labels (case insensitive, so normalize to lowercase)
-		if strings.HasPrefix(key, reqHostLabelsReplPrefix) {
-			idxStr := key[len(reqHostLabelsReplPrefix):]
-			idx, err := strconv.Atoi(idxStr)
-			if err != nil || idx < 0 {
-				return "", false
-			}
-			reqHost, _, err := net.SplitHostPort(req.Host)
-			if err != nil {
-				reqHost = req.Host // OK; assume there was no port
-			}
-			hostLabels := strings.Split(reqHost, ".")
-			if idx >= len(hostLabels) {
-				return "", true
-			}
-			return strings.ToLower(hostLabels[len(hostLabels)-idx-1]), true
-		}
-
-		// path parts
-		if strings.HasPrefix(key, reqURIPathReplPrefix) {
-			idxStr := key[len(reqURIPathReplPrefix):]
-			idx, err := strconv.Atoi(idxStr)
-			if err != nil {
-				return "", false
-			}
-			pathParts := strings.Split(req.URL.Path, "/")
-			if len(pathParts) > 0 && pathParts[0] == "" {
-				pathParts = pathParts[1:]
-			}
-			if idx < 0 {
-				return "", false
-			}
-			if idx >= len(pathParts) {
-				return "", true
-			}
-			return pathParts[idx], true
-		}
-
-		// orig uri path parts
-		if strings.HasPrefix(key, reqOrigURIPathReplPrefix) {
-			idxStr := key[len(reqOrigURIPathReplPrefix):]
-			idx, err := strconv.Atoi(idxStr)
-			if err != nil {
-				return "", false
-			}
-			or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-			pathParts := strings.Split(or.URL.Path, "/")
-			if len(pathParts) > 0 && pathParts[0] == "" {
-				pathParts = pathParts[1:]
-			}
-			if idx < 0 {
-				return "", false
-			}
-			if idx >= len(pathParts) {
-				return "", true
-			}
-			return pathParts[idx], true
-		}
-
-		// middleware variables
-		if strings.HasPrefix(key, varsReplPrefix) {
-			varName := key[len(varsReplPrefix):]
-			raw := GetVar(req.Context(), varName)
-			// variables can be dynamic, so always return true
-			// even when it may not be set; treat as empty then
-			return raw, true
-		}
 
 		// response header fields
 		if strings.HasPrefix(key, respHeaderReplPrefix) {
@@ -428,11 +427,87 @@ func (p reqProvider) Replace(key string) (any, bool) {
 	return nil, false
 }
 
-func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
-	if req == nil || req.TLS == nil {
-		return nil, false
+// RequestBodyLimitError is returned by the {http.request.body} and
+// {http.request.body_base64} placeholders when reading the request body
+// exceeded a request_body max_size limit. Placeholder consumers such as
+// templates and the vars matchers recognize exactly this condition and no
+// other error, so unrelated errors keep their existing behavior.
+type RequestBodyLimitError struct {
+	Err error // the underlying reason, e.g. *http.MaxBytesError
+}
+
+// Error returns the reason the request body could not be read in full.
+func (e RequestBodyLimitError) Error() string {
+	return fmt.Sprintf("request body: %v", e.Err)
+}
+
+// StatusCode returns 413 to match the request_body handler's response to an
+// oversized body.
+func (e RequestBodyLimitError) StatusCode() int {
+	return http.StatusRequestEntityTooLarge
+}
+
+// Unwrap returns the underlying error value. See the `errors` package for info.
+func (e RequestBodyLimitError) Unwrap() error { return e.Err }
+
+// readRequestBodyForPlaceholder reads the request body into a buffer for the
+// {http.request.body} and {http.request.body_base64} placeholders. Usually the
+// body is copied verbatim and the buffered replacement is installed on req. If
+// the read fails because the request_body max_size limit was exceeded, the
+// request_body handler wraps the http.MaxBytesError into a HandlerError
+// carrying status 413; here that error is converted to a RequestBodyLimitError,
+// which the placeholder consumers recognize, instead of silently returning the
+// truncated prefix as though it were the complete body. Only a max_size-driven
+// handler error is converted; any other read error is still ignored, as it was
+// before, because the request is probably not going to be served normally
+// anyway and we want to keep the placeholder's behavior unchanged in that case.
+func readRequestBodyForPlaceholder(req *http.Request) ([]byte, error) {
+	// normally net/http will close the body for us, but since we are replacing
+	// it with a fake one, we have to ensure we close the real body ourselves
+	defer req.Body.Close()
+
+	// read the request body into a buffer (can't pool because we don't know its
+	// lifetime and would have to make a copy anyway)
+	buf := new(bytes.Buffer)
+	_, err := io.Copy(buf, req.Body)
+	if err != nil {
+		var handlerErr HandlerError
+		var maxBytes *http.MaxBytesError
+		if errors.As(err, &handlerErr) && errors.As(handlerErr.Err, &maxBytes) {
+			// return the dedicated body-limit marker carrying only the
+			// MaxBytesError; the generated ID and stack trace of the handler
+			// error are intentionally dropped so a placeholder stringified
+			// into a response body (e.g. respond {http.request.body}) cannot
+			// leak the call stack to the client. consumers recognize this
+			// marker and no other error, so unrelated HandlerError values
+			// keep their existing behavior.
+			return nil, RequestBodyLimitError{Err: maxBytes}
+		}
 	}
 
+	// replace the real body with the buffered data
+	req.Body = io.NopCloser(buf)
+	return buf.Bytes(), nil
+}
+
+func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
+	if req == nil {
+		return nil, false
+	}
+	state := req.TLS
+	if state == nil {
+		state = new(tls.ConnectionState)
+	}
+	value, known := getTLSReplacement(state, key)
+	if req.TLS == nil {
+		// Use the same field parser to recognise valid placeholders but
+		// do not substitute values from the empty state for a plain HTTP request.
+		return nil, known
+	}
+	return value, known
+}
+
+func getTLSReplacement(state *tls.ConnectionState, key string) (any, bool) {
 	if len(key) < len(reqTLSReplPrefix) {
 		return nil, false
 	}
@@ -440,7 +515,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 	field := strings.ToLower(key[len(reqTLSReplPrefix):])
 
 	if strings.HasPrefix(field, "client.") {
-		cert := getTLSPeerCert(req.TLS)
+		cert := getTLSPeerCert(state)
 		if cert == nil {
 			// Instead of returning (nil, false) here, we set it to a dummy
 			// value to fix #7530. This way, even if there is no client cert,
@@ -545,20 +620,20 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 
 	switch field {
 	case "version":
-		return caddytls.ProtocolName(req.TLS.Version), true
+		return caddytls.ProtocolName(state.Version), true
 	case "cipher_suite":
-		return tls.CipherSuiteName(req.TLS.CipherSuite), true
+		return tls.CipherSuiteName(state.CipherSuite), true
 	case "resumed":
-		return req.TLS.DidResume, true
+		return state.DidResume, true
 	case "proto":
-		return req.TLS.NegotiatedProtocol, true
+		return state.NegotiatedProtocol, true
 	case "proto_mutual":
 		// req.TLS.NegotiatedProtocolIsMutual is deprecated - it's always true.
 		return true, true
 	case "server_name":
-		return req.TLS.ServerName, true
+		return state.ServerName, true
 	case "ech":
-		return req.TLS.ECHAccepted, true
+		return state.ECHAccepted, true
 	}
 	return nil, false
 }
