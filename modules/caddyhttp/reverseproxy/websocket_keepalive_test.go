@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"sync"
 	"testing"
 	"time"
 
@@ -56,14 +55,11 @@ func TestWebSocketKeepAlivePingGeneration(t *testing.T) {
 	res.Header.Set("Connection", "Upgrade")
 	res.Header.Set("Upgrade", "websocket")
 
+	logger := zaptest.NewLogger(t)
 	h := &Handler{
 		WebSocketKeepAlive: caddy.Duration(50 * time.Millisecond),
-		connections:        make(map[io.ReadWriteCloser]openConnection),
-		connectionsMu:      new(sync.Mutex),
+		tunnelTracker:      newTunnelTracker(logger, 0),
 	}
-
-	logger := zaptest.NewLogger(t)
-	var wg sync.WaitGroup
 
 	rw := &mockHijackResponseWriter{
 		HeaderMap: make(http.Header),
@@ -72,7 +68,7 @@ func TestWebSocketKeepAlivePingGeneration(t *testing.T) {
 
 	doneChan := make(chan struct{})
 	go func() {
-		h.handleUpgradeResponse(logger, &wg, rw, req, res)
+		h.handleUpgradeResponse(logger, rw, req, res, "127.0.0.1:8080")
 		close(doneChan)
 	}()
 
@@ -135,14 +131,11 @@ func TestWebSocketKeepAliveWriteFailureTeardown(t *testing.T) {
 	res.Header.Set("Connection", "Upgrade")
 	res.Header.Set("Upgrade", "websocket")
 
+	logger := zaptest.NewLogger(t)
 	h := &Handler{
 		WebSocketKeepAlive: caddy.Duration(20 * time.Millisecond),
-		connections:        make(map[io.ReadWriteCloser]openConnection),
-		connectionsMu:      new(sync.Mutex),
+		tunnelTracker:      newTunnelTracker(logger, 0),
 	}
-
-	logger := zaptest.NewLogger(t)
-	var wg sync.WaitGroup
 
 	rw := &mockHijackResponseWriter{
 		HeaderMap: make(http.Header),
@@ -151,7 +144,7 @@ func TestWebSocketKeepAliveWriteFailureTeardown(t *testing.T) {
 
 	doneChan := make(chan struct{})
 	go func() {
-		h.handleUpgradeResponse(logger, &wg, rw, req, res)
+		h.handleUpgradeResponse(logger, rw, req, res, "127.0.0.1:8080")
 		close(doneChan)
 	}()
 
@@ -188,21 +181,22 @@ func TestWebSocketKeepAliveZeroInterval(t *testing.T) {
 	res.Header.Set("Upgrade", "websocket")
 
 	// Interval = 0 (disabled)
+	logger := zaptest.NewLogger(t)
 	h := &Handler{
 		WebSocketKeepAlive: 0,
-		connections:        make(map[io.ReadWriteCloser]openConnection),
-		connectionsMu:      new(sync.Mutex),
+		tunnelTracker:      newTunnelTracker(logger, 0),
 	}
-
-	logger := zaptest.NewLogger(t)
-	var wg sync.WaitGroup
 
 	rw := &mockHijackResponseWriter{
 		HeaderMap: make(http.Header),
 		conn:      proxyClientConn,
 	}
 
-	go h.handleUpgradeResponse(logger, &wg, rw, req, res)
+	doneChan := make(chan struct{})
+	go func() {
+		h.handleUpgradeResponse(logger, rw, req, res, "127.0.0.1:8080")
+		close(doneChan)
+	}()
 
 	// Send message from client to backend
 	testMsg := []byte("hello backend")
@@ -222,6 +216,12 @@ func TestWebSocketKeepAliveZeroInterval(t *testing.T) {
 
 	_ = clientConn.Close()
 	_ = backendConn.Close()
+
+	select {
+	case <-doneChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleUpgradeResponse did not finish after connection close")
+	}
 }
 
 type mockHijackResponseWriter struct {
