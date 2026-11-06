@@ -294,8 +294,14 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			// identify this error as one that occurred during
 			// dialing, which can be important when trying to
 			// decide whether to retry a request
-			return nil, DialError{Cause: err}
+			return nil, DialError{err}
 		}
+		keepConn := false
+		defer func() {
+			if !keepConn {
+				_ = conn.Close()
+			}
+		}()
 
 		if h.ProxyProtocol != "" {
 			proxyProtocolInfo, ok := caddyhttp.GetVar(ctx, proxyProtocolInfoVarKey).(ProxyProtocolInfo)
@@ -348,7 +354,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				// identify this error as one that occurred during
 				// dialing, which can be important when trying to
 				// decide whether to retry a request
-				return nil, DialError{Cause: err}
+				return nil, DialError{err}
 			}
 		}
 
@@ -363,6 +369,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			}
 		}
 
+		keepConn = true
 		return conn, nil
 	}
 
@@ -456,7 +463,7 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 				err = tlsConn.HandshakeContext(ctx)
 				if err != nil {
 					_ = tlsConn.Close()
-					return nil, DialError{Cause: err}
+					return nil, DialError{err}
 				}
 				return tlsConn, nil
 			}
@@ -496,11 +503,10 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 	if len(h.Versions) == 1 && h.Versions[0] == "3" {
 		h.h3Transport = new(http3.Transport)
 		if h.TLS != nil {
-			var err error
-			h.h3Transport.TLSClientConfig, err = h.TLS.MakeTLSClientConfig(caddyCtx)
-			if err != nil {
-				return nil, fmt.Errorf("making TLS client config for HTTP/3 transport: %v", err)
-			}
+			// Reuse the TLS client config built above for the HTTP/1.1+2
+			// transport rather than calling MakeTLSClientConfig again.
+			// Fixing: https://github.com/caddyserver/caddy/issues/8041
+			h.h3Transport.TLSClientConfig = rt.TLSClientConfig.Clone()
 
 			if strings.Contains(h.TLS.ServerName, "{") {
 				// copied from quic-go
@@ -515,11 +521,11 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 					tlsCfg.ServerName = repl.ReplaceAll(tlsCfg.ServerName, "")
 					udpAddr, err := resolveUDPAddr(ctx, "udp", addr)
 					if err != nil {
-						return nil, DialError{Cause: err}
+						return nil, DialError{err}
 					}
 					conn, err := h.quicTransport.DialEarly(ctx, udpAddr, tlsCfg, cfg)
 					if err != nil {
-						return nil, DialError{Cause: err}
+						return nil, DialError{err}
 					}
 					return conn, nil
 				}
@@ -531,6 +537,8 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 
 	// if h2/c is enabled, configure it explicitly
 	if slices.Contains(h.Versions, "2") || slices.Contains(h.Versions, "h2c") {
+		// TODO: Migrate to http.Transport.Protocols once transport behaviour is covered.
+		//nolint:staticcheck
 		if err := http2.ConfigureTransport(rt); err != nil {
 			return nil, err
 		}
@@ -892,7 +900,10 @@ func (t *TLSConfig) MakeTLSClientConfig(ctx caddy.Context) (*tls.Config, error) 
 
 	curvesAdded := make(map[tls.CurveID]struct{})
 	for _, curveName := range t.Curves {
-		curveID := caddytls.SupportedCurves[curveName]
+		curveID, ok := caddytls.SupportedCurves[curveName]
+		if !ok {
+			return nil, fmt.Errorf("unsupported curve: %s", curveName)
+		}
 		if _, ok := curvesAdded[curveID]; !ok {
 			curvesAdded[curveID] = struct{}{}
 			cfg.CurvePreferences = append(cfg.CurvePreferences, curveID)
