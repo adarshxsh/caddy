@@ -202,6 +202,9 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 		}
 	}
 
+	conn = newLockedWriteCloser(conn)
+	backConn = newLockedWriteCloser(backConn)
+
 	// Register both connections with the tunnel tracker. We also try to
 	// gracefully close connections we recognize as websockets. We need to make
 	// sure the client connection messages (i.e. to upstream) are masked, so we
@@ -762,6 +765,46 @@ func newMaskKey() [4]byte {
 func isWebsocket(r *http.Request) bool {
 	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
 		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+// lockedWriteCloser wraps an io.ReadWriteCloser and synchronizes
+// all Write calls using a mutex. This prevents concurrent write data races
+// between active stream copiers and graceful close handlers.
+type lockedWriteCloser struct {
+	io.ReadWriteCloser
+	mu sync.Mutex
+}
+
+func (lwc *lockedWriteCloser) Write(p []byte) (int, error) {
+	lwc.mu.Lock()
+	defer lwc.mu.Unlock()
+	return lwc.ReadWriteCloser.Write(p)
+}
+
+func (lwc *lockedWriteCloser) Unwrap() io.ReadWriteCloser {
+	return lwc.ReadWriteCloser
+}
+
+type lockedWriteCloserWithCloseWrite struct {
+	*lockedWriteCloser
+	closeWriter interface{ CloseWrite() error }
+}
+
+func (lwc *lockedWriteCloserWithCloseWrite) CloseWrite() error {
+	lwc.mu.Lock()
+	defer lwc.mu.Unlock()
+	return lwc.closeWriter.CloseWrite()
+}
+
+func newLockedWriteCloser(rwc io.ReadWriteCloser) io.ReadWriteCloser {
+	base := &lockedWriteCloser{ReadWriteCloser: rwc}
+	if cw, ok := rwc.(interface{ CloseWrite() error }); ok {
+		return &lockedWriteCloserWithCloseWrite{
+			lockedWriteCloser: base,
+			closeWriter:       cw,
+		}
+	}
+	return base
 }
 
 // closeConnectionsForUpstream closes detached connections to the given
