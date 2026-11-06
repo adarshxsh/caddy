@@ -29,6 +29,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -208,6 +209,13 @@ func (fsrv *FileServer) Provision(ctx caddy.Context) error {
 		fsrv.IndexNames = defaultIndexNames
 	}
 
+	// a relative data directory sits under the working directory and holds private keys
+	if dataDir := caddy.AppDataDir(); !filepath.IsAbs(dataDir) {
+		if abs, err := caddy.FastAbs(dataDir); err == nil {
+			fsrv.Hide = append(fsrv.Hide, abs)
+		}
+	}
+
 	// for hide paths that are static (i.e. no placeholders), we can transform them into
 	// absolute paths before the server starts for very slight performance improvement
 	for i, h := range fsrv.Hide {
@@ -275,8 +283,7 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("illegal ADS path"))
 		}
 		// reject paths with "8.3" short names
-		trimmedPath := strings.TrimRight(r.URL.Path, ". ") // Windows ignores trailing dots and spaces, sigh
-		if len(path.Base(trimmedPath)) <= 12 && strings.Contains(trimmedPath, "~") {
+		if caddyhttp.HasWindowsShortName(r.URL.Path) {
 			return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("illegal short name"))
 		}
 		// both of those could bypass file hiding or possibly leak information even if the file is not hidden
@@ -440,6 +447,9 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			continue
 		}
 		compressedFilename := filename + precompress.Suffix()
+		if fileHidden(compressedFilename, filesToHide) {
+			continue
+		}
 		compressedInfo, err := fs.Stat(fileSystem, compressedFilename)
 		if err != nil || compressedInfo.IsDir() {
 			if c := fsrv.logger.Check(zapcore.DebugLevel, "precompressed file not accessible"); c != nil {
@@ -638,6 +648,11 @@ func (fsrv *FileServer) mapDirOpenError(fileSystem fs.FS, originalErr error, nam
 		return originalErr
 	}
 
+	// a regular file used as a directory, e.g. /index.php/foo
+	if errors.Is(originalErr, syscall.ENOTDIR) {
+		return fs.ErrNotExist
+	}
+
 	if _, ok := errors.AsType[*fs.PathError](originalErr); ok {
 		return fs.ErrInvalid
 	}
@@ -767,6 +782,7 @@ func calculateEtag(d os.FileInfo) string {
 	var sb strings.Builder
 	sb.WriteRune('"')
 	sb.WriteString(strconv.FormatInt(mtime.UnixNano(), 36))
+	sb.WriteRune('-')
 	sb.WriteString(strconv.FormatInt(d.Size(), 36))
 	sb.WriteRune('"')
 	return sb.String()
