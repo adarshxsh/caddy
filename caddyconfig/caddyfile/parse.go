@@ -74,11 +74,22 @@ func replaceEnvVars(input []byte) []byte {
 			break
 		}
 		begin += offset // make beginning relative to input, not offset
-		end := bytes.Index(input[begin+len(spanOpen):], spanClose)
+		end := -1
+		depth := 1
+		for i := begin + len(spanOpen); i < len(input); i++ {
+			if input[i] == '{' {
+				depth++
+			} else if input[i] == '}' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
 		if end < 0 {
 			break
 		}
-		end += begin + len(spanOpen) // make end relative to input, not begin
 
 		// get the name; if there is no name, skip it
 		envString := input[begin+len(spanOpen) : end]
