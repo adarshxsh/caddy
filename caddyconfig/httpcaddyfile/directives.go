@@ -56,11 +56,13 @@ var defaultDirectiveOrder = []string{
 	"skip_log", // TODO: deprecated, renamed to log_skip
 	"log_skip",
 	"log_name",
+	"log_level",
 	"early_data",
 
 	"header",
 	"copy_response_headers", // only in reverse_proxy's handle_response
 	"request_body",
+	"timeouts", // wraps the response writer, so keep it close to the real writer, ahead of encode/push/etc.
 
 	"redir",
 
@@ -99,9 +101,23 @@ var defaultDirectiveOrder = []string{
 }
 
 // directiveOrder specifies the order to apply directives
-// in HTTP routes, after being modified by either the
-// plugins or by the user via the "order" global option.
+// in HTTP routes, after being modified by the plugins.
+// It is only written during plugin registration, i.e.
+// before any adaptation runs; adaptations only read it,
+// since the user's "order" global option is kept per
+// adaptation in options["order"] instead.
 var directiveOrder = defaultDirectiveOrder
+
+// directiveOrderFor returns the directive order to use for the
+// adaptation these options belong to. That's whatever the "order"
+// global option built up, or the plugin-registered order if the
+// Caddyfile didn't use it.
+func directiveOrderFor(options map[string]any) []string {
+	if order, ok := options["order"].([]string); ok {
+		return order
+	}
+	return directiveOrder
+}
 
 // RegisterDirective registers a unique directive dir with an
 // associated unmarshaling (setup) function. When directive dir
@@ -169,20 +185,14 @@ func RegisterDirectiveOrder(dir string, position Positional, standardDir string)
 		panic("the 3rd argument '" + standardDir + "' must be a directive that exists in the standard distribution of Caddy")
 	}
 
-	// insert directive into proper position
-	newOrder := directiveOrder
-	for i, d := range newOrder {
-		if d != standardDir {
-			continue
+	// insert directive into proper position, into a copy so that we
+	// never write into the array backing defaultDirectiveOrder
+	newOrder := slices.Clone(directiveOrder)
+	if i := slices.Index(newOrder, standardDir); i >= 0 {
+		if position == After {
+			i++
 		}
-		switch position {
-		case Before:
-			newOrder = append(newOrder[:i], append([]string{dir}, newOrder[i:]...)...)
-		case After:
-			newOrder = append(newOrder[:i+1], append([]string{dir}, newOrder[i+1:]...)...)
-		case First, Last:
-		}
-		break
+		newOrder = slices.Insert(newOrder, i, dir)
 	}
 	directiveOrder = newOrder
 }
@@ -217,6 +227,14 @@ type Helper struct {
 // Option gets the option keyed by name.
 func (h Helper) Option(name string) any {
 	return h.options[name]
+}
+
+// IsNamedRoute returns true if the directive is in a named route.
+// Named routes are adapted before the site blocks, with their own
+// State, so values a directive keeps in State aren't shared with
+// the site blocks.
+func (h Helper) IsNamedRoute() bool {
+	return h.parentBlock.IsNamedRoute
 }
 
 // Caddyfiles returns the list of config files from
@@ -348,7 +366,7 @@ func ParseSegmentAsSubroute(h Helper) (caddyhttp.MiddlewareHandler, error) {
 		return nil, err
 	}
 
-	return buildSubroute(allResults, h.groupCounter, true)
+	return buildSubroute(allResults, h.groupCounter, directiveOrderFor(h.options))
 }
 
 // parseSegmentAsConfig parses the segment such that its subdirectives
@@ -444,9 +462,9 @@ type ConfigValue struct {
 	directive string
 }
 
-func sortRoutes(routes []ConfigValue) {
+func sortRoutes(routes []ConfigValue, order []string) {
 	dirPositions := make(map[string]int)
-	for i, dir := range directiveOrder {
+	for i, dir := range order {
 		dirPositions[dir] = i
 	}
 
@@ -455,6 +473,15 @@ func sortRoutes(routes []ConfigValue) {
 		iDir, jDir := routes[i].directive, routes[j].directive
 		if iDir != jDir {
 			return dirPositions[iDir] < dirPositions[jDir]
+		}
+
+		// some directives involve setting values which can overwrite
+		// each other, so it makes most sense to reverse the order so
+		// that the least-specific matcher is first, allowing the last
+		// matching one to win; we swap i and j instead of using !,
+		// so matchers that can't be compared keep their order
+		if iDir == "vars" || iDir == "log_level" {
+			i, j = j, i
 		}
 
 		// directives are the same; sub-sort by path matcher length if there's
@@ -527,15 +554,7 @@ func sortRoutes(routes []ConfigValue) {
 			return len(iRoute.MatcherSetsRaw) > 0 && len(jRoute.MatcherSetsRaw) == 0
 		}()
 
-		// some directives involve setting values which can overwrite
-		// each other, so it makes most sense to reverse the order so
-		// that the least-specific matcher is first, allowing the last
-		// matching one to win
-		if iDir == "vars" {
-			return !sortByPath
-		}
-
-		// everything else is most-specific matcher first
+		// most-specific matcher first (or last for vars and log_level, see above)
 		return sortByPath
 	})
 }
