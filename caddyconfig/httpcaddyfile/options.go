@@ -65,6 +65,7 @@ func init() {
 	RegisterGlobalOption("persist_config", parseOptPersistConfig)
 	RegisterGlobalOption("dns", parseOptDNS)
 	RegisterGlobalOption("tls_resolvers", parseOptTLSResolvers)
+	RegisterGlobalOption("tls_automate_names", parseOptAutomateNames)
 	RegisterGlobalOption("ech", parseOptECH)
 	RegisterGlobalOption("renewal_window_ratio", parseOptRenewalWindowRatio)
 }
@@ -101,7 +102,7 @@ func parseOptHTTPSPort(d *caddyfile.Dispenser, _ any) (any, error) {
 	return httpsPort, nil
 }
 
-func parseOptOrder(d *caddyfile.Dispenser, existingVal any) (any, error) {
+func parseOptOrder(d *caddyfile.Dispenser, existing any) (any, error) {
 	d.Next() // consume option name
 
 	// get directive name
@@ -119,15 +120,16 @@ func parseOptOrder(d *caddyfile.Dispenser, existingVal any) (any, error) {
 	}
 	pos := Positional(d.Val())
 
-	var currentOrder []string
-	if existingOrder, ok := existingVal.([]string); ok && existingOrder != nil {
-		currentOrder = slices.Clone(existingOrder)
-	} else {
-		currentOrder = getDefaultDirectiveOrder()
+	// build on what an earlier order option in this same Caddyfile produced;
+	// the first one starts from a clone of the order the plugins registered,
+	// so from here on we're only ever editing a slice this adaptation owns
+	order, ok := existing.([]string)
+	if !ok {
+		order = slices.Clone(directiveOrder)
 	}
 
 	// if directive already had an order, drop it
-	newOrder := slices.DeleteFunc(currentOrder, func(d string) bool {
+	newOrder := slices.DeleteFunc(order, func(d string) bool {
 		return d == dirName
 	})
 
@@ -317,6 +319,22 @@ func parseOptTLSResolvers(d *caddyfile.Dispenser, _ any) (any, error) {
 		return nil, d.ArgErr()
 	}
 	return resolvers, nil
+}
+
+// parseOptAutomateNames parses the tls_automate_names global option, which
+// names subjects to manage certificates for without serving them. Repeating
+// the option appends to the list rather than replacing it, so a long list can
+// be split over several lines.
+func parseOptAutomateNames(d *caddyfile.Dispenser, existing any) (any, error) {
+	d.Next() // consume option name
+	names := d.RemainingArgs()
+	if len(names) == 0 {
+		return nil, d.ArgErr()
+	}
+	if previous, ok := existing.([]string); ok {
+		names = append(previous, names...)
+	}
+	return names, nil
 }
 
 func parseOptDefaultBind(d *caddyfile.Dispenser, _ any) (any, error) {
