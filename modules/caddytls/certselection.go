@@ -58,13 +58,24 @@ func (p CustomCertSelectionPolicy) SelectCertificate(hello *tls.ClientHelloInfo,
 
 nextChoice:
 	for _, cert := range choices {
-		if len(p.SerialNumber) > 0 {
+		leaf := cert.Leaf
+		if leaf == nil && len(cert.Certificate.Certificate) > 0 {
+			var err error
+			leaf, err = x509.ParseCertificate(cert.Certificate.Certificate[0])
+			if err != nil {
+				leaf = nil
+			}
+		}
+
+		if leaf != nil && len(p.SerialNumber) > 0 {
 			var found bool
-			for _, sn := range p.SerialNumber {
-				snInt := sn.Int // avoid taking address of iteration variable (gosec warning)
-				if cert.Leaf.SerialNumber.Cmp(&snInt) == 0 {
-					found = true
-					break
+			if leaf.SerialNumber != nil {
+				for _, sn := range p.SerialNumber {
+					snInt := sn.Int // avoid taking address of iteration variable (gosec warning)
+					if leaf.SerialNumber.Cmp(&snInt) == 0 {
+						found = true
+						break
+					}
 				}
 			}
 			if !found {
@@ -72,17 +83,17 @@ nextChoice:
 			}
 		}
 
-		if len(p.SubjectOrganization) > 0 {
+		if leaf != nil && len(p.SubjectOrganization) > 0 {
 			found := slices.ContainsFunc(p.SubjectOrganization, func(s string) bool {
-				return slices.Contains(cert.Leaf.Subject.Organization, s)
+				return slices.Contains(leaf.Subject.Organization, s)
 			})
 			if !found {
 				continue
 			}
 		}
 
-		if p.PublicKeyAlgorithm != PublicKeyAlgorithm(x509.UnknownPublicKeyAlgorithm) &&
-			PublicKeyAlgorithm(cert.Leaf.PublicKeyAlgorithm) != p.PublicKeyAlgorithm {
+		if leaf != nil && p.PublicKeyAlgorithm != PublicKeyAlgorithm(x509.UnknownPublicKeyAlgorithm) &&
+			PublicKeyAlgorithm(leaf.PublicKeyAlgorithm) != p.PublicKeyAlgorithm {
 			continue
 		}
 
