@@ -218,13 +218,13 @@ func Test1xxHeaderIsolationOverlappingKey(t *testing.T) {
 		t.Fatalf("ServeHTTP failed: %v", err)
 	}
 
-	// Final headers should keep non-overlapping outer header, but remove overlapping header key
+	// Final headers should keep non-overlapping outer header and preserve overlapping outer header
 	finalHeaders := rw.Header()
 	if got := finalHeaders.Get("X-Outer-Header"); got != "keep-me" {
 		t.Errorf("expected X-Outer-Header = keep-me, got %q", got)
 	}
-	if got := finalHeaders.Get("X-Overlapping"); got != "" {
-		t.Errorf("expected overlapping header to be removed after 1xx flush, got %q", got)
+	if got := finalHeaders.Get("X-Overlapping"); got != "outer-value" {
+		t.Errorf("expected overlapping outer header to be preserved after 1xx flush, got %q, want %q", got, "outer-value")
 	}
 }
 
