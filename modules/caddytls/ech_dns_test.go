@@ -217,7 +217,7 @@ func TestPublishECHConfigsConcurrentWithRotation(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
-				_ = tlsApp.publishECHConfigs(logger)
+				_ = tlsApp.publishECHConfigs(caddyCtx, logger)
 			}
 		}()
 		go func() {
