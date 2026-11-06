@@ -162,7 +162,7 @@ func TestFinalizeResponseNonCanonicalHopByHopHeaders(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com/", nil)
 	repl := caddy.NewReplacer()
 
-	err := handler.finalizeResponse(rw, req, res, repl, time.Now(), zap.NewNop())
+	err := handler.finalizeResponse(rw, req, res, repl, time.Now(), zap.NewNop(), "")
 	if err != nil {
 		t.Fatalf("finalizeResponse failed: %v", err)
 	}
