@@ -26,6 +26,7 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -62,7 +63,6 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 		*req = *req.WithContext(ctx)
 	}
 	SetVar(req.Context(), "start_time", time.Now())
-	SetVar(req.Context(), "uuid", new(requestID))
 
 	httpVars := func(key string) (any, bool) {
 		if req != nil {
@@ -93,6 +93,7 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 						return cookie.Value, true
 					}
 				}
+				return "", true
 			}
 
 			// http.request.tls.*
@@ -218,8 +219,14 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return time.Since(start).Seconds() * 1e3, true // multiply seconds to preserve decimal (see #4666)
 
 			case "http.request.uuid":
-				// fetch the UUID for this request
-				id := GetVar(req.Context(), "uuid").(*requestID)
+				// fetch the UUID for this request, generating and caching it
+				// on first access so requests that never reference the UUID
+				// don't pay for the allocation
+				id, ok := GetVar(req.Context(), "uuid").(*requestID)
+				if !ok {
+					id = new(requestID)
+					SetVar(req.Context(), "uuid", id)
+				}
 
 				// set it to this request's access log
 				extra := req.Context().Value(ExtraLogFieldsCtxKey).(*ExtraLogFields)
@@ -228,18 +235,24 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				return id.String(), true
 
 			case "http.request.body":
-				bodyBytes, ok := readAndCacheRequestBody(req)
-				if !ok || bodyBytes == nil {
+				if req.Body == nil {
 					return "", true
 				}
-				return string(bodyBytes), true
+				body, err := readRequestBodyForPlaceholder(req)
+				if err != nil {
+					return err, true
+				}
+				return string(body), true
 
 			case "http.request.body_base64":
-				bodyBytes, ok := readAndCacheRequestBody(req)
-				if !ok || bodyBytes == nil {
+				if req.Body == nil {
 					return "", true
 				}
-				return base64.StdEncoding.EncodeToString(bodyBytes), true
+				body, err := readRequestBodyForPlaceholder(req)
+				if err != nil {
+					return err, true
+				}
+				return base64.StdEncoding.EncodeToString(body), true
 
 			// original request, before any internal changes
 			case "http.request.orig_method":
@@ -254,6 +267,13 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 			case "http.request.orig_uri.path.file":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
 				_, file := path.Split(or.URL.Path)
+				return file, true
+			case "http.request.orig_uri.path.file_escaped":
+				// split the escaped path rather than escaping the decoded
+				// file name, since an encoded slash (%2F) in the request
+				// is part of the last segment, not a separator
+				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
+				_, file := path.Split(or.URL.EscapedPath())
 				return file, true
 			case "http.request.orig_uri.path.dir":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
@@ -400,11 +420,104 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 	repl.Map(httpVars)
 }
 
-func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
-	if req == nil || req.TLS == nil {
-		return nil, false
+// RequestBodyLimitError is returned by the {http.request.body} and
+// {http.request.body_base64} placeholders when reading the request body
+// exceeded a request_body max_size limit. Placeholder consumers such as
+// templates and the vars matchers recognize exactly this condition and no
+// other error, so unrelated errors keep their existing behavior.
+type RequestBodyLimitError struct {
+	Err error // the underlying reason, e.g. *http.MaxBytesError
+}
+
+// Error returns the reason the request body could not be read in full.
+func (e RequestBodyLimitError) Error() string {
+	return fmt.Sprintf("request body: %v", e.Err)
+}
+
+// StatusCode returns 413 to match the request_body handler's response to an
+// oversized body.
+func (e RequestBodyLimitError) StatusCode() int {
+	return http.StatusRequestEntityTooLarge
+}
+
+// Unwrap returns the underlying error value. See the `errors` package for info.
+func (e RequestBodyLimitError) Unwrap() error { return e.Err }
+
+// readRequestBodyForPlaceholder reads the request body into a buffer for the
+// {http.request.body} and {http.request.body_base64} placeholders. Usually the
+// body is copied verbatim and the buffered replacement is installed on req. If
+// the read fails because the request_body max_size limit was exceeded, the
+// request_body handler wraps the http.MaxBytesError into a HandlerError
+// carrying status 413; here that error is converted to a RequestBodyLimitError,
+// which the placeholder consumers recognize, instead of silently returning the
+// truncated prefix as though it were the complete body. Only a max_size-driven
+// handler error is converted; any other read error is still ignored, as it was
+// before, because the request is probably not going to be served normally
+// anyway and we want to keep the placeholder's behavior unchanged in that case.
+func readRequestBodyForPlaceholder(req *http.Request) ([]byte, error) {
+	if req == nil || req.Body == nil {
+		return nil, nil
 	}
 
+	if req.Context().Value(VarsCtxKey) == nil {
+		ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+		*req = *req.WithContext(ctx)
+	}
+
+	if cachedErr, ok := GetVar(req.Context(), requestBodyErrorVarKey).(error); ok {
+		return nil, cachedErr
+	}
+	if cached, ok := GetVar(req.Context(), requestBodyBytesVarKey).([]byte); ok {
+		return cached, nil
+	}
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	_, err := io.Copy(buf, req.Body)
+	_ = req.Body.Close()
+
+	if err != nil {
+		var handlerErr HandlerError
+		var maxBytes *http.MaxBytesError
+		if errors.As(err, &handlerErr) && errors.As(handlerErr.Err, &maxBytes) {
+			buf.Reset()
+			bufPool.Put(buf)
+			limitErr := RequestBodyLimitError{Err: maxBytes}
+			SetVar(req.Context(), requestBodyErrorVarKey, limitErr)
+			return nil, limitErr
+		}
+	}
+
+	bodyBytes := bytes.Clone(buf.Bytes())
+	SetVar(req.Context(), requestBodyBytesVarKey, bodyBytes)
+
+	req.Body = &bodyReadCloser{
+		Reader: bytes.NewReader(buf.Bytes()),
+		buf:    buf,
+	}
+
+	return bodyBytes, nil
+}
+
+func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
+	if req == nil {
+		return nil, false
+	}
+	state := req.TLS
+	if state == nil {
+		state = new(tls.ConnectionState)
+	}
+	value, known := getTLSReplacement(state, key)
+	if req.TLS == nil {
+		// Use the same field parser to recognise valid placeholders but
+		// do not substitute values from the empty state for a plain HTTP request.
+		return nil, known
+	}
+	return value, known
+}
+
+func getTLSReplacement(state *tls.ConnectionState, key string) (any, bool) {
 	if len(key) < len(reqTLSReplPrefix) {
 		return nil, false
 	}
@@ -412,7 +525,7 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 	field := strings.ToLower(key[len(reqTLSReplPrefix):])
 
 	if strings.HasPrefix(field, "client.") {
-		cert := getTLSPeerCert(req.TLS)
+		cert := getTLSPeerCert(state)
 		if cert == nil {
 			// Instead of returning (nil, false) here, we set it to a dummy
 			// value to fix #7530. This way, even if there is no client cert,
@@ -517,20 +630,20 @@ func getReqTLSReplacement(req *http.Request, key string) (any, bool) {
 
 	switch field {
 	case "version":
-		return caddytls.ProtocolName(req.TLS.Version), true
+		return caddytls.ProtocolName(state.Version), true
 	case "cipher_suite":
-		return tls.CipherSuiteName(req.TLS.CipherSuite), true
+		return tls.CipherSuiteName(state.CipherSuite), true
 	case "resumed":
-		return req.TLS.DidResume, true
+		return state.DidResume, true
 	case "proto":
-		return req.TLS.NegotiatedProtocol, true
+		return state.NegotiatedProtocol, true
 	case "proto_mutual":
 		// req.TLS.NegotiatedProtocolIsMutual is deprecated - it's always true.
 		return true, true
 	case "server_name":
-		return req.TLS.ServerName, true
+		return state.ServerName, true
 	case "ech":
-		return req.TLS.ECHAccepted, true
+		return state.ECHAccepted, true
 	}
 	return nil, false
 }
@@ -587,7 +700,10 @@ const (
 	reqOrigURIPathReplPrefix = "http.request.orig_uri.path."
 )
 
-const requestBodyBytesVarKey = "http.request.body_bytes"
+const (
+	requestBodyBytesVarKey = "http.request.body_bytes"
+	requestBodyErrorVarKey = "http.request.body_error"
+)
 
 var bufPool = sync.Pool{
 	New: func() any {
@@ -618,35 +734,4 @@ func (brc *bodyReadCloser) Close() error {
 		}
 	})
 	return err
-}
-
-func readAndCacheRequestBody(req *http.Request) ([]byte, bool) {
-	if req == nil || req.Body == nil {
-		return nil, true
-	}
-
-	if req.Context().Value(VarsCtxKey) == nil {
-		ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
-		*req = *req.WithContext(ctx)
-	}
-
-	if cached, ok := GetVar(req.Context(), requestBodyBytesVarKey).([]byte); ok {
-		return cached, true
-	}
-
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-
-	_, _ = io.Copy(buf, req.Body)
-	_ = req.Body.Close()
-
-	bodyBytes := bytes.Clone(buf.Bytes())
-	SetVar(req.Context(), requestBodyBytesVarKey, bodyBytes)
-
-	req.Body = &bodyReadCloser{
-		Reader: bytes.NewReader(buf.Bytes()),
-		buf:    buf,
-	}
-
-	return bodyBytes, true
 }
