@@ -843,9 +843,9 @@ func leastRequests(upstreams []*Upstream) *Upstream {
 		if reqs == 0 {
 			return upstream
 		}
-		if reqs < bestReqs || bestReqs == -1 {
+		if bestReqs == -1 || reqs < bestReqs {
 			bestReqs = reqs
-			best = []*Upstream{upstream}
+			best = append(best[:0], upstream)
 		} else if reqs == bestReqs {
 			best = append(best, upstream)
 		}
