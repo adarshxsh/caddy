@@ -479,6 +479,9 @@ func (l *lexer) next() (bool, error) {
 				val = append(val, '\\')
 			}
 			escaped = false
+		} else if ch == '"' {
+			quoted = true
+			continue
 		}
 
 		// first character of a new unquoted token (tokenStart may already be

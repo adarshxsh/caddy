@@ -518,6 +518,22 @@ import ./conf.d/matcher_not_my_subnet.caddy
 }`,
 		},
 		{
+			description: "unspaced double quotes with braces",
+			input:       `key="foo { bar }"`,
+			expect:      `key="foo { bar }"`,
+		},
+		{
+			description: "unspaced double quotes in block directives",
+			input: `site.com {
+	header_up Host"{host}"
+	key="foo { bar }"
+}`,
+			expect: `site.com {
+	header_up Host"{host}"
+	key="foo { bar }"
+}`,
+		},
+		{
 			description: "keep an opening brace that ends the input",
 			input:       `localhost {`,
 			expect:      `localhost {`,
