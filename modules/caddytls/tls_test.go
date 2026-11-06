@@ -81,11 +81,10 @@ func TestTLSStopIdempotent(t *testing.T) {
 		}
 	})
 
-	t.Run("manually constructed channels", func(t *testing.T) {
+	t.Run("manually constructed ticker", func(t *testing.T) {
 		tlsApp := &TLS{
 			logger:             zap.NewNop(),
 			storageCleanOnce:   new(sync.Once),
-			storageCleanStop:   make(chan struct{}),
 			storageCleanTicker: time.NewTicker(1 * time.Hour),
 		}
 
