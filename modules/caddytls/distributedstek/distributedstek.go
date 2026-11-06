@@ -31,6 +31,7 @@ import (
 	"io/fs"
 	"log"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -53,10 +54,12 @@ type Provider struct {
 	// storage module will be used.
 	Storage json.RawMessage `json:"storage,omitempty" caddy:"namespace=caddy.storage inline_key=module"`
 
-	storage    certmagic.Storage
-	stekConfig *caddytls.SessionTicketService
-	timer      *time.Timer
-	ctx        caddy.Context
+	storage     certmagic.Storage
+	stekConfig  *caddytls.SessionTicketService
+	timer       *time.Timer
+	ctx         caddy.Context
+	numFailures int
+	mu          sync.Mutex
 }
 
 // CaddyModule returns the Caddy module information.
@@ -213,18 +216,7 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 	for {
 		select {
 		case <-s.timer.C:
-			dstek, err := s.getSTEK()
-			if err != nil {
-				// TODO: improve this handling
-				log.Printf("[ERROR] Loading STEK: %v", err)
-				continue
-			}
-
-			// send the updated keys to the service
-			keysChan <- dstek.Keys
-
-			// timer channel is already drained, so reset directly (see godoc)
-			s.timer.Reset(time.Until(dstek.NextRotation))
+			_ = s.handleTick(keysChan)
 
 		case <-doneChan:
 			// again, see godocs for why timer is stopped this way
@@ -234,6 +226,53 @@ func (s *Provider) rotate(doneChan <-chan struct{}, keysChan chan<- [][32]byte) 
 			return
 		}
 	}
+}
+
+func (s *Provider) handleTick(keysChan chan<- [][32]byte) (err error) {
+	var dstek distributedSTEK
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if err != nil {
+			s.numFailures++
+			s.timer.Reset(stekBackoffDelay(s.numFailures))
+		} else {
+			s.numFailures = 0
+			s.timer.Reset(time.Until(dstek.NextRotation))
+		}
+	}()
+
+	dstek, err = s.getSTEK()
+	if err != nil {
+		log.Printf("[ERROR] Loading STEK: %v", err)
+		return err
+	}
+
+	// send the updated keys to the service
+	keysChan <- dstek.Keys
+
+	return nil
+}
+
+const (
+	stekInitialBackoff = 10 * time.Second
+	stekMaxBackoff     = 5 * time.Minute
+)
+
+// stekBackoffDelay calculates the exponential backoff duration for the given number
+// of consecutive failures, starting at 10 seconds and doubling up to a cap of 5 minutes.
+func stekBackoffDelay(numFailures int) time.Duration {
+	if numFailures <= 0 {
+		return stekInitialBackoff
+	}
+	if numFailures > 30 {
+		return stekMaxBackoff
+	}
+	delay := stekInitialBackoff * time.Duration(1<<(numFailures-1))
+	if delay > stekMaxBackoff || delay < 0 {
+		return stekMaxBackoff
+	}
+	return delay
 }
 
 type distributedSTEK struct {

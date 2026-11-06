@@ -29,8 +29,10 @@ func init() {
 }
 
 type standardSTEKProvider struct {
-	stekConfig *caddytls.SessionTicketService
-	timer      *time.Timer
+	stekConfig  *caddytls.SessionTicketService
+	timer       *time.Timer
+	numFailures int
+	mu          sync.Mutex
 }
 
 // CaddyModule returns the Caddy module information.
@@ -90,32 +92,7 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 	for {
 		select {
 		case now := <-s.timer.C:
-			// copy the slice header to avoid races
-			mutex.RLock()
-			keysCopy := keys
-			mutex.RUnlock()
-
-			// generate a new key, rotating old ones
-			var err error
-			keysCopy, err = s.stekConfig.RotateSTEKs(keysCopy)
-			if err != nil {
-				// TODO: improve this handling
-				log.Printf("[ERROR] Generating STEK: %v", err)
-				continue
-			}
-
-			// replace keys slice with updated value and
-			// record the timestamp of rotation
-			mutex.Lock()
-			keys = keysCopy
-			lastRotation = now
-			mutex.Unlock()
-
-			// send the updated keys to the service
-			keysChan <- keysCopy
-
-			// timer channel is already drained, so reset directly (see godoc)
-			s.timer.Reset(time.Duration(s.stekConfig.RotationInterval))
+			_ = s.handleTick(now, keysChan)
 
 		case <-doneChan:
 			// again, see godocs for why timer is stopped this way
@@ -125,6 +102,65 @@ func (s *standardSTEKProvider) rotate(doneChan <-chan struct{}, keysChan chan<- 
 			return
 		}
 	}
+}
+
+func (s *standardSTEKProvider) handleTick(now time.Time, keysChan chan<- [][32]byte) (err error) {
+	defer func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if err != nil {
+			s.numFailures++
+			s.timer.Reset(stekBackoffDelay(s.numFailures))
+		} else {
+			s.numFailures = 0
+			s.timer.Reset(time.Duration(s.stekConfig.RotationInterval))
+		}
+	}()
+
+	// copy the slice header to avoid races
+	mutex.RLock()
+	keysCopy := keys
+	mutex.RUnlock()
+
+	// generate a new key, rotating old ones
+	keysCopy, err = s.stekConfig.RotateSTEKs(keysCopy)
+	if err != nil {
+		log.Printf("[ERROR] Generating STEK: %v", err)
+		return err
+	}
+
+	// replace keys slice with updated value and
+	// record the timestamp of rotation
+	mutex.Lock()
+	keys = keysCopy
+	lastRotation = now
+	mutex.Unlock()
+
+	// send the updated keys to the service
+	keysChan <- keysCopy
+
+	return nil
+}
+
+const (
+	stekInitialBackoff = 10 * time.Second
+	stekMaxBackoff     = 5 * time.Minute
+)
+
+// stekBackoffDelay calculates the exponential backoff duration for the given number
+// of consecutive failures, starting at 10 seconds and doubling up to a cap of 5 minutes.
+func stekBackoffDelay(numFailures int) time.Duration {
+	if numFailures <= 0 {
+		return stekInitialBackoff
+	}
+	if numFailures > 30 {
+		return stekMaxBackoff
+	}
+	delay := stekInitialBackoff * time.Duration(1<<(numFailures-1))
+	if delay > stekMaxBackoff || delay < 0 {
+		return stekMaxBackoff
+	}
+	return delay
 }
 
 var (
