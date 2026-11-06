@@ -8,8 +8,10 @@ run:
     - nopgx
 output:
   formats:
-    colored-line-number:
+    text:
       path: stdout
+      print-linter-name: true
+      print-issued-lines: true
 linters:
   default: none
   enable:
@@ -17,6 +19,7 @@ linters:
     - asciicheck
     - bidichk
     - bodyclose
+    - canonicalheader
     - decorder
     - dogsled
     - dupl
@@ -45,6 +48,12 @@ linters:
     - whitespace
     - zerologlint
   settings:
+    canonicalheader:
+      # Match net/http's canonical MIME map keys to avoid re-canonicalisation.
+      exclusions:
+        - Etag
+        - Te
+        - Www-Authenticate
     staticcheck:
       checks: ["all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022",  "-QF1006", "-QF1008"] # default, and exclude 1 more undesired check
     errcheck:
@@ -52,8 +61,6 @@ linters:
         - fmt.*
         - (go.uber.org/zap/zapcore.ObjectEncoder).AddObject
         - (go.uber.org/zap/zapcore.ObjectEncoder).AddArray
-    exhaustive:
-      ignore-enum-types: reflect.Kind|svc.Cmd
   exclusions:
     generated: lax
     presets:
@@ -94,6 +101,9 @@ linters:
         path: modules/caddyhttp/vars.go
       - linters:
           - errcheck
+        path: _test\.go
+      - linters:
+          - canonicalheader
         path: _test\.go
     paths:
       - third_party$
