@@ -291,3 +291,130 @@ func TestMergeACMEIssuers(t *testing.T) {
 		t.Fatalf("expected base roots to remain unchanged, got %v", base.TrustedRootsPEMFiles)
 	}
 }
+
+func TestServersOptionEarlyDataPolicy(t *testing.T) {
+	tests := []struct {
+		name                   string
+		input                  string
+		expectEarlyDataPolicy  string
+		expectStrictEarlyData *bool
+		expectError            bool
+	}{
+		{
+			name: "early_data_policy reject_unsafe",
+			input: `{
+				servers {
+					early_data_policy reject_unsafe
+				}
+			}
+			example.com {
+			}`,
+			expectEarlyDataPolicy: "reject_unsafe",
+		},
+		{
+			name: "early_data_policy reject_all",
+			input: `{
+				servers {
+					early_data_policy reject_all
+				}
+			}
+			example.com {
+			}`,
+			expectEarlyDataPolicy: "reject_all",
+		},
+		{
+			name: "early_data_policy allow_all",
+			input: `{
+				servers {
+					early_data_policy allow_all
+				}
+			}
+			example.com {
+			}`,
+			expectEarlyDataPolicy: "allow_all",
+		},
+		{
+			name: "strict_early_data false",
+			input: `{
+				servers {
+					strict_early_data false
+				}
+			}
+			example.com {
+			}`,
+			expectStrictEarlyData: func() *bool { b := false; return &b }(),
+		},
+		{
+			name: "invalid early_data_policy",
+			input: `{
+				servers {
+					early_data_policy invalid
+				}
+			}
+			example.com {
+			}`,
+			expectError: true,
+		},
+		{
+			name: "invalid strict_early_data",
+			input: `{
+				servers {
+					strict_early_data invalid
+				}
+			}
+			example.com {
+			}`,
+			expectError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := caddyfile.Adapter{
+				ServerType: ServerType{},
+			}
+
+			out, _, err := adapter.Adapt([]byte(tc.input), nil)
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var config struct {
+				Apps struct {
+					HTTP struct {
+						Servers map[string]struct {
+							EarlyDataPolicy string `json:"early_data_policy,omitempty"`
+							StrictEarlyData *bool  `json:"strict_early_data,omitempty"`
+						} `json:"servers"`
+					} `json:"http"`
+				} `json:"apps"`
+			}
+
+			if err := json.Unmarshal(out, &config); err != nil {
+				t.Fatalf("unmarshaling adapted config: %v", err)
+			}
+
+			found := false
+			for _, server := range config.Apps.HTTP.Servers {
+				found = true
+				if tc.expectEarlyDataPolicy != "" && server.EarlyDataPolicy != tc.expectEarlyDataPolicy {
+					t.Errorf("expected early_data_policy %q, got %q", tc.expectEarlyDataPolicy, server.EarlyDataPolicy)
+				}
+				if tc.expectStrictEarlyData != nil {
+					if server.StrictEarlyData == nil || *server.StrictEarlyData != *tc.expectStrictEarlyData {
+						t.Errorf("expected strict_early_data %v, got %v", *tc.expectStrictEarlyData, server.StrictEarlyData)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("expected HTTP server in adapted config")
+			}
+		})
+	}
+}
