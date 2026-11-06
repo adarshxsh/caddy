@@ -184,10 +184,19 @@ func (r *Replacer) replace(input, empty string,
 	}
 
 	var sb strings.Builder
+	var hasMutated bool
+	var sbGrown bool
 
-	// it is reasonable to assume that the output
-	// will be approximately as long as the input
-	sb.Grow(len(input))
+	writeStr := func(s string) {
+		if s == "" {
+			return
+		}
+		if !sbGrown {
+			sb.Grow(len(input))
+			sbGrown = true
+		}
+		sb.WriteString(s)
+	}
 
 	// iterate the input to find each placeholder
 	var lastWriteCursor int
@@ -202,7 +211,8 @@ scan:
 	for i := 0; i < len(input); i++ {
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
-			sb.WriteString(input[lastWriteCursor : i-1])
+			hasMutated = true
+			writeStr(input[lastWriteCursor : i-1])
 			lastWriteCursor = i
 			continue
 		}
@@ -235,9 +245,6 @@ scan:
 			end += nextEnd + 1
 		}
 
-		// write the substring from the last cursor to this point
-		sb.WriteString(input[lastWriteCursor:i])
-
 		// trim opening bracket
 		key := input[i+1 : end]
 
@@ -261,7 +268,6 @@ scan:
 			} else if !treatUnknownAsEmpty {
 				// if treatUnknownAsEmpty is true, we'll handle an empty
 				// val later; so only continue otherwise
-				lastWriteCursor = i
 				continue
 			}
 		}
@@ -278,17 +284,23 @@ scan:
 		// convert val to a string as efficiently as possible
 		valStr := ToString(val)
 
-		// write the value; if it's empty, either return
-		// an error or write a default value
+		if valStr == "" && errOnEmpty {
+			return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
+				string(phOpen), key, string(phClose))
+		}
+
+		hasMutated = true
+
+		// write the substring from the last cursor to this point
+		writeStr(input[lastWriteCursor:i])
+
+		// write the value; if it's empty, either write a default value
 		if valStr == "" {
-			if errOnEmpty {
-				return "", fmt.Errorf("evaluated placeholder %s%s%s is empty",
-					string(phOpen), key, string(phClose))
-			} else if empty != "" {
-				sb.WriteString(empty)
+			if empty != "" {
+				writeStr(empty)
 			}
 		} else {
-			sb.WriteString(valStr)
+			writeStr(valStr)
 		}
 
 		// advance cursor to end of placeholder
@@ -296,8 +308,12 @@ scan:
 		lastWriteCursor = i + 1
 	}
 
+	if !hasMutated {
+		return input, nil
+	}
+
 	// flush any unwritten remainder
-	sb.WriteString(input[lastWriteCursor:])
+	writeStr(input[lastWriteCursor:])
 
 	return sb.String(), nil
 }
