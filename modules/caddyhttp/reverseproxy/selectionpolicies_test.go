@@ -966,6 +966,21 @@ func TestCookieHashPolicyWithFirstFallback(t *testing.T) {
 	}
 }
 
+func TestClientIPHashSelection_MissingClientIPVar(t *testing.T) {
+	ipHash := ClientIPHashSelection{}
+	pool := UpstreamPool{
+		{Host: new(Host), Dial: "0.0.0.1"},
+		{Host: new(Host), Dial: "0.0.0.2"},
+	}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	// req context has no ClientIPVarKey set
+	h := ipHash.Select(pool, req, nil)
+	if h == nil {
+		t.Error("Expected host selection to return an upstream even when ClientIPVarKey is missing")
+	}
+}
+
 func TestCookieHashPolicyWithSecret(t *testing.T) {
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	defer cancel()

@@ -721,6 +721,19 @@ func initTestContext() (TemplateContext, error) {
 		RespHeader: WrappedHeader{make(http.Header)},
 	}, nil
 }
+func TestClientIP_MissingClientIPVar(t *testing.T) {
+	req, err := http.NewRequest("GET", "https://example.com/foo/bar", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	tplCtx := TemplateContext{Req: req}
+
+	clientIP := tplCtx.ClientIP()
+	if clientIP != "" {
+		t.Errorf("expected empty clientIP when ClientIPVarKey is missing, got %q", clientIP)
+	}
+}
+
 // TestFuncPlaceholderPropagatesOnlyBodyLimitMarker verifies that the template
 // placeholder function aborts only on the request-body limit marker and keeps
 // rendering unrelated errors as text, exactly like before.
