@@ -443,7 +443,11 @@ func (a Address) String() string {
 			(scheme == "http" && a.Port != strconv.Itoa(caddyhttp.DefaultHTTPPort))) {
 		s += net.JoinHostPort(a.Host, a.Port)
 	} else {
-		s += a.Host
+		if strings.Contains(a.Host, ":") && !strings.HasPrefix(a.Host, "[") {
+			s += "[" + a.Host + "]"
+		} else {
+			s += a.Host
+		}
 	}
 	if a.Path != "" {
 		s += a.Path
