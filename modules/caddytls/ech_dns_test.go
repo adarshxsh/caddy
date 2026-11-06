@@ -187,7 +187,7 @@ func TestConcurrentECHPublicationMapSafety(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				_ = tlsApp.publishECHConfigs(zap.NewNop())
+				_ = tlsApp.publishECHConfigs(caddyCtx, zap.NewNop())
 				time.Sleep(50 * time.Microsecond)
 			}
 		}
